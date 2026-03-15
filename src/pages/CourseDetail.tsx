@@ -1,0 +1,310 @@
+import { useEffect, useMemo } from 'react';
+import { useParams, useNavigate, Link } from 'react-router-dom';
+import { motion } from 'framer-motion';
+import {
+  Play,
+  Clock,
+  User,
+  ChevronRight,
+  AlertCircle,
+} from 'lucide-react';
+import { useCourseStore, useUIStore } from '../store';
+import { courses, getClipsForCourse } from '../services/mock/courses';
+import { Progress } from '../components/ui/progress';
+import { formatDuration } from '../utils/helpers';
+
+export default function CourseDetail() {
+  const { courseId } = useParams<{ courseId: string }>();
+  const navigate = useNavigate();
+  const setSelectedCourse = useCourseStore((s) => s.setSelectedCourse);
+  const setSelectedClip = useCourseStore((s) => s.setSelectedClip);
+  const setRobotMessage = useUIStore((s) => s.setRobotMessage);
+
+  const course = useMemo(
+    () => courses.find((c) => c.id === courseId),
+    [courseId],
+  );
+
+  const clips = useMemo(
+    () => (courseId ? getClipsForCourse(courseId) : []),
+    [courseId],
+  );
+
+  useEffect(() => {
+    if (course) {
+      setSelectedCourse(course.id);
+      setRobotMessage(
+        course.progress > 0
+          ? `You're viewing "${course.title}". You've completed ${course.progress}% — keep going!`
+          : `Welcome to "${course.title}"! Pick a clip below to start learning.`,
+      );
+    }
+    return () => {
+      setRobotMessage(null);
+    };
+  }, [course, setSelectedCourse, setRobotMessage]);
+
+  const handleClipClick = (clipId: string) => {
+    setSelectedClip(clipId);
+    navigate('/compare');
+  };
+
+  if (!course) {
+    return (
+      <div className="container">
+        <motion.div
+          className="empty-state"
+          initial={{ opacity: 0, y: 20 }}
+          animate={{ opacity: 1, y: 0 }}
+        >
+          <AlertCircle className="empty-state-icon" />
+          <h2 className="empty-state-title">Course Not Found</h2>
+          <p className="empty-state-description">
+            The course you&apos;re looking for doesn&apos;t exist or has been removed.
+          </p>
+          <Link
+            to="/courses"
+            className="btn btn-primary"
+            style={{ marginTop: 'var(--space-lg)', display: 'inline-flex' }}
+          >
+            Back to Courses
+          </Link>
+        </motion.div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="container" style={{ paddingBottom: 'var(--space-3xl)' }}>
+      {/* Breadcrumb */}
+      <motion.nav
+        className="breadcrumb"
+        initial={{ opacity: 0 }}
+        animate={{ opacity: 1 }}
+        transition={{ delay: 0.05 }}
+        style={{ paddingTop: 'var(--space-lg)' }}
+      >
+        <Link to="/">Home</Link>
+        <ChevronRight size={14} className="breadcrumb-separator" />
+        <Link to="/courses">Courses</Link>
+        <ChevronRight size={14} className="breadcrumb-separator" />
+        <span>{course.title}</span>
+      </motion.nav>
+
+      {/* Course Header */}
+      <motion.div
+        initial={{ opacity: 0, y: 20 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ delay: 0.1 }}
+        className="glass"
+        style={{
+          borderRadius: 'var(--radius-xl)',
+          padding: 'var(--space-2xl)',
+          marginBottom: 'var(--space-2xl)',
+        }}
+      >
+        <div
+          className="grid grid-cols-1 md:grid-cols-[280px_1fr]"
+          style={{ gap: 'var(--space-2xl)' }}
+        >
+          {/* Thumbnail */}
+          <div
+            style={{
+              width: '100%',
+              aspectRatio: '4/3',
+              borderRadius: 'var(--radius-lg)',
+              background: 'var(--bg-tertiary)',
+              backgroundImage: `url(${course.thumbnail})`,
+              backgroundSize: 'cover',
+              backgroundPosition: 'center',
+            }}
+          />
+
+          {/* Info */}
+          <div
+            style={{
+              display: 'flex',
+              flexDirection: 'column',
+              gap: 'var(--space-md)',
+            }}
+          >
+            <h1 className="heading-2">{course.title}</h1>
+            <p className="text-body">{course.description}</p>
+
+            <div
+              style={{
+                display: 'flex',
+                gap: 'var(--space-sm)',
+                flexWrap: 'wrap',
+                alignItems: 'center',
+              }}
+            >
+              <span
+                className={`difficulty-badge difficulty-${course.difficulty}`}
+              >
+                {course.difficulty}
+              </span>
+              <span className="badge badge-blue">{course.category}</span>
+              <span
+                className="text-small"
+                style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: '0.25rem',
+                  color: 'var(--text-secondary)',
+                }}
+              >
+                <User size={14} /> {course.instructor}
+              </span>
+              <span
+                className="text-small"
+                style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: '0.25rem',
+                  color: 'var(--text-secondary)',
+                }}
+              >
+                <Clock size={14} /> {course.estimatedTime}
+              </span>
+            </div>
+
+            {/* Progress */}
+            <div>
+              <div
+                className="flex-between"
+                style={{ marginBottom: 'var(--space-xs)' }}
+              >
+                <span
+                  className="text-small"
+                  style={{ color: 'var(--text-secondary)' }}
+                >
+                  Progress
+                </span>
+                <span className="text-small" style={{ fontWeight: 600 }}>
+                  {course.progress}%
+                </span>
+              </div>
+              <Progress value={course.progress} />
+            </div>
+
+            {/* CTA */}
+            <div>
+              <button
+                className="btn btn-primary"
+                onClick={() => {
+                  if (clips.length > 0) handleClipClick(clips[0].id);
+                }}
+              >
+                <Play size={16} />
+                {course.progress > 0 ? 'Continue Learning' : 'Start Course'}
+              </button>
+            </div>
+          </div>
+        </div>
+      </motion.div>
+
+      {/* Clips Section */}
+      <motion.section
+        initial={{ opacity: 0, y: 20 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ delay: 0.2 }}
+      >
+        <div
+          className="flex-between"
+          style={{ marginBottom: 'var(--space-lg)' }}
+        >
+          <h2 className="heading-3">Course Clips</h2>
+          <span
+            className="text-small"
+            style={{ color: 'var(--text-secondary)' }}
+          >
+            {course.totalClips} videos
+          </span>
+        </div>
+
+        <div
+          className="horizontal-scroll"
+          style={{ paddingBottom: 'var(--space-md)' }}
+        >
+          {clips.map((clip, index) => (
+            <motion.div
+              key={clip.id}
+              initial={{ opacity: 0, y: 16 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ delay: 0.25 + index * 0.025 }}
+              className="card card-hover"
+              style={{ width: 200, cursor: 'pointer', overflow: 'hidden' }}
+              onClick={() => handleClipClick(clip.id)}
+            >
+              {/* Thumbnail with play overlay */}
+              <div
+                style={{
+                  position: 'relative',
+                  width: '100%',
+                  aspectRatio: '16/9',
+                  background: 'var(--bg-tertiary)',
+                  backgroundImage: `url(${clip.thumbnail})`,
+                  backgroundSize: 'cover',
+                  backgroundPosition: 'center',
+                  overflow: 'hidden',
+                }}
+              >
+                <div
+                  className="flex-center"
+                  style={{
+                    position: 'absolute',
+                    inset: 0,
+                    background: 'rgba(0,0,0,0.4)',
+                    opacity: 0,
+                    transition: 'opacity var(--transition-fast)',
+                  }}
+                  onMouseEnter={(e) => {
+                    (e.currentTarget as HTMLElement).style.opacity = '1';
+                  }}
+                  onMouseLeave={(e) => {
+                    (e.currentTarget as HTMLElement).style.opacity = '0';
+                  }}
+                >
+                  <Play size={28} style={{ color: '#fff' }} />
+                </div>
+
+                <span
+                  style={{
+                    position: 'absolute',
+                    bottom: 4,
+                    right: 4,
+                    background: 'rgba(0,0,0,0.75)',
+                    color: '#fff',
+                    padding: '2px 6px',
+                    borderRadius: 'var(--radius-sm)',
+                    fontSize: '0.7rem',
+                    fontFamily: 'var(--font-mono)',
+                  }}
+                >
+                  {formatDuration(clip.duration)}
+                </span>
+              </div>
+
+              {/* Title */}
+              <div style={{ padding: 'var(--space-sm)' }}>
+                <p
+                  className="text-small"
+                  style={{
+                    fontWeight: 500,
+                    color: 'var(--text-primary)',
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace: 'nowrap',
+                  }}
+                >
+                  {clip.title}
+                </p>
+              </div>
+            </motion.div>
+          ))}
+        </div>
+      </motion.section>
+    </div>
+  );
+}
