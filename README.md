@@ -1,4 +1,4 @@
-AugMentor 2.0 – AI-Assisted Craft Skill Analysis
+#AugMentor 2.0 – AI-Assisted Craft Skill Analysis
 
 AugMentor 2.0 is an AI-powered system designed to help learners improve manual craft skills by analyzing and comparing their movements with those of an expert.
 
