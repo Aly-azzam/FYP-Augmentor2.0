@@ -1,9 +1,7 @@
 from uuid import UUID
 
-from fastapi import APIRouter, Depends
-from sqlalchemy.ext.asyncio import AsyncSession
+from fastapi import APIRouter
 
-from app.core.database import get_db
 from app.schemas.upload_schema import (
     EvaluationStartRequest,
     EvaluationStartResponse,
@@ -15,10 +13,7 @@ router = APIRouter(prefix="/api/evaluations", tags=["Evaluations"])
 
 
 @router.post("/start", response_model=EvaluationStartResponse)
-async def start_evaluation(
-    request: EvaluationStartRequest,
-    db: AsyncSession = Depends(get_db),
-):
+async def start_evaluation(request: EvaluationStartRequest):
     """Start async evaluation pipeline for a learner attempt.
 
     Sets attempt status to queued and dispatches processing job.
@@ -40,10 +35,7 @@ async def start_evaluation(
 
 
 @router.get("/{evaluation_id}/status", response_model=EvaluationStatusResponse)
-async def get_evaluation_status(
-    evaluation_id: UUID,
-    db: AsyncSession = Depends(get_db),
-):
+async def get_evaluation_status(evaluation_id: UUID):
     """Poll evaluation processing status."""
     # TODO: query real status from DB
     return EvaluationStatusResponse(
@@ -56,10 +48,7 @@ async def get_evaluation_status(
 
 
 @router.get("/{evaluation_id}/result", response_model=EvaluationResultOut)
-async def get_evaluation_result(
-    evaluation_id: UUID,
-    db: AsyncSession = Depends(get_db),
-):
+async def get_evaluation_result(evaluation_id: UUID):
     """Get final evaluation result. Only available when status is terminal."""
     # TODO: query real result from DB, return 404/409 if not ready
     return EvaluationResultOut(

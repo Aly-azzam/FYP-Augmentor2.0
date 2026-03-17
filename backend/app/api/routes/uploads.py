@@ -1,9 +1,7 @@
 import uuid
 
-from fastapi import APIRouter, UploadFile, File, Form, Depends
-from sqlalchemy.ext.asyncio import AsyncSession
+from fastapi import APIRouter, UploadFile, File, Form
 
-from app.core.database import get_db
 from app.schemas.upload_schema import UploadResponse
 
 router = APIRouter(prefix="/api/uploads", tags=["Uploads"])
@@ -13,7 +11,6 @@ router = APIRouter(prefix="/api/uploads", tags=["Uploads"])
 async def upload_practice_video(
     chapter_id: str = Form(...),
     file: UploadFile = File(...),
-    db: AsyncSession = Depends(get_db),
 ):
     """Upload a learner practice video for a specific chapter.
 

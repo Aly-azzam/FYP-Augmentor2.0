@@ -1,23 +1,21 @@
 from uuid import UUID
 
-from fastapi import APIRouter, Depends
-from sqlalchemy.ext.asyncio import AsyncSession
+from fastapi import APIRouter
 
-from app.core.database import get_db
 from app.schemas.course_schema import CourseOut, CourseDetail
 
 router = APIRouter(prefix="/api/courses", tags=["Courses"])
 
 
 @router.get("", response_model=list[CourseOut])
-async def list_courses(db: AsyncSession = Depends(get_db)):
+async def list_courses():
     """List all available courses."""
     # TODO: query real DB
     return []
 
 
 @router.get("/{course_id}", response_model=CourseDetail)
-async def get_course(course_id: UUID, db: AsyncSession = Depends(get_db)):
+async def get_course(course_id: UUID):
     """Get course details including chapters."""
     # TODO: query real DB, return 404 if not found
     return CourseDetail(
