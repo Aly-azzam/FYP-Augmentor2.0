@@ -5,16 +5,17 @@ import { Canvas } from '@react-three/fiber';
 import { Float, MeshDistortMaterial, OrbitControls } from '@react-three/drei';
 import { BookOpen, Play, Upload, Sparkles, ArrowRight, ChevronDown } from 'lucide-react';
 import { courses } from '@/services/mock/courses';
+import { useThemeStore } from '@/store';
 
 /* ─── 3D Wireframe Vase ────────────────────────────────────────────────────── */
 
-function WireframeVase() {
+function WireframeVase({ color }: { color: string }) {
   return (
     <Float speed={1.4} rotationIntensity={1.2} floatIntensity={1.5}>
       <mesh>
         <cylinderGeometry args={[0.6, 1, 2.4, 32, 1, true]} />
         <MeshDistortMaterial
-          color="#3B82F6"
+          color={color}
           wireframe
           distort={0.25}
           speed={2}
@@ -104,6 +105,7 @@ const staggerChild = {
 
 export default function Home() {
   const heroRef = useRef<HTMLDivElement>(null);
+  const isDark = useThemeStore((s) => s.isDark);
   const { scrollYProgress } = useScroll({
     target: heroRef,
     offset: ['start start', 'end start'],
@@ -180,7 +182,7 @@ export default function Home() {
                 <ambientLight intensity={0.4} />
                 <directionalLight position={[5, 5, 5]} intensity={0.6} />
                 <Suspense fallback={null}>
-                  <WireframeVase />
+                  <WireframeVase color={isDark ? '#FFFFFF' : '#3B82F6'} />
                 </Suspense>
                 <OrbitControls
                   enablePan={false}
