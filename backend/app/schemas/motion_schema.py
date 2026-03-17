@@ -12,35 +12,38 @@ from typing import Optional
 from pydantic import BaseModel
 
 
-class FrameMotion(BaseModel):
+class MotionFrame(BaseModel):
     frame_index: int
-    timestamp_sec: float
-    positions: dict[str, list[float]]  # landmark_name -> [x, y, z?]
-    velocity: Optional[dict[str, list[float]]] = None
-    speed: Optional[dict[str, float]] = None
+    timestamp: float
+    positions: dict[str, list[float]]
 
 
-class TrajectoryPoint(BaseModel):
-    landmark_name: str
-    points: list[list[float]]  # [[x, y, z?], ...]
-
-
-class ToolState(BaseModel):
-    frame_index: int
-    tool_class: str
-    present: bool
-    confidence: float
-    position_normalized: Optional[list[float]] = None
-
-
-class MotionOutput(BaseModel):
-    """Full output contract of the Motion Representation Engine."""
+class MotionSequenceOutput(BaseModel):
+    """Step 1 output contract for cleaned time-ordered motion sequences."""
 
     video_id: str
     fps: float
     sequence_length: int
     tracked_landmarks: list[str]
-    tracked_tools: list[str]
-    frames: list[FrameMotion]
-    trajectories: list[TrajectoryPoint] = []
-    tool_states: list[ToolState] = []
+    frames: list[MotionFrame]
+
+
+class EnrichedMotionFrame(MotionFrame):
+    velocity: dict[str, list[float]]
+    speed: dict[str, float]
+    acceleration: dict[str, list[float]]
+    trajectory_point: dict[str, list[float]]
+
+
+class MotionRepresentationOutput(BaseModel):
+    """Step 4 output contract for enriched motion representation."""
+
+    video_id: str
+    fps: float
+    sequence_length: int
+    tracked_landmarks: list[str]
+    frames: list[EnrichedMotionFrame]
+
+
+# Backward-compatible alias used by existing motion stubs.
+MotionOutput = MotionRepresentationOutput

@@ -3,6 +3,11 @@
 import math
 
 
+def zero_vector(dim: int) -> list[float]:
+    """Return a zero vector with the requested dimension."""
+    return [0.0] * dim
+
+
 def euclidean_distance(p1: list[float], p2: list[float]) -> float:
     """Compute Euclidean distance between two points."""
     return math.sqrt(sum((a - b) ** 2 for a, b in zip(p1, p2)))
