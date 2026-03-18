@@ -1,50 +1,80 @@
-"""Evaluation Engine Service — orchestrates the full evaluation pipeline.
+"""Orchestrate the full Evaluation Engine pipeline."""
 
-Fixed pipeline order:
-Upload → Perception → Motion Representation → Evaluation → VLM → Final Result
-
-This service coordinates the async execution of all stages
-and manages the LearnerAttempt status transitions.
-"""
+from __future__ import annotations
 
 import uuid
-from typing import Optional
+from pathlib import Path
+from typing import Any
 
-from app.core.constants import AttemptStatus
+from app.schemas.evaluation_schema import EvaluationResult, MetricSet
+from app.services.angle_metrics_service import compute_angle_deviation
+from app.services.comparison_service import (
+    load_motion_data,
+    pair_motion_data,
+)
+from app.services.feedback_structuring_service import build_summary, build_vlm_payload
+from app.services.scoring_service import compute_final_score
+from app.services.tool_metrics_service import compute_tool_alignment_deviation
+from app.services.trajectory_metrics_service import compute_trajectory_deviation
+from app.services.velocity_metrics_service import compute_velocity_difference
+
+MotionSource = str | Path | dict[str, Any]
+
+
+def generate_evaluation_id() -> str:
+    """Generate a simple evaluation identifier."""
+    return f"eval_{uuid.uuid4().hex[:8]}"
+
+
+def build_metric_set(paired_motion_data: dict[str, Any]) -> MetricSet:
+    """Compute all evaluation metrics from paired motion data."""
+    return MetricSet(
+        angle_deviation=compute_angle_deviation(paired_motion_data),
+        trajectory_deviation=compute_trajectory_deviation(paired_motion_data),
+        velocity_difference=compute_velocity_difference(paired_motion_data),
+        tool_alignment_deviation=compute_tool_alignment_deviation(paired_motion_data),
+    )
+
+
+def evaluate_motion_pair(
+    expert_motion_source: MotionSource,
+    learner_motion_source: MotionSource,
+) -> EvaluationResult:
+    """Run the complete evaluation flow from motion inputs to final result."""
+    expert_motion_data = load_motion_data(expert_motion_source)
+    learner_motion_data = load_motion_data(learner_motion_source)
+
+    paired_motion_data = pair_motion_data(
+        expert_data=expert_motion_data,
+        learner_data=learner_motion_data,
+    )
+
+    metrics = build_metric_set(paired_motion_data)
+    score_result = compute_final_score(metrics.model_dump())
+    final_score = score_result["score"]
+
+    summary = build_summary(score=final_score, metrics=metrics)
+    vlm_payload = build_vlm_payload(
+        score=final_score,
+        metrics=metrics,
+        summary=summary,
+    )
+
+    return EvaluationResult(
+        evaluation_id=generate_evaluation_id(),
+        score=final_score,
+        metrics=metrics,
+        summary=summary,
+        vlm_payload=vlm_payload,
+    )
 
 
 async def run_evaluation_pipeline(
-    attempt_id: uuid.UUID,
-    learner_video_path: str,
-    expert_video_path: str,
-    chapter_id: uuid.UUID,
-) -> dict:
-    """Run the full evaluation pipeline for a learner attempt.
-
-    Steps:
-    1. Set status to RUNNING
-    2. Run Perception on both expert and learner videos
-    3. Run Motion Representation
-    4. Run Comparison + Metrics
-    5. Compute Score
-    6. Structure Feedback
-    7. Generate VLM Explanation
-    8. Persist EvaluationResult
-    9. Set final status (completed / completed_with_warnings / failed)
-
-    Returns dict with evaluation result data.
-    """
-    # TODO: wire all real sub-services and implement status transitions
-    return {
-        "status": AttemptStatus.COMPLETED,
-        "score": 75,
-        "metrics": {
-            "angle_deviation": 8.5,
-            "trajectory_deviation": 12.3,
-            "velocity_difference": 15.0,
-            "tool_alignment_deviation": 6.2,
-        },
-        "summary": "Placeholder evaluation result",
-        "ai_text": "Placeholder AI explanation",
-        "warnings": [],
-    }
+    expert_motion_source: MotionSource,
+    learner_motion_source: MotionSource,
+) -> EvaluationResult:
+    """Async wrapper around the evaluation flow for later API integration."""
+    return evaluate_motion_pair(
+        expert_motion_source=expert_motion_source,
+        learner_motion_source=learner_motion_source,
+    )
