@@ -1,15 +1,216 @@
-"""Angle Metrics Service — compute angle deviation between expert and learner.
+"""Angle Metrics Service: geometric hand joint angles.
 
-Canonical unit: degrees
+This module computes geometric hand joint angles from extracted landmark
+dictionaries. It provides utilities to compute a single joint angle from
+three 3D points and to derive a small set of per-hand and per-frame angles.
 
-Owner: Evaluation Engine (Person 3)
+No scoring, comparison, DTW, velocity, or aggregation is performed here.
 """
 
+from __future__ import annotations
 
-async def compute_angle_deviation(expert_data: dict, learner_data: dict) -> float:
-    """Compute mean angle deviation between expert and learner joint angles.
+import math
+from typing import Dict, List, Optional
 
-    Returns deviation in degrees.
+
+def calculate_angle(point_a: list[float], point_b: list[float], point_c: list[float]) -> float:
+    """Compute the angle ABC (with B as the joint center) in degrees.
+
+    Args:
+        point_a: Point A as [x, y, z].
+        point_b: Point B (joint center) as [x, y, z].
+        point_c: Point C as [x, y, z].
+
+    Returns:
+        Angle ABC in degrees.
+
+    Raises:
+        ValueError: if any point is malformed or any vector length is zero.
     """
-    # TODO: implement angle comparison logic
-    return 0.0
+
+    def _validate_point(p: list[float], name: str) -> List[float]:
+        if not isinstance(p, list) or len(p) != 3:
+            raise ValueError(f"calculate_angle: {name} must be a list[float] of length 3.")
+        try:
+            return [float(p[0]), float(p[1]), float(p[2])]
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"calculate_angle: {name} contains non-numeric values.") from exc
+
+    a = _validate_point(point_a, "point_a")
+    b = _validate_point(point_b, "point_b")
+    c = _validate_point(point_c, "point_c")
+
+    # Vectors BA and BC (origin at joint center B)
+    ba = (a[0] - b[0], a[1] - b[1], a[2] - b[2])
+    bc = (c[0] - b[0], c[1] - b[1], c[2] - b[2])
+
+    ba_len = math.sqrt(ba[0] * ba[0] + ba[1] * ba[1] + ba[2] * ba[2])
+    bc_len = math.sqrt(bc[0] * bc[0] + bc[1] * bc[1] + bc[2] * bc[2])
+
+    if ba_len == 0.0:
+        raise ValueError("calculate_angle: vector BA length is zero.")
+    if bc_len == 0.0:
+        raise ValueError("calculate_angle: vector BC length is zero.")
+
+    dot = ba[0] * bc[0] + ba[1] * bc[1] + ba[2] * bc[2]
+    cosine = dot / (ba_len * bc_len)
+    cosine = max(-1.0, min(1.0, cosine))  # clamp before acos
+
+    return math.degrees(math.acos(cosine))
+
+
+def compute_hand_joint_angles(hand_landmarks: dict) -> dict:
+    """Compute hand joint angles from one hand landmark dictionary.
+
+    Args:
+        hand_landmarks: One hand dictionary like:
+            {
+              "wrist": [x, y, z],
+              ...
+            }
+
+    Returns:
+        Dict with exactly:
+        {
+          "thumb_ip_angle": ...,
+          "index_pip_angle": ...,
+          "middle_pip_angle": ...,
+          "ring_pip_angle": ...,
+          "pinky_pip_angle": ...
+        }
+
+    Raises:
+        ValueError: if hand_landmarks is None, required landmarks are missing,
+            or any required point is malformed.
+    """
+    if hand_landmarks is None:
+        raise ValueError("compute_hand_joint_angles: hand_landmarks must not be None.")
+    if not isinstance(hand_landmarks, dict):
+        raise ValueError("compute_hand_joint_angles: hand_landmarks must be a dict.")
+
+    def _get_point(name: str) -> list[float]:
+        if name not in hand_landmarks:
+            raise ValueError(f"compute_hand_joint_angles: missing required landmark '{name}'.")
+        point = hand_landmarks[name]
+        if not isinstance(point, list) or len(point) != 3:
+            raise ValueError(
+                f"compute_hand_joint_angles: landmark '{name}' must be a list[float] of length 3."
+            )
+        try:
+            return [float(point[0]), float(point[1]), float(point[2])]
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"compute_hand_joint_angles: landmark '{name}' has non-numeric values.") from exc
+
+    thumb_ip_angle = calculate_angle(
+        point_a=_get_point("thumb_mcp"),
+        point_b=_get_point("thumb_ip"),
+        point_c=_get_point("thumb_tip"),
+    )
+
+    index_pip_angle = calculate_angle(
+        point_a=_get_point("index_finger_mcp"),
+        point_b=_get_point("index_finger_pip"),
+        point_c=_get_point("index_finger_dip"),
+    )
+
+    middle_pip_angle = calculate_angle(
+        point_a=_get_point("middle_finger_mcp"),
+        point_b=_get_point("middle_finger_pip"),
+        point_c=_get_point("middle_finger_dip"),
+    )
+
+    ring_pip_angle = calculate_angle(
+        point_a=_get_point("ring_finger_mcp"),
+        point_b=_get_point("ring_finger_pip"),
+        point_c=_get_point("ring_finger_dip"),
+    )
+
+    pinky_pip_angle = calculate_angle(
+        point_a=_get_point("pinky_mcp"),
+        point_b=_get_point("pinky_pip"),
+        point_c=_get_point("pinky_dip"),
+    )
+
+    return {
+        "thumb_ip_angle": thumb_ip_angle,
+        "index_pip_angle": index_pip_angle,
+        "middle_pip_angle": middle_pip_angle,
+        "ring_pip_angle": ring_pip_angle,
+        "pinky_pip_angle": pinky_pip_angle,
+    }
+
+
+def compute_frame_hand_angles(frame_data: dict) -> dict:
+    """Compute per-hand joint angles for a single processed frame.
+
+    Args:
+        frame_data: Dict shaped like:
+            {
+              "frame_index": ...,
+              "timestamp": ...,
+              "left_hand": {...} or None,
+              "right_hand": {...} or None
+            }
+
+    Returns:
+        Dict exactly shaped as:
+        {
+          "frame_index": ...,
+          "timestamp": ...,
+          "left_hand_angles": {...} or None,
+          "right_hand_angles": {...} or None
+        }
+
+    Raises:
+        ValueError: if required keys are missing or frame_data is malformed.
+    """
+    if frame_data is None or not isinstance(frame_data, dict):
+        raise ValueError("compute_frame_hand_angles: frame_data must be a dict.")
+
+    required_keys = {"frame_index", "timestamp", "left_hand", "right_hand"}
+    missing = required_keys - set(frame_data.keys())
+    if missing:
+        missing_str = ", ".join(sorted(missing))
+        raise ValueError(f"compute_frame_hand_angles: frame_data missing keys: {missing_str}.")
+
+    left_hand = frame_data["left_hand"]
+    right_hand = frame_data["right_hand"]
+
+    left_hand_angles: Optional[dict]
+    right_hand_angles: Optional[dict]
+
+    if left_hand is None:
+        left_hand_angles = None
+    else:
+        if not isinstance(left_hand, dict):
+            raise ValueError("compute_frame_hand_angles: left_hand must be a dict or None.")
+        left_hand_angles = compute_hand_joint_angles(left_hand)
+
+    if right_hand is None:
+        right_hand_angles = None
+    else:
+        if not isinstance(right_hand, dict):
+            raise ValueError("compute_frame_hand_angles: right_hand must be a dict or None.")
+        right_hand_angles = compute_hand_joint_angles(right_hand)
+
+    return {
+        "frame_index": frame_data["frame_index"],
+        "timestamp": frame_data["timestamp"],
+        "left_hand_angles": left_hand_angles,
+        "right_hand_angles": right_hand_angles,
+    }
+
+
+def compute_video_hand_angles(frames: list[dict]) -> list[dict]:
+    """Compute per-frame hand angles for a list of processed frames.
+
+    Args:
+        frames: List of processed frame dictionaries.
+
+    Returns:
+        List of per-frame angle dictionaries.
+    """
+    if frames is None or not isinstance(frames, list):
+        raise ValueError("compute_video_hand_angles: frames must be a list.")
+
+    return [compute_frame_hand_angles(frame_data=f) for f in frames]

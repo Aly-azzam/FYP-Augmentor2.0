@@ -1,50 +1,84 @@
-"""Evaluation Engine Service — orchestrates the full evaluation pipeline.
+"""Evaluation Engine: internal single-video evaluation pipeline.
 
-Fixed pipeline order:
-Upload → Perception → Motion Representation → Evaluation → VLM → Final Result
+This module orchestrates the internal evaluation flow for ONE video:
+`video -> landmarks -> features -> score`.
 
-This service coordinates the async execution of all stages
-and manages the LearnerAttempt status transitions.
+It runs perception, derives angle/trajectory/velocity features, computes an
+internal regularity-based motion score, and returns a single structured
+output dictionary. It intentionally does not implement expert-vs-learner
+comparison, DTW, or any persistence/API logic.
 """
 
-import uuid
-from typing import Optional
+from typing import Dict, List
 
-from app.core.constants import AttemptStatus
+from app.services.perception_service import run_perception_pipeline
+from app.services.angle_metrics_service import compute_video_hand_angles
+from app.services.trajectory_metrics_service import compute_video_trajectory_metrics
+from app.services.velocity_metrics_service import compute_video_velocity_metrics
+from app.services.scoring_service import compute_internal_motion_score
 
 
-async def run_evaluation_pipeline(
-    attempt_id: uuid.UUID,
-    learner_video_path: str,
-    expert_video_path: str,
-    chapter_id: uuid.UUID,
-) -> dict:
-    """Run the full evaluation pipeline for a learner attempt.
+def validate_perception_output(perception_output: Dict) -> List[Dict]:
+    """Validate perception output structure and return the frames list.
 
-    Steps:
-    1. Set status to RUNNING
-    2. Run Perception on both expert and learner videos
-    3. Run Motion Representation
-    4. Run Comparison + Metrics
-    5. Compute Score
-    6. Structure Feedback
-    7. Generate VLM Explanation
-    8. Persist EvaluationResult
-    9. Set final status (completed / completed_with_warnings / failed)
+    Args:
+        perception_output: Output dict from `run_perception_pipeline(video_path)`.
 
-    Returns dict with evaluation result data.
+    Returns:
+        The validated `frames` list.
+
+    Raises:
+        ValueError: if perception_output has an invalid structure.
     """
-    # TODO: wire all real sub-services and implement status transitions
+    if not isinstance(perception_output, dict):
+        raise ValueError("validate_perception_output: perception_output must be a dict.")
+
+    required_keys = {"video_path", "total_frames", "processed_frames", "frames"}
+    missing = required_keys - set(perception_output.keys())
+    if missing:
+        missing_str = ", ".join(sorted(missing))
+        raise ValueError(f"validate_perception_output: missing keys: {missing_str}.")
+
+    frames = perception_output["frames"]
+    if not isinstance(frames, list):
+        raise ValueError("validate_perception_output: 'frames' must be a list.")
+
+    return frames
+
+
+def run_full_evaluation(video_path: str) -> Dict:
+    """Run the full internal evaluation pipeline for a single video.
+
+    Pipeline:
+      1) perception: video -> frames -> hand landmarks
+      2) angle metrics
+      3) trajectory metrics
+      4) velocity metrics
+      5) internal-motion score
+
+    Args:
+        video_path: Path to the input video file.
+
+    Returns:
+        A dict with the exact structure specified in the STEP 6 requirements.
+    """
+    if not isinstance(video_path, str) or not video_path.strip():
+        raise ValueError("run_full_evaluation: video_path must be a non-empty string.")
+
+    perception_output = run_perception_pipeline(video_path)
+    frames = validate_perception_output(perception_output)
+
+    angle_frames = compute_video_hand_angles(frames)
+    trajectory_metrics = compute_video_trajectory_metrics(frames)
+    velocity_metrics = compute_video_velocity_metrics(frames)
+
+    scoring_output = compute_internal_motion_score(angle_frames, trajectory_metrics, velocity_metrics)
+
     return {
-        "status": AttemptStatus.COMPLETED,
-        "score": 75,
-        "metrics": {
-            "angle_deviation": 8.5,
-            "trajectory_deviation": 12.3,
-            "velocity_difference": 15.0,
-            "tool_alignment_deviation": 6.2,
-        },
-        "summary": "Placeholder evaluation result",
-        "ai_text": "Placeholder AI explanation",
-        "warnings": [],
+        "video_path": video_path,
+        "perception": perception_output,
+        "angle_metrics": angle_frames,
+        "trajectory_metrics": trajectory_metrics,
+        "velocity_metrics": velocity_metrics,
+        "scoring": scoring_output,
     }

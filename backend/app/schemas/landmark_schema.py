@@ -1,41 +1,53 @@
-"""Perception output contract.
+"""Landmark schema (Perception Engine placeholders).
 
-Canonical units:
-- coordinates: normalized (0..1) MediaPipe-style
-- timestamps: seconds
+This file defines lightweight placeholder schema classes that will later
+represent per-frame hand landmarks and the overall video-level output.
 """
 
+from __future__ import annotations
+
+from dataclasses import dataclass, field
 from typing import Optional
 
-from pydantic import BaseModel
+from typing import List
 
 
-class LandmarkPoint(BaseModel):
+@dataclass
+class LandmarkPoint:
+    """A single landmark point (normalized coordinates)."""
+
     x: float
     y: float
     z: Optional[float] = None
     confidence: Optional[float] = None
 
 
-class ToolDetection(BaseModel):
-    tool_class: str
-    confidence: float
-    bbox_normalized: Optional[list[float]] = None  # [x_min, y_min, x_max, y_max]
+@dataclass
+class HandLandmarks:
+    """A collection of hand landmarks for one hand in one frame."""
+
+    landmarks: List[LandmarkPoint] = field(default_factory=list)
 
 
-class FrameLandmarks(BaseModel):
+@dataclass
+class FrameLandmarks:
+    """Hand landmarks for a single frame."""
+
     frame_index: int
     timestamp_sec: float
-    left_hand: Optional[list[LandmarkPoint]] = None
-    right_hand: Optional[list[LandmarkPoint]] = None
-    tool_detections: list[ToolDetection] = []
+    left_hand: Optional[HandLandmarks] = None
+    right_hand: Optional[HandLandmarks] = None
 
 
-class PerceptionOutput(BaseModel):
-    """Full output contract of the Perception Engine."""
+@dataclass
+class VideoLandmarksOutput:
+    """Full output contract of the Perception Engine (placeholder)."""
 
     video_id: str
     fps: float
     total_frames: int
-    frames: list[FrameLandmarks]
-    vjepa_features: Optional[dict] = None  # placeholder for V-JEPA integration
+    frames: List[FrameLandmarks] = field(default_factory=list)
+
+
+# Backwards compatibility for older module type hints.
+PerceptionOutput = VideoLandmarksOutput
