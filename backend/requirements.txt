@@ -7,3 +7,4 @@ asyncpg
 alembic
 python-multipart
 python-dotenv
+pytest
