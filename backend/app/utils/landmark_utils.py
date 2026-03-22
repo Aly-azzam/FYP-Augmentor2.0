@@ -1,28 +1,24 @@
-"""Landmark utilities — filtering, confidence checks, interpolation helpers."""
+"""Landmark utilities (Perception Engine helpers).
 
-from typing import Optional
+This module contains placeholder helper function skeletons for converting
+raw landmark lists into dictionary/structured formats.
+"""
 
+from __future__ import annotations
 
-def filter_low_confidence(
-    landmarks: list[dict],
-    min_confidence: float = 0.5,
-) -> list[dict]:
-    """Filter out landmarks below confidence threshold."""
-    return [lm for lm in landmarks if (lm.get("confidence") or 0) >= min_confidence]
+from typing import Any, Dict, Optional
 
 
-def interpolate_missing_frames(
-    frames: list[Optional[dict]],
-    max_gap: int = 5,
-) -> list[Optional[dict]]:
-    """Interpolate missing frames up to max_gap consecutive frames.
-
-    Returns list with interpolated values where possible, None otherwise.
-    """
-    # TODO: implement linear interpolation for short gaps
-    return frames
+def landmark_list_to_dict(landmarks: Any) -> Dict[str, Any]:
+    """Convert a raw landmark list into a structured dictionary (stub)."""
+    raise NotImplementedError("Landmark conversion is not implemented yet.")
 
 
-def count_usable_frames(frames: list[Optional[dict]]) -> int:
-    """Count frames that have at least one hand detected."""
-    return sum(1 for f in frames if f is not None)
+def format_frame_landmarks(
+    frame_index: int,
+    timestamp_sec: float,
+    left_hand: Optional[Any] = None,
+    right_hand: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Format per-frame landmarks into a schema-friendly dict (stub)."""
+    raise NotImplementedError("Frame landmark formatting is not implemented yet.")

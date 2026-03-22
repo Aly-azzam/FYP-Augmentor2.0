@@ -1,4 +1,8 @@
-"""Shared constants for the AugMentor backend."""
+"""Shared constants for the AugMentor backend.
+
+This module also includes placeholders used by the Perception Engine module
+until real inference and video handling logic is implemented.
+"""
 
 from enum import Enum
 
@@ -29,3 +33,7 @@ ALLOWED_TRANSITIONS: dict[AttemptStatus, list[AttemptStatus]] = {
 
 ALLOWED_VIDEO_TYPES = {"video/mp4", "video/quicktime"}
 MAX_VIDEO_DURATION_SECONDS = 120
+
+# Perception Engine placeholders (used by stubs in the perception pipeline)
+SUPPORTED_VIDEO_FORMATS: set[str] = {".mp4", ".mov", ".mkv", ".avi"}
+DEFAULT_FPS: float = 30.0

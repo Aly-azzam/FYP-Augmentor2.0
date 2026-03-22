@@ -1,35 +1,20 @@
-"""Video utilities — file handling, path generation, format helpers."""
+"""Video utilities (Perception Engine helpers).
 
-import uuid
-from pathlib import Path
+This module contains small helper function skeletons used by the
+Perception Engine for working with video filenames and frame timestamps.
+"""
 
-from app.core.config import settings
-
-
-def get_upload_path(filename: str, attempt_id: uuid.UUID) -> Path:
-    """Generate storage path for an uploaded practice video."""
-    ext = Path(filename).suffix
-    dest = settings.STORAGE_ROOT / settings.UPLOAD_DIR / f"{attempt_id}{ext}"
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    return dest
+from __future__ import annotations
 
 
-def get_landmark_path(video_id: str) -> Path:
-    """Generate storage path for persisted landmark data."""
-    dest = settings.STORAGE_ROOT / settings.PROCESSED_DIR / "landmarks" / f"{video_id}.json"
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    return dest
+def is_supported_video_format(filename: str) -> bool:
+    """Check whether the filename's extension is supported (stub).
+
+    Placeholder stub; later this will validate based on configured formats.
+    """
+    raise NotImplementedError("Video format validation is not implemented yet.")
 
 
-def get_motion_path(video_id: str) -> Path:
-    """Generate storage path for persisted motion representation."""
-    dest = settings.STORAGE_ROOT / settings.PROCESSED_DIR / "motion" / f"{video_id}.json"
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    return dest
-
-
-def get_evaluation_output_path(evaluation_id: uuid.UUID) -> Path:
-    """Generate storage path for evaluation result artifact."""
-    dest = settings.STORAGE_ROOT / settings.OUTPUT_DIR / "evaluations" / f"{evaluation_id}.json"
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    return dest
+def frame_to_timestamp(frame_index: int, fps: float) -> float:
+    """Convert a frame index into a timestamp in seconds (stub)."""
+    raise NotImplementedError("Frame-to-timestamp conversion is not implemented yet.")
