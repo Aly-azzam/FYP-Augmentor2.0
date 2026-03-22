@@ -1,17 +1,14 @@
-"""Scoring Service — compute composite score from metrics.
-
-Owner: Evaluation Engine (Person 3)
-"""
-
-from app.core.evaluation_constants import DEFAULT_METRIC_WEIGHTS, SCORE_MIN, SCORE_MAX
+"""Scoring Service — convert DTW distance into a score /100."""
 
 
-async def compute_score(metrics: dict[str, float]) -> int:
-    """Compute weighted composite score from individual metrics.
+class ScoringService:
+    """Compute a simple score from normalized DTW distance."""
 
-    Lower metric values = better performance = higher score.
-    Returns score clamped to [SCORE_MIN, SCORE_MAX].
-    """
-    # TODO: implement real scoring formula based on metric ranges
-    # Stub: return a placeholder score
-    return 75
+    def compute_score(self, normalized_distance: float) -> dict[str, float]:
+        """Convert normalized DTW distance into a 0..100 score."""
+        safe_distance = max(0.0, float(normalized_distance))
+        score = max(0.0, 100.0 * (1.0 - safe_distance))
+        return {
+            "score": score,
+            "normalized_distance": safe_distance,
+        }
