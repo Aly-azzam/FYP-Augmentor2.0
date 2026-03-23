@@ -1,13 +1,21 @@
-"""Evaluation utilities — status transitions, warning builders."""
+"""Small reusable helpers for the Evaluation Engine."""
 
-from app.core.constants import AttemptStatus, ALLOWED_TRANSITIONS
-
-
-def validate_status_transition(current: AttemptStatus, target: AttemptStatus) -> bool:
-    """Check if a status transition is allowed."""
-    return target in ALLOWED_TRANSITIONS.get(current, [])
+from collections.abc import Iterable
 
 
-def build_warning(code: str, message: str) -> dict:
-    """Build a warning dict matching the Warning schema."""
-    return {"code": code, "message": message}
+def round_metric(value: float, digits: int = 4) -> float:
+    """Round a metric value to a consistent number of decimal places."""
+    return round(value, digits)
+
+
+def safe_average(values: Iterable[float]) -> float:
+    """Return the average of numeric values, or 0.0 when empty."""
+    values_list = list(values)
+    if not values_list:
+        return 0.0
+    return sum(values_list) / len(values_list)
+
+
+def clamp(value: float, minimum: float, maximum: float) -> float:
+    """Clamp a numeric value between a minimum and maximum bound."""
+    return max(minimum, min(value, maximum))
