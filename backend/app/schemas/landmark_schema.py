@@ -47,6 +47,7 @@ class VideoLandmarksOutput:
     fps: float
     total_frames: int
     frames: List[FrameLandmarks] = field(default_factory=list)
+    vjepa_features: dict | None = None
 
 
 # Backwards compatibility for older module type hints.

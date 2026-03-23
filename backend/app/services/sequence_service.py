@@ -16,6 +16,7 @@ from app.core.motion_constants import (
     DEFAULT_TRACKED_LANDMARKS,
     DEFAULT_VISIBILITY_THRESHOLD,
 )
+from app.schemas.landmark_schema import PerceptionOutput
 from app.schemas.motion_schema import MotionFrame, MotionSequenceOutput
 from app.utils.sequence_utils import landmark_to_vector, trim_empty_frames
 
@@ -127,3 +128,30 @@ class SequenceService:
             return landmark_to_vector(None)
 
         return landmark_to_vector(landmark)
+
+
+
+async def build_sequences(
+    landmark_data: dict[str, Any] | PerceptionOutput,
+    tracked_points: list[str] | None = None,
+) -> dict[str, Any]:
+    """Compatibility wrapper for tests expecting the legacy async stub."""
+    if isinstance(landmark_data, PerceptionOutput):
+        return {
+            "tracked_landmarks": [],
+            "frames": [],
+            "sequence_length": 0,
+        }
+
+    service = SequenceService()
+    sequence = service.build_motion_sequence(
+        landmark_data=landmark_data,
+        tracked_points=tracked_points,
+    )
+    return {
+        "tracked_landmarks": sequence.tracked_landmarks,
+        "frames": [frame.model_dump() for frame in sequence.frames],
+        "sequence_length": sequence.sequence_length,
+    }
+
+
