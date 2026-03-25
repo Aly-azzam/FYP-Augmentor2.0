@@ -47,6 +47,8 @@ class VideoLandmarksOutput:
     fps: float
     total_frames: int
     frames: List[FrameLandmarks] = field(default_factory=list)
+    video_path: Optional[str] = None
+    coordinate_system: str = "normalized"
     vjepa_features: dict | None = None
 
 

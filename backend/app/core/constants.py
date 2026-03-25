@@ -31,7 +31,14 @@ ALLOWED_TRANSITIONS: dict[AttemptStatus, list[AttemptStatus]] = {
     AttemptStatus.FAILED: [],
 }
 
-ALLOWED_VIDEO_TYPES = {"video/mp4", "video/quicktime"}
+ALLOWED_VIDEO_TYPES = {
+    "video/mp4",
+    "video/quicktime",
+    "video/x-msvideo",
+    "video/avi",
+    "video/webm",
+}
+ALLOWED_VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".webm"}
 MAX_VIDEO_DURATION_SECONDS = 120
 
 # Perception Engine placeholders (used by stubs in the perception pipeline)

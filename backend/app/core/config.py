@@ -12,8 +12,18 @@ class Settings(BaseSettings):
     # Local storage root (MVP)
     STORAGE_ROOT: Path = Path(__file__).resolve().parents[2] / "storage"
     UPLOAD_DIR: str = "uploads"
+    LEARNER_UPLOAD_SUBDIR: str = "learner_videos"
     PROCESSED_DIR: str = "processed"
     OUTPUT_DIR: str = "outputs"
+    MAX_UPLOAD_SIZE_BYTES: int = 100 * 1024 * 1024
+    STANDARDIZATION_TARGET_FPS: float = 30.0
+    STANDARDIZATION_FRAME_WIDTH: int = 640
+    STANDARDIZATION_FRAME_HEIGHT: int = 480
+    HAND_DETECTION_MAX_NUM_HANDS: int = 2
+    HAND_DETECTION_MIN_DETECTION_CONFIDENCE: float = 0.5
+    HAND_DETECTION_MIN_TRACKING_CONFIDENCE: float = 0.5
+    HAND_DETECTION_MIN_PRESENCE_CONFIDENCE: float = 0.5
+    HAND_LANDMARKER_MODEL_PATH: Path = Path(__file__).resolve().parents[2] / "models" / "hand_landmarker.task"
 
     # Pipeline timeouts (seconds)
     UPLOAD_VALIDATION_TIMEOUT: int = 30

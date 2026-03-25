@@ -18,10 +18,20 @@ class ExpertVideoOut(BaseModel):
     id: UUID
     chapter_id: UUID
     file_path: str
+    url: str
     duration_seconds: Optional[float] = None
     fps: Optional[float] = None
 
     model_config = {"from_attributes": True}
+
+
+class ExpertVideoAssetOut(BaseModel):
+    filename: str
+    storage_key: str
+    file_path: str
+    url: str
+    chapter_id: Optional[UUID] = None
+    expert_video_id: Optional[UUID] = None
 
 
 class ChapterDetail(BaseModel):

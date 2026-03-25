@@ -1,7 +1,7 @@
-import { useState, useMemo } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { motion } from 'framer-motion';
-import { Search, SlidersHorizontal, BookOpen } from 'lucide-react';
+import { Search, SlidersHorizontal, BookOpen, PlayCircle } from 'lucide-react';
 import { courses } from '@/services/mock/courses';
 import type { Course } from '@/types';
 
@@ -34,6 +34,38 @@ export default function Courses() {
   const [query, setQuery] = useState('');
   const [difficulty, setDifficulty] = useState<Difficulty>('all');
   const [sort, setSort] = useState<SortKey>('title');
+  const [expertVideoUrl, setExpertVideoUrl] = useState<string | null>(null);
+  const [expertVideoError, setExpertVideoError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadExpertVideo = async () => {
+      try {
+        const response = await fetch('/api/chapters/default/expert-video');
+        if (!response.ok) {
+          throw new Error('Failed to load default expert video');
+        }
+
+        const payload: { url: string } = await response.json();
+        if (!cancelled) {
+          setExpertVideoError(null);
+          setExpertVideoUrl(payload.url);
+        }
+      } catch {
+        if (!cancelled) {
+          setExpertVideoUrl(null);
+          setExpertVideoError('Expert video is unavailable. Start the AugMentor 2.0 backend on port 8001 and seed an expert video.');
+        }
+      }
+    };
+
+    void loadExpertVideo();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const filtered = useMemo(() => {
     let result = [...courses];
@@ -69,6 +101,84 @@ export default function Courses() {
         <h1 className="page-title">Courses</h1>
         <p className="page-subtitle">Browse our collection of expert-led craft courses</p>
       </div>
+
+      {/* ── Expert Demo Preview ─────────────────────────────────────────── */}
+      <motion.div
+        className="glass"
+        initial={{ opacity: 0, y: 20 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ duration: 0.4 }}
+        style={{
+          display: 'grid',
+          gridTemplateColumns: 'minmax(0, 1.1fr) minmax(280px, 0.9fr)',
+          gap: 'var(--space-xl)',
+          padding: 'var(--space-xl)',
+          borderRadius: 'var(--radius-xl)',
+          marginBottom: 'var(--space-xl)',
+        }}
+      >
+        <div>
+          <div
+            className="badge badge-blue"
+            style={{ display: 'inline-flex', marginBottom: 'var(--space-sm)' }}
+          >
+            Featured Expert Demo
+          </div>
+          <h2 className="heading-3" style={{ marginBottom: 'var(--space-sm)' }}>
+            Watch an expert technique before choosing your course
+          </h2>
+          <p
+            className="text-body"
+            style={{ color: 'var(--text-secondary)', marginBottom: 'var(--space-lg)' }}
+          >
+            This preview uses the current expert video stored in the backend so learners can
+            immediately see the kind of guided practice they will compare against later.
+          </p>
+          <div style={{ display: 'flex', gap: 'var(--space-sm)', flexWrap: 'wrap' }}>
+            <Link to="/courses/pottery-wheel" className="btn btn-primary">
+              <PlayCircle size={16} />
+              Explore Pottery Course
+            </Link>
+            <Link to="/compare" className="btn btn-secondary">
+              Open Compare Studio
+            </Link>
+          </div>
+        </div>
+
+        <div
+          className="video-container"
+          style={{
+            aspectRatio: '16/9',
+            background: 'var(--bg-tertiary)',
+            borderRadius: 'var(--radius-lg)',
+            overflow: 'hidden',
+          }}
+        >
+          {expertVideoUrl ? (
+            <video
+              key={expertVideoUrl}
+              src={expertVideoUrl}
+              controls
+              preload="metadata"
+              playsInline
+              style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }}
+            />
+          ) : (
+            <div
+              className="flex-center"
+              style={{
+                width: '100%',
+                height: '100%',
+                color: 'var(--text-muted)',
+                padding: 'var(--space-lg)',
+                textAlign: 'center',
+              }}
+            >
+              {expertVideoError ?? 'Expert video preview is loading...'}
+            </div>
+          )}
+        </div>
+      </motion.div>
 
       {/* ── Search & Filters ────────────────────────────────────────────── */}
       <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-md)', marginBottom: 'var(--space-xl)' }}>
@@ -150,20 +260,38 @@ export default function Courses() {
               >
                 {/* Thumbnail */}
                 <div style={{ position: 'relative', aspectRatio: '16/9', background: 'var(--bg-tertiary)', overflow: 'hidden' }}>
-                  <img
-                    src={course.thumbnail}
-                    alt={course.title}
-                    style={{ width: '100%', height: '100%', objectFit: 'cover' }}
-                    onError={(e) => {
-                      (e.target as HTMLImageElement).style.display = 'none';
-                    }}
-                  />
+                  {course.id === 'pottery-wheel' && expertVideoUrl ? (
+                    <video
+                      src={expertVideoUrl}
+                      muted
+                      playsInline
+                      preload="metadata"
+                      style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }}
+                    />
+                  ) : (
+                    <img
+                      src={course.thumbnail}
+                      alt={course.title}
+                      style={{ width: '100%', height: '100%', objectFit: 'cover' }}
+                      onError={(e) => {
+                        (e.target as HTMLImageElement).style.display = 'none';
+                      }}
+                    />
+                  )}
                   <span
                     className={`difficulty-badge difficulty-${course.difficulty}`}
                     style={{ position: 'absolute', top: 'var(--space-sm)', right: 'var(--space-sm)' }}
                   >
                     {course.difficulty}
                   </span>
+                  {course.id === 'pottery-wheel' && expertVideoUrl && (
+                    <span
+                      className="badge badge-blue"
+                      style={{ position: 'absolute', top: 'var(--space-sm)', left: 'var(--space-sm)' }}
+                    >
+                      Real Expert Video
+                    </span>
+                  )}
                 </div>
 
                 {/* Body */}

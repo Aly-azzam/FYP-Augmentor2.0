@@ -45,8 +45,11 @@ export default function CourseDetail() {
   }, [course, setSelectedCourse, setRobotMessage]);
 
   const handleClipClick = (clipId: string) => {
+    if (!course) return;
+
+    setSelectedCourse(course.id);
     setSelectedClip(clipId);
-    navigate('/compare');
+    navigate(`/compare?courseId=${encodeURIComponent(course.id)}&clipId=${encodeURIComponent(clipId)}`);
   };
 
   if (!course) {
@@ -244,12 +247,29 @@ export default function CourseDetail() {
                   width: '100%',
                   aspectRatio: '16/9',
                   background: 'var(--bg-tertiary)',
-                  backgroundImage: `url(${clip.thumbnail})`,
-                  backgroundSize: 'cover',
-                  backgroundPosition: 'center',
                   overflow: 'hidden',
                 }}
               >
+                {clip.expertVideoUrl ? (
+                  <video
+                    src={clip.expertVideoUrl}
+                    muted
+                    playsInline
+                    preload="metadata"
+                    style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }}
+                  />
+                ) : (
+                  <div
+                    style={{
+                      width: '100%',
+                      height: '100%',
+                      backgroundImage: `url(${clip.thumbnail})`,
+                      backgroundSize: 'cover',
+                      backgroundPosition: 'center',
+                    }}
+                  />
+                )}
+
                 <div
                   className="flex-center"
                   style={{
@@ -268,6 +288,15 @@ export default function CourseDetail() {
                 >
                   <Play size={28} style={{ color: '#fff' }} />
                 </div>
+
+                {clip.expertVideoUrl && (
+                  <span
+                    className="badge badge-blue"
+                    style={{ position: 'absolute', top: 6, left: 6 }}
+                  >
+                    Real Expert Video
+                  </span>
+                )}
 
                 <span
                   style={{

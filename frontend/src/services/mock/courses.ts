@@ -72,7 +72,7 @@ export const courses: Course[] = [
     description:
       'Advanced pottery wheel techniques for creating complex forms, trimming, and decorative methods.',
     difficulty: 'advanced',
-    totalClips: 30,
+    totalClips: 1,
     estimatedTime: '7h 00m',
     progress: 0,
     thumbnail: '/course-pottery.jpg',
@@ -147,7 +147,28 @@ const woodCarvingTechniques = [
   'Final Presentation',
 ];
 
+const potteryWheelClips: VideoClip[] = [
+  {
+    id: 'pottery-wheel-clip-1',
+    title: 'Pottery Expert Demo',
+    duration: 10,
+    description:
+      'This is the real pottery expert video currently available in the system. Choose it to start side-by-side comparison in Compare Studio.',
+    thumbnail: '/course-pottery.jpg',
+    expertVideoUrl: '/storage/expert/pottery.mp4',
+    keyPoints: [
+      'Watch the real expert demo currently stored in the backend',
+      'Use this clip as the expert reference on the left side of Compare Studio',
+      'Upload your learner video on the right and start comparison',
+    ],
+  },
+];
+
 export function getClipsForCourse(courseId: string): VideoClip[] {
+  if (courseId === 'pottery-wheel') {
+    return potteryWheelClips;
+  }
+
   let techniques: string[];
 
   switch (courseId) {

@@ -1,31 +1,54 @@
-import uuid
+from typing import Optional
+from uuid import UUID
 
-from fastapi import APIRouter, UploadFile, File, Form
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.database import get_db
 from app.schemas.upload_schema import UploadResponse
+from app.services.media_service import build_storage_url
+from app.services.upload_service import (
+    RelatedResourceNotFoundError,
+    UploadPersistenceError,
+    UploadValidationError,
+    create_learner_attempt_upload,
+)
 
 router = APIRouter(prefix="/api/uploads", tags=["Uploads"])
 
 
 @router.post("/practice-video", response_model=UploadResponse)
 async def upload_practice_video(
-    chapter_id: str = Form(...),
+    chapter_id: UUID = Form(...),
     file: UploadFile = File(...),
+    user_id: Optional[UUID] = Form(None),
+    db: AsyncSession = Depends(get_db),
 ):
-    """Upload a learner practice video for a specific chapter.
-
-    Creates a LearnerAttempt record and stores the video file.
-    """
-    attempt_id = uuid.uuid4()
-
-    # TODO: implement real flow:
-    # 1. Create LearnerAttempt with status=created
-    # 2. Validate video (format, duration)
-    # 3. Save file to storage
-    # 4. Update status to uploaded (or failed if validation fails)
+    """Upload a learner practice video and persist its attempt record."""
+    try:
+        result = await create_learner_attempt_upload(
+            db,
+            chapter_id=chapter_id,
+            file=file,
+            user_id=user_id,
+        )
+    except RelatedResourceNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except UploadValidationError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    except UploadPersistenceError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to store uploaded video.",
+        ) from exc
 
     return UploadResponse(
-        attempt_id=attempt_id,
-        status="uploaded",
-        message="Video uploaded successfully. Ready for evaluation.",
+        attempt_id=result.attempt.id,
+        chapter_id=result.attempt.chapter_id,
+        expert_video_id=result.expert_video_id,
+        upload_status=result.attempt.status,
+        original_filename=result.attempt.original_filename or file.filename or "",
+        stored_path=result.attempt.video_path or "",
+        video_url=build_storage_url(result.attempt.video_path) if result.attempt.video_path else None,
+        message="Video uploaded successfully. Learner attempt is ready for evaluation.",
     )

@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useDropzone } from 'react-dropzone';
 import { toast } from 'sonner';
@@ -121,7 +122,9 @@ const TOUR_STEPS = [
 export default function CompareStudio() {
   // ── Store hooks ──────────────────────────────────────────────────────────
 
-  const { selectedCourse, selectedClip, userVideo, setUserVideo } =
+  const [searchParams] = useSearchParams();
+
+  const { selectedCourse, selectedClip, userVideo, setUserVideo, setSelectedCourse, setSelectedClip } =
     useCourseStore();
 
   const {
@@ -175,6 +178,8 @@ export default function CompareStudio() {
   // ── Local state ──────────────────────────────────────────────────────────
 
   const [userVideoUrl, setUserVideoUrl] = useState<string | null>(null);
+  const [expertVideoUrl, setExpertVideoUrl] = useState<string | null>(null);
+  const [expertVideoError, setExpertVideoError] = useState<string | null>(null);
   const [expertCurrentTime, setExpertCurrentTime] = useState(0);
   const [expertDuration, setExpertDuration] = useState(0);
   const [learnerCurrentTime, setLearnerCurrentTime] = useState(0);
@@ -195,17 +200,83 @@ export default function CompareStudio() {
   const course = courses.find((c) => c.id === selectedCourse);
   const clips = selectedCourse ? getClipsForCourse(selectedCourse) : [];
   const clip = clips.find((c) => c.id === selectedClip);
+  const requestedCourseId = searchParams.get('courseId');
+  const requestedClipId = searchParams.get('clipId');
 
   // ── Effects ──────────────────────────────────────────────────────────────
+
+  useEffect(() => {
+    if (requestedCourseId && requestedCourseId !== selectedCourse) {
+      setSelectedCourse(requestedCourseId);
+    }
+
+    if (requestedClipId && requestedClipId !== selectedClip) {
+      setSelectedClip(requestedClipId);
+    }
+  }, [
+    requestedCourseId,
+    requestedClipId,
+    selectedCourse,
+    selectedClip,
+    setSelectedCourse,
+    setSelectedClip,
+  ]);
 
   useEffect(() => {
     setRobotMessage(
       clip
         ? `Practicing "${clip.title}". Upload your video and compare with the expert!`
-        : 'Select a clip from a course to start comparing. Head to Courses to pick one!',
+        : 'Choose an expert video first, then start the comparison from the course page.',
     );
     return () => setRobotMessage(null);
   }, [clip, setRobotMessage]);
+
+  useEffect(() => {
+    if (!clip) {
+      setExpertVideoUrl(null);
+      setExpertVideoError(null);
+      setExpertCurrentTime(0);
+      setExpertDuration(0);
+    }
+  }, [clip]);
+
+  useEffect(() => {
+    let isCancelled = false;
+
+    const loadSelectedExpertVideo = async () => {
+      if (!clip) {
+        return;
+      }
+
+      if (clip.expertVideoUrl) {
+        setExpertVideoError(null);
+        setExpertVideoUrl(clip.expertVideoUrl);
+        return;
+      }
+
+      try {
+        if (!isCancelled) {
+          setExpertVideoUrl(null);
+          setExpertVideoError(
+            'This selected clip does not have a real expert video linked yet.',
+          );
+        }
+      } catch {
+        if (!isCancelled) {
+          setExpertVideoUrl(null);
+          setExpertVideoError(
+            'This selected clip does not have a real expert video linked yet.',
+          );
+        }
+      }
+    };
+
+    void loadSelectedExpertVideo();
+
+    return () => {
+      isCancelled = true;
+    };
+  }, [clip]);
 
   // Timer tick
   useEffect(() => {
@@ -499,7 +570,7 @@ export default function CompareStudio() {
             Expert Video
           </span>
 
-          {clip ? (
+          {clip && expertVideoUrl ? (
             <>
               <div
                 className="video-container"
@@ -510,7 +581,11 @@ export default function CompareStudio() {
               >
                 <video
                   ref={expertVideoRef}
+                  key={expertVideoUrl ?? 'missing-expert-video'}
+                  src={expertVideoUrl ?? undefined}
                   poster={clip.thumbnail}
+                  preload="metadata"
+                  playsInline
                   onTimeUpdate={() => {
                     if (expertVideoRef.current)
                       setExpertCurrentTime(expertVideoRef.current.currentTime);
@@ -537,6 +612,14 @@ export default function CompareStudio() {
                 expertMuted,
                 () => setExpertMuted(!expertMuted),
               )}
+              {expertVideoError && (
+                <p
+                  className="text-small"
+                  style={{ color: 'var(--danger, #dc2626)', marginTop: 'var(--space-sm)' }}
+                >
+                  {expertVideoError}
+                </p>
+              )}
             </>
           ) : (
             <div
@@ -554,9 +637,13 @@ export default function CompareStudio() {
                     margin: '0 auto var(--space-md)',
                   }}
                 />
-                <p className="empty-state-title">No Clip Selected</p>
+                <p className="empty-state-title">
+                  {clip ? 'Expert Video Unavailable' : 'Choose An Expert Video'}
+                </p>
                 <p className="empty-state-description">
-                  Select a clip from a course to begin
+                  {clip
+                    ? (expertVideoError ?? 'Start the backend and make sure the selected expert video is available.')
+                    : 'Go to the course page, choose the expert video you want, then press start comparison.'}
                 </p>
               </div>
             </div>

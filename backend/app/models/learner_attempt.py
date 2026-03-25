@@ -21,6 +21,9 @@ class LearnerAttempt(Base):
     )
 
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="created")
+    original_filename: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    content_type: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    file_size_bytes: Mapped[Optional[int]] = mapped_column(nullable=True)
     video_path: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
     error_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 

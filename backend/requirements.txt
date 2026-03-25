@@ -8,3 +8,6 @@ alembic
 python-multipart
 python-dotenv
 pytest
+numpy
+opencv-python
+mediapipe

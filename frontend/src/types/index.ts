@@ -18,6 +18,7 @@ export interface VideoClip {
   description: string;
   thumbnail: string;
   keyPoints: string[];
+  expertVideoUrl?: string;
 }
 
 export interface MetricSet {
