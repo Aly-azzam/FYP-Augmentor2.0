@@ -200,6 +200,24 @@ def compute_trajectory_difference(
 
 def compute_trajectory_deviation(paired_motion_data: dict[str, Any]) -> float:
     """Compute one normalized trajectory deviation score from paired motion data."""
+    modern_channels = paired_motion_data.get("modern_aligned_channels")
+    if isinstance(modern_channels, dict):
+        channel_map = modern_channels.get("trajectory_channels")
+        if isinstance(channel_map, dict) and channel_map:
+            trajectory_scores: list[float] = []
+            for channel_payload in channel_map.values():
+                if not isinstance(channel_payload, dict):
+                    continue
+                expert_trajectory = channel_payload.get("expert", [])
+                learner_trajectory = channel_payload.get("learner", [])
+                if not isinstance(expert_trajectory, list) or not isinstance(learner_trajectory, list):
+                    continue
+                trajectory_scores.append(
+                    compute_trajectory_difference(expert_trajectory, learner_trajectory)
+                )
+            if trajectory_scores:
+                return round_metric(safe_average(trajectory_scores))
+
     if "expert_motion" not in paired_motion_data or "learner_motion" not in paired_motion_data:
         raise ValueError("Paired motion data must include 'expert_motion' and 'learner_motion'.")
 
@@ -226,3 +244,47 @@ def compute_trajectory_deviation(paired_motion_data: dict[str, Any]) -> float:
         )
 
     return round_metric(safe_average(trajectory_scores))
+
+
+def compute_timing_score(paired_motion_data: dict[str, Any]) -> float:
+    """Compute normalized timing/rhythm quality from DTW path and timestamps."""
+    modern_channels = paired_motion_data.get("modern_aligned_channels")
+    if not isinstance(modern_channels, dict):
+        return 1.0
+
+    alignment_path = modern_channels.get("alignment_path")
+    expert_timestamps = modern_channels.get("expert_timestamps")
+    learner_timestamps = modern_channels.get("learner_timestamps")
+    if (
+        not isinstance(alignment_path, list)
+        or len(alignment_path) < 2
+        or not isinstance(expert_timestamps, list)
+        or not isinstance(learner_timestamps, list)
+    ):
+        return 1.0
+
+    step_count = len(alignment_path) - 1
+    warp_steps = 0
+    progression_ratios: list[float] = []
+
+    for index in range(1, len(alignment_path)):
+        previous = alignment_path[index - 1]
+        current = alignment_path[index]
+        if not isinstance(previous, dict) or not isinstance(current, dict):
+            continue
+
+        di = int(current.get("expert_index", 0)) - int(previous.get("expert_index", 0))
+        dj = int(current.get("learner_index", 0)) - int(previous.get("learner_index", 0))
+        if di == 0 or dj == 0:
+            warp_steps += 1
+
+        if index < len(expert_timestamps) and index < len(learner_timestamps):
+            dt_expert = float(expert_timestamps[index]) - float(expert_timestamps[index - 1])
+            dt_learner = float(learner_timestamps[index]) - float(learner_timestamps[index - 1])
+            if dt_expert > 0.0 and dt_learner > 0.0:
+                progression_ratios.append(min(dt_expert, dt_learner) / max(dt_expert, dt_learner))
+
+    warp_penalty = float(warp_steps) / float(step_count) if step_count > 0 else 0.0
+    progression_score = safe_average(progression_ratios) if progression_ratios else 1.0
+    timing_score = (0.6 * progression_score) + (0.4 * (1.0 - warp_penalty))
+    return round_metric(clamp(timing_score, 0.0, 1.0))

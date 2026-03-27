@@ -5,10 +5,13 @@ from __future__ import annotations
 from typing import Any, Dict
 
 from app.core.evaluation_constants import (
+    ACTIVE_SCORING_METRICS,
+    DEVIATION_METRICS,
     DEFAULT_METRIC_WEIGHTS,
     EXCELLENT_SCORE_THRESHOLD,
     FAIR_SCORE_THRESHOLD,
     GOOD_SCORE_THRESHOLD,
+    QUALITY_METRICS,
     NEEDS_IMPROVEMENT_SCORE_THRESHOLD,
     REQUIRED_METRICS,
     SCORE_MAX,
@@ -224,13 +227,10 @@ def compute_internal_motion_score(
 
 
 async def compute_score(metrics: dict[str, Any]) -> int:
-    """Compatibility async scoring API expected by tests."""
+    """Compatibility async scoring API returning deterministic numeric score."""
     if not isinstance(metrics, dict):
         raise ValueError("compute_score: metrics must be a dict.")
-
-    # Preserve the historical stub contract for old tests while the real
-    # production scoring logic continues to live in compute_internal_motion_score.
-    return 75
+    return int(compute_final_score(metrics)["score"])
 
 
 class ScoringService:
@@ -249,19 +249,63 @@ class ScoringService:
         )
 
 
-def compute_total_deviation(metrics: dict[str, float]) -> float:
-    """Compute the weighted total deviation from normalized metric values."""
+def normalize_metric_for_scoring(metric_name: str, raw_value: float) -> float:
+    """Convert raw metric value into quality in [0,1]."""
+    value = clamp(float(raw_value), 0.0, 1.0)
+    if metric_name in DEVIATION_METRICS:
+        return clamp(1.0 - value, 0.0, 1.0)
+    if metric_name in QUALITY_METRICS:
+        return value
+    raise ValueError(f"Unknown metric for scoring normalization: {metric_name}")
+
+
+def compute_metric_breakdown(metrics: dict[str, float]) -> dict[str, dict[str, float]]:
+    """Build per-metric scoring breakdown with score-point contributions."""
     missing_metrics = [metric_name for metric_name in REQUIRED_METRICS if metric_name not in metrics]
     if missing_metrics:
         missing = ", ".join(missing_metrics)
         raise ValueError(f"Missing required metrics for scoring: {missing}")
 
-    total_deviation = 0.0
-    for metric_name, weight in DEFAULT_METRIC_WEIGHTS.items():
-        metric_value = clamp(float(metrics[metric_name]), 0.0, 1.0)
-        total_deviation += metric_value * weight
+    breakdown: dict[str, dict[str, float]] = {}
+    for metric_name in (
+        "trajectory_deviation",
+        "angle_deviation",
+        "velocity_difference",
+        "smoothness_score",
+        "timing_score",
+        "hand_openness_deviation",
+        "tool_alignment_deviation",
+    ):
+        if metric_name not in metrics:
+            continue
 
-    return round_metric(clamp(total_deviation, 0.0, 1.0))
+        raw_value = clamp(float(metrics[metric_name]), 0.0, 1.0)
+        if metric_name in DEVIATION_METRICS or metric_name in QUALITY_METRICS:
+            normalized_quality = normalize_metric_for_scoring(metric_name, raw_value)
+        else:
+            normalized_quality = raw_value
+
+        weight = float(DEFAULT_METRIC_WEIGHTS.get(metric_name, 0.0))
+        contribution = SCORE_MAX * weight * normalized_quality
+
+        breakdown[metric_name] = {
+            "raw_value": round_metric(raw_value),
+            "normalized_quality": round_metric(normalized_quality),
+            "weight": round_metric(weight),
+            "contribution": round_metric(contribution),
+        }
+
+    return breakdown
+
+
+def compute_score_quality(metrics: dict[str, float]) -> float:
+    """Compute weighted score quality in [0,1] from active metrics."""
+    breakdown = compute_metric_breakdown(metrics)
+    total_quality = sum(
+        breakdown[metric_name]["weight"] * breakdown[metric_name]["normalized_quality"]
+        for metric_name in ACTIVE_SCORING_METRICS
+    )
+    return round_metric(clamp(total_quality, 0.0, 1.0))
 
 
 def classify_score(score: int) -> str:
@@ -278,18 +322,30 @@ def classify_score(score: int) -> str:
 
 
 def compute_final_score(metrics: dict[str, float]) -> dict[str, Any]:
-    """Convert deviation metrics into a final score and label.
+    """Convert mixed-direction normalized metrics into a final score and label.
 
-    Lower deviation means better performance, so the score decreases
-    as the total deviation increases.
+    Formula:
+    score_quality =
+      0.30*trajectory_quality +
+      0.25*angle_quality +
+      0.20*velocity_quality +
+      0.15*smoothness_score +
+      0.10*timing_score
+
+    final_score = round(100 * score_quality), clamped to [0,100].
     """
-    total_deviation = compute_total_deviation(metrics)
-    raw_score = SCORE_MAX * (1.0 - total_deviation)
+    breakdown = compute_metric_breakdown(metrics)
+    total_quality = compute_score_quality(metrics)
+    raw_score = SCORE_MAX * total_quality
     final_score = int(round(clamp(raw_score, SCORE_MIN, SCORE_MAX)))
+    contribution_sum = round_metric(sum(item["contribution"] for item in breakdown.values()))
 
     return {
         "score": final_score,
+        "score_quality": round_metric(total_quality),
         "label": classify_score(final_score),
+        "per_metric_breakdown": breakdown,
+        "contribution_sum": contribution_sum,
     }
 
 

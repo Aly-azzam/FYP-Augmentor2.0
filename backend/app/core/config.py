@@ -7,7 +7,7 @@ class Settings(BaseSettings):
     APP_VERSION: str = "0.1.0"
     DEBUG: bool = True
 
-    DATABASE_URL: str = "postgresql+asyncpg://augmentor:augmentor@localhost:5432/augmentor"
+    DATABASE_URL: str = "sqlite:///./augmentor.db"
 
     # Local storage root (MVP)
     STORAGE_ROOT: Path = Path(__file__).resolve().parents[2] / "storage"
@@ -36,6 +36,7 @@ class Settings(BaseSettings):
     PIPELINE_VERSION: str = "0.1.0"
     MODEL_VERSION: str = "0.1.0"
     CONFIG_VERSION: str = "0.1.0"
+    EXPLANATION_MODE: str = "rule"
 
     class Config:
         env_file = ".env"

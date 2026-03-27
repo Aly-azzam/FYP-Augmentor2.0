@@ -4,25 +4,43 @@ This file keeps the metric weights and score thresholds in one place so
 they are easy to read now and easy to tune later.
 """
 
-REQUIRED_METRICS = [
-    "angle_deviation",
+DEVIATION_METRICS = [
     "trajectory_deviation",
+    "angle_deviation",
     "velocity_difference",
+    "hand_openness_deviation",
     "tool_alignment_deviation",
 ]
 
+QUALITY_METRICS = [
+    "smoothness_score",
+    "timing_score",
+]
+
+ACTIVE_SCORING_METRICS = [
+    "trajectory_deviation",
+    "angle_deviation",
+    "velocity_difference",
+    "smoothness_score",
+    "timing_score",
+]
+
+REQUIRED_METRICS = ACTIVE_SCORING_METRICS[:]
+
 # Metric weights for the final score calculation.
 # These should add up to 1.0.
-ANGLE_DEVIATION_WEIGHT = 0.30
 TRAJECTORY_DEVIATION_WEIGHT = 0.30
+ANGLE_DEVIATION_WEIGHT = 0.25
 VELOCITY_DIFFERENCE_WEIGHT = 0.20
-TOOL_ALIGNMENT_DEVIATION_WEIGHT = 0.20
+SMOOTHNESS_SCORE_WEIGHT = 0.15
+TIMING_SCORE_WEIGHT = 0.10
 
 DEFAULT_METRIC_WEIGHTS = {
-    "angle_deviation": ANGLE_DEVIATION_WEIGHT,
     "trajectory_deviation": TRAJECTORY_DEVIATION_WEIGHT,
+    "angle_deviation": ANGLE_DEVIATION_WEIGHT,
     "velocity_difference": VELOCITY_DIFFERENCE_WEIGHT,
-    "tool_alignment_deviation": TOOL_ALIGNMENT_DEVIATION_WEIGHT,
+    "smoothness_score": SMOOTHNESS_SCORE_WEIGHT,
+    "timing_score": TIMING_SCORE_WEIGHT,
 }
 
 SCORE_MIN = 0

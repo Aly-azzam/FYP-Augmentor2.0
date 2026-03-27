@@ -1,3 +1,24 @@
+from __future__ import annotations
+
+
+def compute_progress(evaluations: list[dict]) -> dict:
+    """Compute simple score progress statistics for one attempt."""
+    if not evaluations:
+        return {
+            "best_score": 0.0,
+            "average_score": 0.0,
+            "attempt_count": 0,
+            "latest_score": 0.0,
+        }
+
+    scores = [float(item.get("score", 0.0)) for item in evaluations]
+    return {
+        "best_score": round(max(scores), 4),
+        "average_score": round(sum(scores) / float(len(scores)), 4),
+        "attempt_count": len(scores),
+        "latest_score": round(float(scores[0]), 4),
+    }
+
 """Progress Service — derive completion-based progress.
 
 Progress rule:

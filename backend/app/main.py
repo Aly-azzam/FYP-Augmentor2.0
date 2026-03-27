@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from app.core.config import settings
-from app.core.database import init_db
+from app.core.database import Base, engine
 from app.api.routes import courses, chapters, uploads, evaluations, history, progress
 
 app = FastAPI(
@@ -32,7 +32,16 @@ app.mount("/storage", StaticFiles(directory=settings.STORAGE_ROOT), name="storag
 
 @app.on_event("startup")
 async def startup_event():
-    await init_db()
+    # Ensure SQLAlchemy metadata is populated before table creation.
+    import app.models.chapter  # noqa: F401
+    import app.models.course  # noqa: F401
+    import app.models.evaluation_result  # noqa: F401
+    import app.models.expert_video  # noqa: F401
+    import app.models.learner_attempt  # noqa: F401
+    import app.models.progress  # noqa: F401
+    import app.models.user  # noqa: F401
+
+    Base.metadata.create_all(bind=engine)
 
 
 @app.get("/health", tags=["Health"])

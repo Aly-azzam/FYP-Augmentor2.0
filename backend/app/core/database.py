@@ -1,33 +1,21 @@
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
-from sqlalchemy.orm import DeclarativeBase
+from sqlalchemy import create_engine
+from sqlalchemy.orm import declarative_base, sessionmaker
 
 from app.core.config import settings
 
-engine = create_async_engine(settings.DATABASE_URL, echo=settings.DEBUG)
+engine = create_engine(
+    settings.DATABASE_URL,
+    connect_args={"check_same_thread": False},
+    echo=settings.DEBUG,
+)
 
-async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
 
-
-class Base(DeclarativeBase):
-    pass
-
-
-async def init_db() -> None:
-    """Create database tables for the current MVP schema."""
-    # Import models here so SQLAlchemy registers them on Base.metadata before create_all.
-    import app.models.chapter  # noqa: F401
-    import app.models.course  # noqa: F401
-    import app.models.evaluation_result  # noqa: F401
-    import app.models.expert_video  # noqa: F401
-    import app.models.learner_attempt  # noqa: F401
-    import app.models.progress  # noqa: F401
-    import app.models.user  # noqa: F401
-
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-
-
-async def get_db() -> AsyncSession:
-    """FastAPI dependency that yields an async DB session."""
-    async with async_session() as session:
+def get_db():
+    """FastAPI dependency that yields a DB session."""
+    session = SessionLocal()
+    try:
         yield session
+    finally:
+        session.close()

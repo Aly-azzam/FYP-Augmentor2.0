@@ -2,30 +2,54 @@
 
 from __future__ import annotations
 
+import logging
 import uuid
 from pathlib import Path
 from typing import Any
 
-from app.schemas.evaluation_schema import EvaluationResult, MetricSet
+from sqlalchemy import text
+from sqlalchemy.exc import OperationalError
+
+from app.schemas.evaluation_schema import EvaluationResult as EvaluationResultSchema, MetricSet
+from app.models.evaluation_result import EvaluationResult as EvaluationResultModel
+from app.core.database import SessionLocal, engine
 from app.services.angle_metrics_service import (
     compute_angle_deviation,
+    compute_hand_openness_deviation,
     compute_video_hand_angles,
 )
-from app.services.comparison_service import load_motion_data, pair_motion_data
-from app.services.feedback_structuring_service import build_summary, build_vlm_payload
+from app.services.comparison_service import (
+    detect_key_error_moments,
+    load_motion_data,
+    map_errors_to_phases,
+    pair_motion_data,
+    pair_motion_data_with_alignment,
+)
+from app.services.feedback_structuring_service import (
+    build_explanation_payload,
+    build_summary,
+    build_vlm_payload,
+    generate_explanation,
+)
+from app.core.config import settings
 from app.services.perception_service import run_perception_pipeline
 from app.services.scoring_service import compute_final_score, compute_internal_motion_score
+from app.services.temporal_alignment_service import align_sequences
 from app.services.tool_metrics_service import compute_tool_alignment_deviation
 from app.services.trajectory_metrics_service import (
+    compute_timing_score,
     compute_trajectory_deviation,
     compute_video_trajectory_metrics,
 )
 from app.services.velocity_metrics_service import (
+    compute_smoothness_score,
     compute_velocity_difference,
     compute_video_velocity_metrics,
 )
+from app.services.vjepa_service import analyze_video_semantics
 
 MotionSource = str | Path | dict[str, Any]
+logger = logging.getLogger(__name__)
 
 
 def validate_perception_output(perception_output: Any) -> list[dict]:
@@ -87,6 +111,9 @@ def build_metric_set(paired_motion_data: dict[str, Any]) -> MetricSet:
         angle_deviation=compute_angle_deviation(paired_motion_data),
         trajectory_deviation=compute_trajectory_deviation(paired_motion_data),
         velocity_difference=compute_velocity_difference(paired_motion_data),
+        smoothness_score=compute_smoothness_score(paired_motion_data),
+        timing_score=compute_timing_score(paired_motion_data),
+        hand_openness_deviation=compute_hand_openness_deviation(paired_motion_data),
         tool_alignment_deviation=compute_tool_alignment_deviation(paired_motion_data),
     )
 
@@ -94,41 +121,242 @@ def build_metric_set(paired_motion_data: dict[str, Any]) -> MetricSet:
 def evaluate_motion_pair(
     expert_motion_source: MotionSource,
     learner_motion_source: MotionSource,
-) -> EvaluationResult:
+    attempt_id: str | None = None,
+    db=None,
+) -> EvaluationResultSchema:
     """Run the complete paired evaluation flow from motion inputs to final result."""
     expert_motion_data = load_motion_data(expert_motion_source)
     learner_motion_data = load_motion_data(learner_motion_source)
+    semantic_phases = {
+        "expert": analyze_video_semantics(expert_motion_data),
+        "learner": analyze_video_semantics(learner_motion_data),
+    }
 
-    paired_motion_data = pair_motion_data(
-        expert_data=expert_motion_data,
-        learner_data=learner_motion_data,
-    )
+    if _is_modern_motion_output(expert_motion_data) and _is_modern_motion_output(learner_motion_data):
+        print("Using modern aligned path: True")
+        alignment_result = align_sequences(
+            expert_motion=expert_motion_data,
+            learner_motion=learner_motion_data,
+        )
+        aligned_pairs = alignment_result["aligned_pairs"]
+        aligned_motion_data = pair_motion_data_with_alignment(
+            expert_data=expert_motion_data,
+            learner_data=learner_motion_data,
+            aligned_pairs=aligned_pairs,
+        )
+        print("DTW path length:", alignment_result["path_length"])
+        print("First 10 aligned pairs:", aligned_pairs[:10])
+        print(
+            "Aligned expert sequence length used for metrics:",
+            _infer_metric_sequence_length(aligned_motion_data["expert_motion"]),
+        )
+        print(
+            "Aligned learner sequence length used for metrics:",
+            _infer_metric_sequence_length(aligned_motion_data["learner_motion"]),
+        )
+        key_error_moments = detect_key_error_moments(
+            aligned_motion_data.get("modern_aligned_channels", {})
+        )
+    else:
+        print("Using modern aligned path: False")
+        logger.debug("Using legacy direct comparison path for non-modern motion inputs.")
+        aligned_motion_data = pair_motion_data(
+            expert_data=expert_motion_data,
+            learner_data=learner_motion_data,
+        )
+        key_error_moments = []
 
-    metrics = build_metric_set(paired_motion_data)
+    key_error_moments = map_errors_to_phases(key_error_moments, semantic_phases)
+
+    metrics = build_metric_set(aligned_motion_data)
     score_result = compute_final_score(metrics.model_dump())
     final_score = score_result["score"]
-    summary = build_summary(score=final_score, metrics=metrics)
+    per_metric_breakdown = score_result["per_metric_breakdown"]
+    print("Modern metrics used:", list(metrics.model_dump().keys()))
+    print("Metric values:", metrics.model_dump())
+    print("Key error moments:", key_error_moments)
+    print("Semantic phases:", semantic_phases)
+    print("Final score:", final_score)
+    summary = build_summary(
+        score=final_score,
+        metrics=metrics,
+        per_metric_breakdown=per_metric_breakdown,
+    )
+    explanation_payload = build_explanation_payload(
+        {
+            "score": final_score,
+            "metrics": metrics,
+            "per_metric_breakdown": per_metric_breakdown,
+            "key_error_moments": key_error_moments,
+            "semantic_phases": semantic_phases,
+        }
+    )
+    explanation_mode = str(getattr(settings, "EXPLANATION_MODE", "rule"))
+    explanation_output = generate_explanation(explanation_payload, mode=explanation_mode)
     vlm_payload = build_vlm_payload(
         score=final_score,
         metrics=metrics,
         summary=summary,
+        per_metric_breakdown=per_metric_breakdown,
+        key_error_moments=key_error_moments,
+        semantic_phases=semantic_phases,
+        explanation_payload=explanation_payload,
+        explanation=explanation_output,
     )
 
-    return EvaluationResult(
-        evaluation_id=generate_evaluation_id(),
+    persisted_id = _persist_evaluation_result(
+        attempt_id=attempt_id or str(uuid.uuid4()),
+        score=float(final_score),
+        metrics=metrics.model_dump(),
+        per_metric_breakdown=_as_jsonable(per_metric_breakdown),
+        key_error_moments=_as_jsonable(key_error_moments),
+        semantic_phases=_as_jsonable(semantic_phases),
+        explanation=explanation_output.model_dump(),
+        db=db,
+    )
+
+    return EvaluationResultSchema(
+        evaluation_id=persisted_id,
         score=final_score,
         metrics=metrics,
+        per_metric_breakdown=per_metric_breakdown,
+        key_error_moments=key_error_moments,
+        semantic_phases=semantic_phases,
+        explanation=explanation_output,
         summary=summary,
         vlm_payload=vlm_payload,
     )
 
 
+def _is_modern_motion_output(motion_data: dict[str, Any]) -> bool:
+    frames = motion_data.get("frames")
+    if not isinstance(frames, list) or not frames:
+        return False
+    first_frame = frames[0]
+    if not isinstance(first_frame, dict):
+        return False
+    vector = first_frame.get("flattened_feature_vector")
+    return isinstance(vector, list) and len(vector) > 0
+
+
+def _infer_metric_sequence_length(metric_motion: dict[str, Any]) -> int:
+    for field_name in ("angle_series", "joint_trajectories", "velocity_profiles", "tool_motion"):
+        mapping = metric_motion.get(field_name)
+        if not isinstance(mapping, dict):
+            continue
+        for values in mapping.values():
+            if isinstance(values, list):
+                return len(values)
+    return 0
+
+
 async def run_evaluation_pipeline(
     expert_motion_source: MotionSource,
     learner_motion_source: MotionSource,
-) -> EvaluationResult:
+    attempt_id: str | None = None,
+    db=None,
+) -> EvaluationResultSchema:
     """Async wrapper around paired evaluation flow for API integration."""
     return evaluate_motion_pair(
         expert_motion_source=expert_motion_source,
         learner_motion_source=learner_motion_source,
+        attempt_id=attempt_id,
+        db=db,
     )
+
+
+def _persist_evaluation_result(
+    *,
+    attempt_id: str,
+    score: float,
+    metrics: dict[str, Any],
+    per_metric_breakdown: dict[str, Any],
+    key_error_moments: list[dict[str, Any]],
+    semantic_phases: dict[str, Any],
+    explanation: dict[str, Any],
+    db=None,
+) -> str:
+    owns_session = db is None
+    session = db or SessionLocal()
+    try:
+        return _insert_db_result(
+            session=session,
+            attempt_id=attempt_id,
+            score=score,
+            metrics=metrics,
+            per_metric_breakdown=per_metric_breakdown,
+            key_error_moments=key_error_moments,
+            semantic_phases=semantic_phases,
+            explanation=explanation,
+        )
+    except OperationalError:
+        session.rollback()
+        _ensure_evaluation_results_schema()
+        return _insert_db_result(
+            session=session,
+            attempt_id=attempt_id,
+            score=score,
+            metrics=metrics,
+            per_metric_breakdown=per_metric_breakdown,
+            key_error_moments=key_error_moments,
+            semantic_phases=semantic_phases,
+            explanation=explanation,
+        )
+    finally:
+        if owns_session:
+            session.close()
+
+
+def _as_jsonable(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _as_jsonable(val) for key, val in value.items()}
+    if isinstance(value, list):
+        return [_as_jsonable(item) for item in value]
+    if hasattr(value, "model_dump"):
+        return _as_jsonable(value.model_dump())
+    return value
+
+
+def _insert_db_result(
+    *,
+    session,
+    attempt_id: str,
+    score: float,
+    metrics: dict[str, Any],
+    per_metric_breakdown: dict[str, Any],
+    key_error_moments: list[dict[str, Any]],
+    semantic_phases: dict[str, Any],
+    explanation: dict[str, Any],
+) -> str:
+    db_result = EvaluationResultModel(
+        attempt_id=attempt_id,
+        score=score,
+        metrics=metrics,
+        per_metric_breakdown=per_metric_breakdown,
+        key_error_moments=key_error_moments,
+        semantic_phases=semantic_phases,
+        explanation=explanation,
+    )
+    session.add(db_result)
+    session.commit()
+    session.refresh(db_result)
+    return str(db_result.id)
+
+
+def _ensure_evaluation_results_schema() -> None:
+    required_columns = {
+        "metrics": "JSON",
+        "per_metric_breakdown": "JSON",
+        "key_error_moments": "JSON",
+        "semantic_phases": "JSON",
+        "explanation": "JSON",
+    }
+    with engine.begin() as connection:
+        rows = connection.execute(text("PRAGMA table_info(evaluation_results)")).fetchall()
+        existing = {str(row[1]) for row in rows}
+        for column_name, column_type in required_columns.items():
+            if column_name in existing:
+                continue
+            connection.execute(
+                text(f"ALTER TABLE evaluation_results ADD COLUMN {column_name} {column_type}")
+            )

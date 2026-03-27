@@ -9,8 +9,7 @@ import uuid
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import Float, Integer, ForeignKey, DateTime, func
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy import Float, Integer, ForeignKey, DateTime, String, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
@@ -19,9 +18,9 @@ from app.core.database import Base
 class Progress(Base):
     __tablename__ = "progress"
 
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    user_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
-    course_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("courses.id"), nullable=False)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id: Mapped[Optional[str]] = mapped_column(String(36), ForeignKey("users.id"), nullable=True)
+    course_id: Mapped[str] = mapped_column(String(36), ForeignKey("courses.id"), nullable=False)
 
     completed_chapters: Mapped[int] = mapped_column(Integer, default=0)
     total_chapters: Mapped[int] = mapped_column(Integer, default=0)

@@ -180,6 +180,22 @@ def compute_velocity_series_difference(
 
 def compute_velocity_difference(paired_motion_data: dict[str, Any]) -> float:
     """Compute one normalized velocity difference score from paired motion data."""
+    modern_channels = paired_motion_data.get("modern_aligned_channels")
+    if isinstance(modern_channels, dict):
+        channel_map = modern_channels.get("velocity_channels")
+        if isinstance(channel_map, dict) and channel_map:
+            velocity_scores: list[float] = []
+            for channel_payload in channel_map.values():
+                if not isinstance(channel_payload, dict):
+                    continue
+                expert_series = channel_payload.get("expert", [])
+                learner_series = channel_payload.get("learner", [])
+                if not isinstance(expert_series, list) or not isinstance(learner_series, list):
+                    continue
+                velocity_scores.append(compute_velocity_series_difference(expert_series, learner_series))
+            if velocity_scores:
+                return round_metric(safe_average(velocity_scores))
+
     if "expert_motion" not in paired_motion_data or "learner_motion" not in paired_motion_data:
         raise ValueError("Paired motion data must include 'expert_motion' and 'learner_motion'.")
 
@@ -206,3 +222,54 @@ def compute_velocity_difference(paired_motion_data: dict[str, Any]) -> float:
         )
 
     return round_metric(safe_average(velocity_scores))
+
+
+def compute_smoothness_score(paired_motion_data: dict[str, Any]) -> float:
+    """Compute smoothness quality [0,1] from aligned velocity-channel jerk proxies."""
+    modern_channels = paired_motion_data.get("modern_aligned_channels")
+    if not isinstance(modern_channels, dict):
+        return 1.0
+
+    channel_map = modern_channels.get("velocity_channels")
+    if not isinstance(channel_map, dict) or not channel_map:
+        return 1.0
+
+    channel_differences: list[float] = []
+    for channel_payload in channel_map.values():
+        if not isinstance(channel_payload, dict):
+            continue
+        expert_series = channel_payload.get("expert", [])
+        learner_series = channel_payload.get("learner", [])
+        if not isinstance(expert_series, list) or not isinstance(learner_series, list):
+            continue
+        expert_jerk = _jerk_proxy_series(expert_series)
+        learner_jerk = _jerk_proxy_series(learner_series)
+        shared_length = min(len(expert_jerk), len(learner_jerk))
+        if shared_length == 0:
+            continue
+        diffs = [
+            abs(float(expert_jerk[index]) - float(learner_jerk[index]))
+            for index in range(shared_length)
+        ]
+        channel_differences.append(clamp(safe_average(diffs), 0.0, 1.0))
+
+    if not channel_differences:
+        return 1.0
+
+    mean_jerk_diff = safe_average(channel_differences)
+    return round_metric(clamp(1.0 - mean_jerk_diff, 0.0, 1.0))
+
+
+def _jerk_proxy_series(speed_series: list[Number]) -> list[float]:
+    if len(speed_series) < 3:
+        return []
+    accelerations = [
+        abs(float(speed_series[index]) - float(speed_series[index - 1]))
+        for index in range(1, len(speed_series))
+    ]
+    if len(accelerations) < 2:
+        return []
+    return [
+        abs(accelerations[index] - accelerations[index - 1])
+        for index in range(1, len(accelerations))
+    ]

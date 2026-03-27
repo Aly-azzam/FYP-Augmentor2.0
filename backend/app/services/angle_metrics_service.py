@@ -8,6 +8,7 @@ from typing import Any, List, Optional
 from app.utils.evaluation_utils import clamp, round_metric, safe_average
 
 MAX_ANGLE_DIFFERENCE = 180.0
+MAX_HAND_SHAPE_DIFFERENCE = 1.0
 
 
 def calculate_angle(point_a: list[float], point_b: list[float], point_c: list[float]) -> float:
@@ -237,6 +238,21 @@ def compute_series_difference(expert_series: list[float], learner_series: list[f
 
 def compute_angle_deviation(paired_motion_data: dict[str, Any]) -> float:
     """Compute one normalized angle deviation score from paired motion data."""
+    modern_channels = paired_motion_data.get("modern_aligned_channels")
+    if isinstance(modern_channels, dict):
+        channel_map = modern_channels.get("angle_channels")
+        if isinstance(channel_map, dict) and channel_map:
+            series_scores: list[float] = []
+            for channel_payload in channel_map.values():
+                if not isinstance(channel_payload, dict):
+                    continue
+                expert_series = channel_payload.get("expert", [])
+                learner_series = channel_payload.get("learner", [])
+                if isinstance(expert_series, list) and isinstance(learner_series, list):
+                    series_scores.append(compute_series_difference(expert_series, learner_series))
+            if series_scores:
+                return round_metric(safe_average(series_scores))
+
     if "expert_motion" not in paired_motion_data or "learner_motion" not in paired_motion_data:
         raise ValueError("Paired motion data must include 'expert_motion' and 'learner_motion'.")
 
@@ -261,3 +277,36 @@ def compute_angle_deviation(paired_motion_data: dict[str, Any]) -> float:
         series_scores.append(compute_series_difference(expert_series, learner_series))
 
     return round_metric(safe_average(series_scores))
+
+
+def compute_hand_openness_deviation(paired_motion_data: dict[str, Any]) -> float:
+    """Compute normalized hand shape deviation from aligned hand-shape channels."""
+    modern_channels = paired_motion_data.get("modern_aligned_channels")
+    if not isinstance(modern_channels, dict):
+        return 0.0
+
+    channel_map = modern_channels.get("hand_shape_channels")
+    if not isinstance(channel_map, dict) or not channel_map:
+        return 0.0
+
+    channel_scores: list[float] = []
+    for channel_payload in channel_map.values():
+        if not isinstance(channel_payload, dict):
+            continue
+        expert_series = channel_payload.get("expert", [])
+        learner_series = channel_payload.get("learner", [])
+        if not isinstance(expert_series, list) or not isinstance(learner_series, list):
+            continue
+        shared_length = min(len(expert_series), len(learner_series))
+        if shared_length == 0:
+            continue
+        diffs = [
+            abs(float(expert_series[index]) - float(learner_series[index]))
+            for index in range(shared_length)
+        ]
+        mean_diff = safe_average(diffs)
+        channel_scores.append(clamp(mean_diff / MAX_HAND_SHAPE_DIFFERENCE, 0.0, 1.0))
+
+    if not channel_scores:
+        return 0.0
+    return round_metric(safe_average(channel_scores))
