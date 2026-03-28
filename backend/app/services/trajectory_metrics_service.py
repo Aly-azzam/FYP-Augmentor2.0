@@ -7,7 +7,7 @@ from typing import Any, List
 
 from app.utils.evaluation_utils import clamp, round_metric, safe_average
 
-MAX_POINT_DISTANCE = math.sqrt(2.0)
+MAX_POINT_DISTANCE = 0.5
 
 
 def euclidean_distance(point_a: list[float], point_b: list[float]) -> float:

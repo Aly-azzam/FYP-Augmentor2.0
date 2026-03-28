@@ -2,8 +2,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import Session, selectinload
 
 from app.core.database import get_db
 from app.models.chapter import Chapter
@@ -20,9 +19,9 @@ router = APIRouter(prefix="/api/chapters", tags=["Chapters"])
 
 
 @router.get("/default/expert-video", response_model=ExpertVideoAssetOut)
-async def get_default_expert_video(db: AsyncSession = Depends(get_db)):
+def get_default_expert_video(db: Session = Depends(get_db)):
     """Return the default expert video for frontend playback."""
-    asset = await get_default_expert_video_asset(db)
+    asset = get_default_expert_video_asset(db)
     if asset is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -40,9 +39,9 @@ async def get_default_expert_video(db: AsyncSession = Depends(get_db)):
 
 
 @router.get("/{chapter_id}", response_model=ChapterDetail)
-async def get_chapter(chapter_id: UUID, db: AsyncSession = Depends(get_db)):
+def get_chapter(chapter_id: UUID, db: Session = Depends(get_db)):
     """Get chapter details."""
-    result = await db.execute(
+    result = db.execute(
         select(Chapter)
         .options(selectinload(Chapter.expert_video))
         .where(Chapter.id == chapter_id)
@@ -78,9 +77,9 @@ async def get_chapter(chapter_id: UUID, db: AsyncSession = Depends(get_db)):
 
 
 @router.get("/{chapter_id}/expert-video", response_model=ExpertVideoOut)
-async def get_expert_video(chapter_id: UUID, db: AsyncSession = Depends(get_db)):
+def get_expert_video(chapter_id: UUID, db: Session = Depends(get_db)):
     """Get expert reference video for a chapter."""
-    result = await db.execute(select(ExpertVideo).where(ExpertVideo.chapter_id == chapter_id))
+    result = db.execute(select(ExpertVideo).where(ExpertVideo.chapter_id == chapter_id))
     expert_video = result.scalar_one_or_none()
     if expert_video is None:
         raise HTTPException(

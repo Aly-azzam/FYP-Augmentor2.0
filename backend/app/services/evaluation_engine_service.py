@@ -32,6 +32,7 @@ from app.services.feedback_structuring_service import (
     generate_explanation,
 )
 from app.core.config import settings
+from app.core.evaluation_constants import DTW_SIMILARITY_DECAY
 from app.services.perception_service import run_perception_pipeline
 from app.services.scoring_service import compute_final_score, compute_internal_motion_score
 from app.services.temporal_alignment_service import align_sequences
@@ -105,7 +106,15 @@ def generate_evaluation_id() -> str:
     return f"eval_{uuid.uuid4().hex[:8]}"
 
 
-def build_metric_set(paired_motion_data: dict[str, Any]) -> MetricSet:
+def compute_dtw_similarity(dtw_normalized_cost: float) -> float:
+    """Convert DTW normalized cost to a similarity score in [0,1]."""
+    return 1.0 / (1.0 + DTW_SIMILARITY_DECAY * max(0.0, dtw_normalized_cost))
+
+
+def build_metric_set(
+    paired_motion_data: dict[str, Any],
+    dtw_normalized_cost: float = 0.0,
+) -> MetricSet:
     """Compute all evaluation metrics from paired motion data."""
     return MetricSet(
         angle_deviation=compute_angle_deviation(paired_motion_data),
@@ -115,6 +124,7 @@ def build_metric_set(paired_motion_data: dict[str, Any]) -> MetricSet:
         timing_score=compute_timing_score(paired_motion_data),
         hand_openness_deviation=compute_hand_openness_deviation(paired_motion_data),
         tool_alignment_deviation=compute_tool_alignment_deviation(paired_motion_data),
+        dtw_similarity=compute_dtw_similarity(dtw_normalized_cost),
     )
 
 
@@ -132,6 +142,7 @@ def evaluate_motion_pair(
         "learner": analyze_video_semantics(learner_motion_data),
     }
 
+    dtw_normalized_cost = 0.0
     if _is_modern_motion_output(expert_motion_data) and _is_modern_motion_output(learner_motion_data):
         print("Using modern aligned path: True")
         alignment_result = align_sequences(
@@ -139,11 +150,15 @@ def evaluate_motion_pair(
             learner_motion=learner_motion_data,
         )
         aligned_pairs = alignment_result["aligned_pairs"]
+        dtw_normalized_cost = float(alignment_result.get("dtw_normalized_cost", 0.0))
         aligned_motion_data = pair_motion_data_with_alignment(
             expert_data=expert_motion_data,
             learner_data=learner_motion_data,
             aligned_pairs=aligned_pairs,
         )
+        print("DTW total cost:", alignment_result.get("dtw_total_cost"))
+        print("DTW normalized cost:", dtw_normalized_cost)
+        print("DTW similarity:", compute_dtw_similarity(dtw_normalized_cost))
         print("DTW path length:", alignment_result["path_length"])
         print("First 10 aligned pairs:", aligned_pairs[:10])
         print(
@@ -168,10 +183,22 @@ def evaluate_motion_pair(
 
     key_error_moments = map_errors_to_phases(key_error_moments, semantic_phases)
 
-    metrics = build_metric_set(aligned_motion_data)
+    metrics = build_metric_set(aligned_motion_data, dtw_normalized_cost=dtw_normalized_cost)
     score_result = compute_final_score(metrics.model_dump())
     final_score = score_result["score"]
     per_metric_breakdown = score_result["per_metric_breakdown"]
+    print(
+        "Final score input values:",
+        {
+            "trajectory_deviation": metrics.trajectory_deviation,
+            "angle_deviation": metrics.angle_deviation,
+            "velocity_difference": metrics.velocity_difference,
+            "smoothness_score": metrics.smoothness_score,
+            "timing_score": metrics.timing_score,
+            "hand_openness_deviation": metrics.hand_openness_deviation,
+            "tool_alignment_deviation": metrics.tool_alignment_deviation,
+        },
+    )
     print("Modern metrics used:", list(metrics.model_dump().keys()))
     print("Metric values:", metrics.model_dump())
     print("Key error moments:", key_error_moments)

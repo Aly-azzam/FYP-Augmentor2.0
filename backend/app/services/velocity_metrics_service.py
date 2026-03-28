@@ -6,7 +6,7 @@ from typing import Any, List, Union
 
 from app.utils.evaluation_utils import clamp, round_metric, safe_average
 
-MAX_VELOCITY_DIFFERENCE = 1.0
+MAX_VELOCITY_DIFFERENCE = 0.5
 
 
 Number = Union[int, float]

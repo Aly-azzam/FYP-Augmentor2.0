@@ -275,6 +275,7 @@ def compute_metric_breakdown(metrics: dict[str, float]) -> dict[str, dict[str, f
         "timing_score",
         "hand_openness_deviation",
         "tool_alignment_deviation",
+        "dtw_similarity",
     ):
         if metric_name not in metrics:
             continue

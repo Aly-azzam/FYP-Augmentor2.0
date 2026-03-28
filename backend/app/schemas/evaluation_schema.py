@@ -26,6 +26,7 @@ class MetricSet(BaseModel):
     timing_score: float = Field(..., ge=0.0, le=1.0)
     hand_openness_deviation: float = Field(..., ge=0.0, le=1.0)
     tool_alignment_deviation: float = Field(0.0, ge=0.0)
+    dtw_similarity: float = Field(1.0, ge=0.0, le=1.0)
 
 
 class EvaluationSummary(BaseModel):
@@ -114,6 +115,7 @@ class EvaluationMetrics(BaseModel):
     timing_score: float = Field(..., ge=0.0, le=1.0)
     hand_openness_deviation: float = Field(..., ge=0.0, le=1.0)
     tool_alignment_deviation: float = Field(0.0, ge=0.0)
+    dtw_similarity: float = Field(1.0, ge=0.0, le=1.0)
 
 
 class EvaluationResultOut(BaseModel):

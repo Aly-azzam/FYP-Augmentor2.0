@@ -20,6 +20,7 @@ METRIC_LABELS = {
     "timing_score": "timing and rhythm",
     "hand_openness_deviation": "hand openness control",
     "tool_alignment_deviation": "tool alignment",
+    "dtw_similarity": "overall motion similarity",
 }
 
 FOCUS_LABELS = {
@@ -30,6 +31,7 @@ FOCUS_LABELS = {
     "timing_score": "Improve timing and rhythm",
     "hand_openness_deviation": "Improve hand openness control",
     "tool_alignment_deviation": "Improve tool alignment control",
+    "dtw_similarity": "Improve overall motion pattern",
 }
 STRENGTH_PHRASES = {
     "angle_deviation": "Your joint angle control is accurate.",
@@ -39,6 +41,7 @@ STRENGTH_PHRASES = {
     "timing_score": "Your timing is consistent with the expert.",
     "hand_openness_deviation": "Your hand openness control is strong.",
     "tool_alignment_deviation": "Your tool alignment is stable.",
+    "dtw_similarity": "Your overall motion pattern closely matches the expert.",
 }
 ADVICE_BY_METRIC = {
     "trajectory_deviation": "Focus on following the expert's movement path more closely.",
@@ -48,9 +51,10 @@ ADVICE_BY_METRIC = {
     "smoothness_score": "Work on smoother transitions between movement phases.",
     "hand_openness_deviation": "Focus on maintaining consistent hand openness and grip shape.",
     "tool_alignment_deviation": "Focus on keeping your tool alignment stable throughout the motion.",
+    "dtw_similarity": "Try to match the expert's overall motion pattern more closely.",
 }
 
-HIGHER_IS_BETTER = {"smoothness_score", "timing_score"}
+HIGHER_IS_BETTER = {"smoothness_score", "timing_score", "dtw_similarity"}
 
 
 def _get_strength_prefix(score: int) -> str:

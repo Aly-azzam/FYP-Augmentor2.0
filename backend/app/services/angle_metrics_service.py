@@ -7,7 +7,7 @@ from typing import Any, List, Optional
 
 from app.utils.evaluation_utils import clamp, round_metric, safe_average
 
-MAX_ANGLE_DIFFERENCE = 180.0
+MAX_ANGLE_DIFFERENCE = 90.0
 MAX_HAND_SHAPE_DIFFERENCE = 1.0
 
 

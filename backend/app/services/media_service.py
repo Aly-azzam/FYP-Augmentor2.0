@@ -6,7 +6,7 @@ from typing import Optional
 from urllib.parse import quote
 
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import Session
 from sqlalchemy.orm import joinedload
 
 from app.core.config import settings
@@ -66,8 +66,8 @@ def find_first_expert_video_file() -> Optional[Path]:
     return expert_files[0] if expert_files else None
 
 
-async def get_default_expert_video_asset(db: AsyncSession) -> Optional[ExpertVideoAsset]:
-    result = await db.execute(
+def get_default_expert_video_asset(db: Session) -> Optional[ExpertVideoAsset]:
+    result = db.execute(
         select(ExpertVideo)
         .options(joinedload(ExpertVideo.chapter))
         .join(Chapter, ExpertVideo.chapter_id == Chapter.id)

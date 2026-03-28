@@ -45,10 +45,7 @@ import {
   useTimerStore,
 } from '../store';
 import { courses, getClipsForCourse } from '../services/mock/courses';
-import {
-  generateMockEvaluation,
-  scoreColor,
-} from '../services/mock/evaluation';
+import { getEvaluationResult, startEvaluation as startEvaluationApi } from '../api/evaluationApi';
 import { formatTime } from '../utils/helpers';
 import type { DrawingTool } from '../types';
 
@@ -88,6 +85,29 @@ const COLOR_SWATCHES = [
 ];
 
 const PLAYBACK_RATES = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 2];
+
+const scoreColor = (score: number): string => {
+  if (score >= 90) return '#22c55e';
+  if (score >= 70) return '#3b82f6';
+  if (score >= 50) return '#eab308';
+  return '#ef4444';
+};
+
+const scoreLabel = (score: number): string => {
+  if (score >= 90) return 'Excellent';
+  if (score >= 80) return 'Very Good';
+  if (score >= 70) return 'Good';
+  if (score >= 50) return 'Fair';
+  return 'Needs Improvement';
+};
+
+/** File inputs on Windows often omit MIME type; allow .mp4 / .mov by extension. */
+function isValidPracticeVideo(file: File): boolean {
+  const t = (file.type || '').toLowerCase();
+  if (t === 'video/mp4' || t === 'video/quicktime') return true;
+  const ext = file.name.toLowerCase().match(/\.([^.]+)$/)?.[1];
+  return ext === 'mp4' || ext === 'mov';
+}
 
 const TOUR_STEPS = [
   {
@@ -155,11 +175,9 @@ export default function CompareStudio() {
     isEvaluating,
     evaluationStep,
     evaluationProgress,
-    evaluationResult,
     startEvaluation,
     setEvaluationStep,
     setEvaluationProgress,
-    setEvaluationResult,
     resetEvaluation,
   } = useEvaluationStore();
 
@@ -186,12 +204,16 @@ export default function CompareStudio() {
   const [learnerDuration, setLearnerDuration] = useState(0);
   const [expertMuted, setExpertMuted] = useState(false);
   const [learnerMuted, setLearnerMuted] = useState(false);
+  const [apiEvaluationResult, setApiEvaluationResult] = useState<any | null>(null);
 
   // ── Refs ──────────────────────────────────────────────────────────────────
 
   const expertVideoRef = useRef<HTMLVideoElement>(null);
   const learnerVideoRef = useRef<HTMLVideoElement>(null);
   const expertCanvasRef = useRef<HTMLCanvasElement>(null);
+  const learnerFileInputRef = useRef<HTMLInputElement>(null);
+  /** Tracks the active learner blob URL so we only revoke on replace / unmount (avoids Strict Mode double-revoke). */
+  const learnerBlobUrlRef = useRef<string | null>(null);
   const timersRef = useRef(timers);
   timersRef.current = timers;
 
@@ -314,22 +336,22 @@ export default function CompareStudio() {
     if (learnerVideoRef.current) learnerVideoRef.current.muted = learnerMuted;
   }, [learnerMuted]);
 
-  // Revoke objectURL on unmount
+  // Revoke learner blob URL only when leaving the page (not on every URL change — that could revoke the new blob).
   useEffect(() => {
     return () => {
-      if (userVideoUrl) URL.revokeObjectURL(userVideoUrl);
+      const u = learnerBlobUrlRef.current;
+      if (u) {
+        URL.revokeObjectURL(u);
+        learnerBlobUrlRef.current = null;
+      }
     };
-  }, [userVideoUrl]);
+  }, []);
 
   // ── Video upload ─────────────────────────────────────────────────────────
 
-  const onDrop = useCallback(
-    (acceptedFiles: File[]) => {
-      const file = acceptedFiles[0];
-      if (!file) return;
-
-      const validTypes = ['video/mp4', 'video/quicktime'];
-      if (!validTypes.includes(file.type)) {
+  const handlePracticeVideoFile = useCallback(
+    (file: File) => {
+      if (!isValidPracticeVideo(file)) {
         toast.error('Please upload an MP4 or MOV file');
         return;
       }
@@ -337,19 +359,41 @@ export default function CompareStudio() {
       const url = URL.createObjectURL(file);
       const probe = document.createElement('video');
       probe.preload = 'metadata';
+      probe.onerror = () => {
+        URL.revokeObjectURL(url);
+        toast.error('Could not read this video file');
+      };
       probe.onloadedmetadata = () => {
         if (probe.duration > 120) {
           toast.error('Video must be 2 minutes or shorter');
           URL.revokeObjectURL(url);
           return;
         }
+        const prev = learnerBlobUrlRef.current;
+        if (prev && prev !== url) {
+          URL.revokeObjectURL(prev);
+        }
+        learnerBlobUrlRef.current = url;
         setUserVideoUrl(url);
         setUserVideo(file);
-        toast.success('Video uploaded successfully!');
+        setLearnerCurrentTime(0);
+        setLearnerDuration(0);
+        setApiEvaluationResult(null);
+        resetEvaluation();
+        toast.success('Practice video ready');
       };
       probe.src = url;
     },
-    [setUserVideo],
+    [setUserVideo, resetEvaluation],
+  );
+
+  const onDrop = useCallback(
+    (acceptedFiles: File[]) => {
+      const file = acceptedFiles[0];
+      if (!file) return;
+      handlePracticeVideoFile(file);
+    },
+    [handlePracticeVideoFile],
   );
 
   const { getRootProps, getInputProps, isDragActive } = useDropzone({
@@ -362,21 +406,58 @@ export default function CompareStudio() {
 
   const runEvaluation = useCallback(async () => {
     if (!selectedCourse || !selectedClip || !userVideo) return;
-    startEvaluation();
+    try {
+      setApiEvaluationResult(null);
+      startEvaluation();
+      setEvaluationStep(0);
+      setEvaluationProgress(20);
 
-    const total = PIPELINE_STAGES.length;
-    const sub = 10;
-    for (let i = 0; i < total; i++) {
-      setEvaluationStep(i);
-      for (let p = 0; p <= sub; p++) {
-        setEvaluationProgress(((i * sub + p) / (total * sub)) * 100);
-        await new Promise((r) => setTimeout(r, 120 + Math.random() * 200));
+      const formData = new FormData();
+      formData.append('file', userVideo);
+      formData.append('course_id', selectedCourse);
+      formData.append('clip_id', selectedClip);
+      formData.append('filename', userVideo.name);
+
+      const started = await startEvaluationApi(formData);
+
+      if (started?.status === 'out_of_context') {
+        resetEvaluation();
+        setApiEvaluationResult({
+          score: 0,
+          status: 'out_of_context',
+          message: started.message,
+          gate_reasons: started.gate_reasons || [],
+          metrics: null,
+          explanation: null,
+          key_error_moments: [],
+        });
+        toast.error('Video rejected: does not match the expert task');
+        return;
       }
-    }
 
-    const result = generateMockEvaluation(selectedCourse, selectedClip);
-    setEvaluationResult(result);
-    toast.success(`Evaluation complete! Score: ${result.score}/100`);
+      const evaluationId =
+        typeof started === 'string'
+          ? started
+          : started?.evaluation_id || started?.id;
+
+      if (!evaluationId) {
+        throw new Error('Missing evaluation_id from backend response');
+      }
+
+      setEvaluationStep(2);
+      setEvaluationProgress(70);
+      const result = await getEvaluationResult(evaluationId);
+      setEvaluationStep(4);
+      setEvaluationProgress(100);
+      setApiEvaluationResult(result);
+      resetEvaluation();
+      console.log('CompareStudio evaluation response:', result);
+      toast.success(`Evaluation complete! Score: ${result.score}/100`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Evaluation failed';
+      toast.error(message);
+      resetEvaluation();
+    }
   }, [
     selectedCourse,
     selectedClip,
@@ -384,7 +465,7 @@ export default function CompareStudio() {
     startEvaluation,
     setEvaluationStep,
     setEvaluationProgress,
-    setEvaluationResult,
+    resetEvaluation,
   ]);
 
   // ── Video helpers ────────────────────────────────────────────────────────
@@ -656,12 +737,51 @@ export default function CompareStudio() {
           animate={{ opacity: 1, x: 0 }}
           transition={{ delay: 0.15 }}
         >
-          <span
-            className="label"
-            style={{ display: 'block', marginBottom: 'var(--space-sm)' }}
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              flexWrap: 'wrap',
+              gap: 'var(--space-sm)',
+              marginBottom: 'var(--space-sm)',
+            }}
           >
-            Your Practice
-          </span>
+            <span className="label" style={{ margin: 0 }}>
+              Your Practice
+            </span>
+            {userVideoUrl ? (
+              <>
+                <input
+                  ref={learnerFileInputRef}
+                  type="file"
+                  accept="video/mp4,video/quicktime,.mp4,.mov"
+                  style={{ position: 'absolute', width: 0, height: 0, opacity: 0, pointerEvents: 'none' }}
+                  aria-hidden
+                  tabIndex={-1}
+                  onChange={(e) => {
+                    const next = e.target.files?.[0];
+                    e.target.value = '';
+                    if (next) handlePracticeVideoFile(next);
+                  }}
+                />
+                <button
+                  type="button"
+                  className="btn btn-secondary"
+                  aria-label="Choose a different practice video"
+                  style={{
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: 'var(--space-xs)',
+                  }}
+                  onClick={() => learnerFileInputRef.current?.click()}
+                >
+                  <Upload size={14} />
+                  Change video
+                </button>
+              </>
+            ) : null}
+          </div>
 
           {userVideoUrl ? (
             <>
@@ -673,6 +793,7 @@ export default function CompareStudio() {
                 }}
               >
                 <video
+                  key={userVideoUrl}
                   ref={learnerVideoRef}
                   src={userVideoUrl}
                   onTimeUpdate={() => {
@@ -891,7 +1012,7 @@ export default function CompareStudio() {
             {/* ── Tab: Evaluate ─────────────────────────────────────────── */}
             <TabsContent value="evaluate">
               {/* Idle */}
-              {!isEvaluating && !evaluationResult && (
+              {!isEvaluating && !apiEvaluationResult && (
                 <div
                   style={{
                     display: 'flex',
@@ -1000,13 +1121,68 @@ export default function CompareStudio() {
                       textAlign: 'center',
                     }}
                   >
-                    Step {evaluationStep + 1} of {PIPELINE_STAGES.length}
+                    Processing... Step {evaluationStep + 1} of {PIPELINE_STAGES.length}
                   </p>
                 </div>
               )}
 
+              {/* Out of context rejection */}
+              {apiEvaluationResult?.status === 'out_of_context' && !isEvaluating && (
+                <div
+                  style={{
+                    display: 'flex',
+                    flexDirection: 'column',
+                    alignItems: 'center',
+                    gap: 'var(--space-md)',
+                    padding: 'var(--space-lg) 0',
+                  }}
+                >
+                  <div
+                    style={{
+                      width: 80,
+                      height: 80,
+                      borderRadius: '50%',
+                      border: '4px solid #ef4444',
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      boxShadow: '0 0 20px #ef444440',
+                    }}
+                  >
+                    <span style={{ fontSize: '2rem' }}>0</span>
+                  </div>
+                  <p
+                    className="heading-4"
+                    style={{ textAlign: 'center', color: '#ef4444' }}
+                  >
+                    Out of Context
+                  </p>
+                  <p
+                    className="text-small"
+                    style={{
+                      textAlign: 'center',
+                      color: 'var(--text-secondary)',
+                      maxWidth: 280,
+                    }}
+                  >
+                    {apiEvaluationResult.message}
+                  </p>
+                  <button
+                    className="btn btn-secondary"
+                    style={{ width: '100%' }}
+                    onClick={() => {
+                      resetEvaluation();
+                      setApiEvaluationResult(null);
+                    }}
+                  >
+                    <RotateCcw size={14} />
+                    Try Again
+                  </button>
+                </div>
+              )}
+
               {/* Complete */}
-              {evaluationResult && !isEvaluating && (
+              {apiEvaluationResult && apiEvaluationResult.status !== 'out_of_context' && !isEvaluating && (
                 <div
                   style={{
                     display: 'flex',
@@ -1022,24 +1198,24 @@ export default function CompareStudio() {
                         width: 100,
                         height: 100,
                         borderRadius: '50%',
-                        border: `4px solid ${scoreColor(evaluationResult.score)}`,
+                        border: `4px solid ${scoreColor(apiEvaluationResult.score)}`,
                         display: 'flex',
                         flexDirection: 'column',
                         alignItems: 'center',
                         justifyContent: 'center',
-                        boxShadow: `0 0 20px ${scoreColor(evaluationResult.score)}40`,
+                        boxShadow: `0 0 20px ${scoreColor(apiEvaluationResult.score)}40`,
                       }}
                     >
                       <span
                         style={{
                           fontSize: '2rem',
                           fontWeight: 700,
-                          color: scoreColor(evaluationResult.score),
+                          color: scoreColor(apiEvaluationResult.score),
                         }}
                       >
-                        {evaluationResult.score}
+                        {apiEvaluationResult.score}
                       </span>
-                      <span className="label">{evaluationResult.label}</span>
+                      <span className="label">{scoreLabel(apiEvaluationResult.score)}</span>
                     </div>
                   </div>
 
@@ -1055,23 +1231,23 @@ export default function CompareStudio() {
                       [
                         {
                           label: 'Angle Dev.',
-                          value: evaluationResult.metrics.angleDeviation,
-                          unit: '°',
+                          value: apiEvaluationResult.metrics?.angle_deviation,
+                          unit: '',
                         },
                         {
                           label: 'Trajectory',
-                          value: evaluationResult.metrics.trajectoryDeviation,
-                          unit: '°',
+                          value: apiEvaluationResult.metrics?.trajectory_deviation,
+                          unit: '',
                         },
                         {
                           label: 'Velocity',
-                          value: evaluationResult.metrics.velocityDifference,
-                          unit: '%',
+                          value: apiEvaluationResult.metrics?.velocity_difference,
+                          unit: '',
                         },
                         {
                           label: 'Tool Align.',
-                          value: evaluationResult.metrics.toolAlignmentDeviation,
-                          unit: '°',
+                          value: apiEvaluationResult.metrics?.tool_alignment_deviation,
+                          unit: '',
                         },
                       ] as const
                     ).map((m) => (
@@ -1084,7 +1260,7 @@ export default function CompareStudio() {
                           className="stat-value"
                           style={{ fontSize: '1.25rem' }}
                         >
-                          {m.value}
+                          {typeof m.value === 'number' ? m.value : 0}
                           {m.unit}
                         </div>
                         <div
@@ -1109,14 +1285,31 @@ export default function CompareStudio() {
                       className="text-small"
                       style={{ color: 'var(--text-secondary)' }}
                     >
-                      {evaluationResult.explanation}
+                      {apiEvaluationResult.explanation?.explanation ?? ''}
                     </p>
+                    {Array.isArray(apiEvaluationResult.key_error_moments) &&
+                      apiEvaluationResult.key_error_moments.length > 0 && (
+                        <div style={{ marginTop: 'var(--space-sm)' }}>
+                          {apiEvaluationResult.key_error_moments.map((error: any, index: number) => (
+                            <p
+                              key={`${error.error_type ?? 'error'}-${index}`}
+                              className="text-small"
+                              style={{ color: 'var(--text-secondary)' }}
+                            >
+                              - {error.semantic_label || error.label}
+                            </p>
+                          ))}
+                        </div>
+                      )}
                   </div>
 
                   <button
                     className="btn btn-secondary"
                     style={{ width: '100%' }}
-                    onClick={resetEvaluation}
+                    onClick={() => {
+                      resetEvaluation();
+                      setApiEvaluationResult(null);
+                    }}
                   >
                     <RotateCcw size={14} />
                     Run Again

@@ -24,6 +24,9 @@ class EvaluationStartResponse(BaseModel):
     attempt_id: UUID
     status: str
     message: str
+    score: Optional[int] = None
+    gate_status: Optional[str] = None
+    gate_reasons: Optional[list[str]] = None
 
 
 class EvaluationStatusResponse(BaseModel):
