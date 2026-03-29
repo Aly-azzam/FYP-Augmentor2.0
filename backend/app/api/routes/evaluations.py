@@ -319,6 +319,11 @@ def _resolve_expert_video_path(
         if mapped.exists():
             return mapped
 
+    if course_id == "pottery-wheel" and clip_id == "pottery-wheel-clip-2":
+        mapped = settings.STORAGE_ROOT / "expert" / "expert1.mp4"
+        if mapped.exists():
+            return mapped
+
     return find_first_expert_video_file()
 
 

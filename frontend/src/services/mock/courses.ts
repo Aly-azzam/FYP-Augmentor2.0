@@ -72,7 +72,7 @@ export const courses: Course[] = [
     description:
       'Advanced pottery wheel techniques for creating complex forms, trimming, and decorative methods.',
     difficulty: 'advanced',
-    totalClips: 1,
+    totalClips: 2,
     estimatedTime: '7h 00m',
     progress: 0,
     thumbnail: '/course-pottery.jpg',
@@ -160,6 +160,20 @@ const potteryWheelClips: VideoClip[] = [
       'Watch the real expert demo currently stored in the backend',
       'Use this clip as the expert reference on the left side of Compare Studio',
       'Upload your learner video on the right and start comparison',
+    ],
+  },
+  {
+    id: 'pottery-wheel-clip-2',
+    title: 'Pottery Expert Demo - Alternate',
+    duration: 10,
+    description:
+      'Alternate expert reference clip. Use this card if you want to compare against the newly added expert1 video.',
+    thumbnail: '/course-pottery.jpg',
+    expertVideoUrl: '/storage/expert/expert1.mp4',
+    keyPoints: [
+      'This card points to /storage/expert/expert1.mp4',
+      'Selecting this card opens Compare Studio with this expert reference',
+      'Upload your learner attempt and run evaluation against this specific expert clip',
     ],
   },
 ];
