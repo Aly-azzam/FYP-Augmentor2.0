@@ -2,7 +2,7 @@ from typing import Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.schemas.upload_schema import UploadResponse
@@ -22,7 +22,7 @@ async def upload_practice_video(
     chapter_id: UUID = Form(...),
     file: UploadFile = File(...),
     user_id: Optional[UUID] = Form(None),
-    db: AsyncSession = Depends(get_db),
+    db: Session = Depends(get_db),
 ):
     """Upload a learner practice video and persist its attempt record."""
     try:

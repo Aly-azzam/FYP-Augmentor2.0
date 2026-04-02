@@ -18,6 +18,46 @@ from app.services.media_service import (
 router = APIRouter(prefix="/api/chapters", tags=["Chapters"])
 
 
+@router.get("", response_model=list[ChapterDetail])
+def list_chapters(course_id: UUID | None = None, db: Session = Depends(get_db)):
+    """List chapters, optionally filtered by course_id."""
+    query = select(Chapter).options(selectinload(Chapter.expert_video)).order_by(Chapter.chapter_order.asc())
+    if course_id is not None:
+        query = query.where(Chapter.course_id == course_id)
+
+    chapters = db.execute(query).scalars().all()
+    response: list[ChapterDetail] = []
+    for chapter in chapters:
+        expert_video = None
+        if chapter.expert_video is not None:
+            try:
+                storage_key = normalize_storage_key(chapter.expert_video.file_path)
+            except ValueError:
+                storage_key = None
+
+            if storage_key is not None:
+                expert_video = ExpertVideoOut(
+                    id=chapter.expert_video.id,
+                    chapter_id=chapter.expert_video.chapter_id,
+                    file_path=storage_key,
+                    url=build_storage_url(storage_key),
+                    duration_seconds=chapter.expert_video.duration_seconds,
+                    fps=chapter.expert_video.fps,
+                )
+
+        response.append(
+            ChapterDetail(
+                id=chapter.id,
+                course_id=chapter.course_id,
+                title=chapter.title,
+                order=chapter.chapter_order,
+                expert_video=expert_video,
+            )
+        )
+
+    return response
+
+
 @router.get("/default/expert-video", response_model=ExpertVideoAssetOut)
 def get_default_expert_video(db: Session = Depends(get_db)):
     """Return the default expert video for frontend playback."""
@@ -71,7 +111,7 @@ def get_chapter(chapter_id: UUID, db: Session = Depends(get_db)):
         id=chapter.id,
         course_id=chapter.course_id,
         title=chapter.title,
-        order=chapter.order,
+        order=chapter.chapter_order,
         expert_video=expert_video,
     )
 
@@ -79,7 +119,12 @@ def get_chapter(chapter_id: UUID, db: Session = Depends(get_db)):
 @router.get("/{chapter_id}/expert-video", response_model=ExpertVideoOut)
 def get_expert_video(chapter_id: UUID, db: Session = Depends(get_db)):
     """Get expert reference video for a chapter."""
-    result = db.execute(select(ExpertVideo).where(ExpertVideo.chapter_id == chapter_id))
+    result = db.execute(
+        select(ExpertVideo).where(
+            ExpertVideo.chapter_id == chapter_id,
+            ExpertVideo.video_role == "expert",
+        )
+    )
     expert_video = result.scalar_one_or_none()
     if expert_video is None:
         raise HTTPException(

@@ -8,8 +8,7 @@ from typing import Optional
 
 from fastapi import UploadFile
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import Session, selectinload
 
 from app.core.config import settings
 from app.core.constants import ALLOWED_VIDEO_EXTENSIONS, ALLOWED_VIDEO_TYPES, AttemptStatus
@@ -70,8 +69,8 @@ def validate_upload_file(file: UploadFile) -> str:
     return extension
 
 
-async def _get_chapter_with_context(db: AsyncSession, chapter_id: uuid.UUID) -> Optional[Chapter]:
-    result = await db.execute(
+async def _get_chapter_with_context(db: Session, chapter_id: uuid.UUID) -> Optional[Chapter]:
+    result = db.execute(
         select(Chapter)
         .options(selectinload(Chapter.expert_video))
         .where(Chapter.id == chapter_id)
@@ -79,11 +78,11 @@ async def _get_chapter_with_context(db: AsyncSession, chapter_id: uuid.UUID) -> 
     return result.scalar_one_or_none()
 
 
-async def _validate_user_if_provided(db: AsyncSession, user_id: Optional[uuid.UUID]) -> None:
+async def _validate_user_if_provided(db: Session, user_id: Optional[uuid.UUID]) -> None:
     if user_id is None:
         return
 
-    result = await db.execute(select(User.id).where(User.id == user_id))
+    result = db.execute(select(User.id).where(User.id == user_id))
     if result.scalar_one_or_none() is None:
         raise UploadValidationError("Provided user_id does not exist.")
 
@@ -119,7 +118,7 @@ async def save_upload_file(file: UploadFile, relative_path: Path) -> int:
 
 
 async def create_learner_attempt_upload(
-    db: AsyncSession,
+    db: Session,
     *,
     chapter_id: uuid.UUID,
     file: UploadFile,
@@ -153,13 +152,13 @@ async def create_learner_attempt_upload(
         attempt.status = AttemptStatus.UPLOADED.value
 
         db.add(attempt)
-        await db.commit()
-        await db.refresh(attempt)
+        db.commit()
+        db.refresh(attempt)
     except UploadValidationError:
-        await db.rollback()
+        db.rollback()
         raise
     except Exception as exc:
-        await db.rollback()
+        db.rollback()
         saved_file = settings.STORAGE_ROOT / relative_path
         if saved_file.exists():
             saved_file.unlink()

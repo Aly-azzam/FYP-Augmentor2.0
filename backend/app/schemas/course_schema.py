@@ -48,10 +48,8 @@ class CourseOut(BaseModel):
     id: UUID
     title: str
     description: Optional[str] = None
-    instructor: Optional[str] = None
-    difficulty: Optional[str] = None
-    thumbnail_url: Optional[str] = None
     created_at: datetime
+    updated_at: datetime
 
     model_config = {"from_attributes": True}
 

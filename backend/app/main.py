@@ -1,10 +1,22 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from sqlalchemy import text
+from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.core.database import Base, engine
+from app.core.database import get_db
 from app.api.routes import courses, chapters, uploads, evaluations, history, progress
+from fastapi import Depends
+from app.models.user import User
+from app.models.course import Course
+from app.models.chapter import Chapter
+from app.models.video import Video
+from app.models.attempt import Attempt
+from app.models.evaluation import Evaluation
+from app.models.evaluation_feedback import EvaluationFeedback
+
+
 
 app = FastAPI(
     title=settings.APP_NAME,
@@ -41,7 +53,8 @@ async def startup_event():
     import app.models.progress  # noqa: F401
     import app.models.user  # noqa: F401
 
-    Base.metadata.create_all(bind=engine)
+    # Tables are managed externally (PostgreSQL + migrations/manual setup).
+    # Base.metadata.create_all(bind=engine)
 
 
 @app.get("/health", tags=["Health"])
@@ -50,4 +63,49 @@ async def health_check():
         "status": "healthy",
         "version": settings.APP_VERSION,
         "pipeline_version": settings.PIPELINE_VERSION,
+    }
+
+@app.get("/health/db", tags=["Health"])
+def health_db(db: Session = Depends(get_db)):
+    db.execute(text("SELECT 1"))
+    return {"status": "db connected"}
+
+
+@app.get("/health/db/smoke", tags=["Health"])
+def health_db_smoke(db: Session = Depends(get_db)):
+    checks: dict[str, dict[str, object]] = {}
+    overall_ok = True
+
+    try:
+        db.execute(text("SELECT 1"))
+        checks["select_1"] = {"ok": True}
+    except Exception as exc:
+        checks["select_1"] = {"ok": False, "error": str(exc)}
+        overall_ok = False
+
+    model_checks = [
+        ("User", User),
+        ("Course", Course),
+        ("Chapter", Chapter),
+        ("Video", Video),
+        ("Attempt", Attempt),
+        ("Evaluation", Evaluation),
+        ("EvaluationFeedback", EvaluationFeedback),
+    ]
+
+    for label, model in model_checks:
+        try:
+            row = db.query(model).first()
+            checks[label] = {
+                "ok": True,
+                "found_row": row is not None,
+            }
+        except Exception as exc:
+            checks[label] = {"ok": False, "error": str(exc)}
+            overall_ok = False
+
+    return {
+        "status": "db smoke passed" if overall_ok else "db smoke failed",
+        "ok": overall_ok,
+        "checks": checks,
     }

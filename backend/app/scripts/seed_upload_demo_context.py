@@ -1,8 +1,6 @@
-import asyncio
-
 from sqlalchemy import select
 
-from app.core.database import async_session, init_db
+from app.core.database import SessionLocal
 from app.models.chapter import Chapter
 from app.models.course import Course
 from app.models.expert_video import ExpertVideo
@@ -12,13 +10,13 @@ COURSE_TITLE = "MVP Upload Demo Course"
 CHAPTER_TITLE = "MVP Upload Demo Chapter"
 
 
-async def main() -> None:
-    await init_db()
+def main() -> None:
     expert_file = find_first_expert_video_file()
     expert_storage_key = normalize_storage_key(expert_file) if expert_file is not None else None
 
-    async with async_session() as session:
-        course_result = await session.execute(
+    session = SessionLocal()
+    try:
+        course_result = session.execute(
             select(Course).where(Course.title == COURSE_TITLE)
         )
         course = course_result.scalar_one_or_none()
@@ -30,9 +28,9 @@ async def main() -> None:
                 difficulty="beginner",
             )
             session.add(course)
-            await session.flush()
+            session.flush()
 
-        chapter_result = await session.execute(
+        chapter_result = session.execute(
             select(Chapter).where(
                 Chapter.course_id == course.id,
                 Chapter.title == CHAPTER_TITLE,
@@ -46,9 +44,9 @@ async def main() -> None:
                 order=1,
             )
             session.add(chapter)
-            await session.flush()
+            session.flush()
 
-        expert_video_result = await session.execute(
+        expert_video_result = session.execute(
             select(ExpertVideo).where(ExpertVideo.chapter_id == chapter.id)
         )
         expert_video = expert_video_result.scalar_one_or_none()
@@ -58,11 +56,11 @@ async def main() -> None:
                 file_path=expert_storage_key,
             )
             session.add(expert_video)
-            await session.flush()
+            session.flush()
         elif expert_storage_key is not None and expert_video is not None:
             expert_video.file_path = expert_storage_key
 
-        await session.commit()
+        session.commit()
 
         print("Seed data ready:")
         print(f"course_id={course.id}")
@@ -72,7 +70,9 @@ async def main() -> None:
             print(f"expert_video_storage_key={expert_storage_key}")
         else:
             print("warning=no expert video file found under backend/storage/expert")
+    finally:
+        session.close()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

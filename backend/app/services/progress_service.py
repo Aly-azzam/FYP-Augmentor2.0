@@ -31,13 +31,13 @@ Progress rule:
 from uuid import UUID
 from typing import Optional
 
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import Session
 
 from app.schemas.evaluation_schema import ProgressOut
 
 
 async def get_progress(
-    db: AsyncSession,
+    db: Session,
     user_id: Optional[UUID] = None,
 ) -> list[ProgressOut]:
     """Compute completion-based progress per course.

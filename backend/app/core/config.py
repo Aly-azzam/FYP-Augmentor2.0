@@ -1,5 +1,5 @@
 from pathlib import Path
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -7,7 +7,7 @@ class Settings(BaseSettings):
     APP_VERSION: str = "0.1.0"
     DEBUG: bool = True
 
-    DATABASE_URL: str = "sqlite:///./augmentor.db"
+    DATABASE_URL: str
 
     # Local storage root (MVP)
     STORAGE_ROOT: Path = Path(__file__).resolve().parents[2] / "storage"
@@ -38,9 +38,10 @@ class Settings(BaseSettings):
     CONFIG_VERSION: str = "0.1.0"
     EXPLANATION_MODE: str = "rule"
 
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8"
+    )
 
 
 settings = Settings()

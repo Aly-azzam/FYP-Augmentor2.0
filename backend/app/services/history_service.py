@@ -6,13 +6,13 @@ History is not stored separately. It is queried/derived from existing tables.
 from uuid import UUID
 from typing import Optional
 
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import Session
 
 from app.schemas.evaluation_schema import HistoryEntry
 
 
 async def get_history(
-    db: AsyncSession,
+    db: Session,
     user_id: Optional[UUID] = None,
     limit: int = 50,
     offset: int = 0,
