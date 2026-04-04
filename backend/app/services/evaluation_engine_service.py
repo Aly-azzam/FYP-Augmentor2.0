@@ -12,6 +12,7 @@ from sqlalchemy import text
 from app.schemas.evaluation_schema import EvaluationResult as EvaluationResultSchema, MetricSet
 from app.models.attempt import Attempt
 from app.models.evaluation import Evaluation as EvaluationModel
+from app.models.evaluation_feedback import EvaluationFeedback
 from app.models.video import Video
 from app.core.database import SessionLocal, engine
 from app.services.angle_metrics_service import (
@@ -329,6 +330,8 @@ def _persist_evaluation_result(
                 f"Expert video not found for chapter_id={attempt_row.chapter_id}"
             )
 
+        attempt_row.status = "evaluated"
+
         return _insert_db_result(
             session=session,
             attempt_id=attempt_id,
@@ -369,24 +372,74 @@ def _insert_db_result(
     semantic_phases: dict[str, Any],
     explanation: dict[str, Any],
 ) -> str:
-    db_result = EvaluationModel(
-        attempt_id=attempt_id,
-        expert_video_id=expert_video_id,
-        learner_video_id=learner_video_id,
-        overall_score=score,
-        status="completed",
-        context_confidence=None,
-        score_confidence=None,
-        explanation_confidence=None,
-        gate_passed=True,
-        gate_reasons=[],
-        metrics=metrics,
-        per_metric_breakdown=per_metric_breakdown,
-        key_error_moments=key_error_moments,
-        semantic_phases=semantic_phases,
-        summary_text=str(explanation.get("explanation", "")) if isinstance(explanation, dict) else "",
+    db_result = (
+        session.query(EvaluationModel)
+        .filter(EvaluationModel.attempt_id == attempt_id)
+        .first()
     )
-    session.add(db_result)
+    if db_result is None:
+        db_result = EvaluationModel(
+            attempt_id=attempt_id,
+            expert_video_id=expert_video_id,
+            learner_video_id=learner_video_id,
+        )
+        session.add(db_result)
+
+    db_result.expert_video_id = expert_video_id
+    db_result.learner_video_id = learner_video_id
+    db_result.overall_score = score
+    db_result.status = "completed"
+    db_result.context_confidence = None
+    db_result.score_confidence = None
+    db_result.explanation_confidence = None
+    db_result.gate_passed = True
+    db_result.gate_reasons = []
+    db_result.metrics = metrics
+    db_result.per_metric_breakdown = per_metric_breakdown
+    db_result.key_error_moments = key_error_moments
+    db_result.semantic_phases = semantic_phases
+    db_result.summary_text = str(explanation.get("explanation", "")) if isinstance(explanation, dict) else ""
+
+    session.flush()
+    _upsert_feedback(session=session, evaluation_id=str(db_result.id), explanation=explanation)
     session.commit()
     session.refresh(db_result)
     return str(db_result.id)
+
+
+def _upsert_feedback(*, session, evaluation_id: str, explanation: dict[str, Any]) -> None:
+    if not isinstance(explanation, dict):
+        explanation = {}
+
+    mode = str(explanation.get("mode", "rule_based"))
+    explanation_text = str(
+        explanation.get("explanation")
+        or explanation.get("explanation_text")
+        or "No explanation available."
+    )
+    model_name = explanation.get("model_name")
+    strengths = explanation.get("strengths")
+    weaknesses = explanation.get("weaknesses")
+    advice = explanation.get("advice")
+    cited_timestamps = explanation.get("cited_timestamps")
+
+    feedback_row = (
+        session.query(EvaluationFeedback)
+        .filter(EvaluationFeedback.evaluation_id == evaluation_id)
+        .first()
+    )
+    if feedback_row is None:
+        feedback_row = EvaluationFeedback(
+            evaluation_id=evaluation_id,
+            mode=mode,
+            explanation_text=explanation_text,
+        )
+        session.add(feedback_row)
+
+    feedback_row.mode = mode
+    feedback_row.model_name = str(model_name) if model_name is not None else None
+    feedback_row.explanation_text = explanation_text
+    feedback_row.strengths = strengths if isinstance(strengths, list) else None
+    feedback_row.weaknesses = weaknesses if isinstance(weaknesses, list) else None
+    feedback_row.advice = advice
+    feedback_row.cited_timestamps = cited_timestamps if isinstance(cited_timestamps, list) else None

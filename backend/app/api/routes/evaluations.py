@@ -1,20 +1,21 @@
 from __future__ import annotations
 
-import hashlib
 import traceback
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from app.core.config import settings
 from app.core.database import get_db
 from app.models.evaluation import Evaluation as EvaluationModel
+from app.models.evaluation_feedback import EvaluationFeedback
 from app.models.video import Video
 from app.models.attempt import Attempt
 from app.schemas.upload_schema import (
+    EvaluationStartRequest,
     EvaluationStartResponse,
     EvaluationStatusResponse,
 )
@@ -37,7 +38,11 @@ MIN_VALID_LANDMARK_FRAMES = 3
 
 
 @router.post("/start", response_model=EvaluationStartResponse)
-async def start_evaluation(request: Request, db: Session = Depends(get_db)):
+async def start_evaluation(
+    request: Request,
+    start_request: EvaluationStartRequest | None = None,
+    db: Session = Depends(get_db),
+):
     """Run the real evaluation pipeline: video -> MediaPipe -> motion -> DTW -> score."""
 
     raw_attempt_id = None
@@ -45,10 +50,13 @@ async def start_evaluation(request: Request, db: Session = Depends(get_db)):
     selected_clip_id = None
     selected_chapter_id = None
     learner_video_path: Path | None = None
+    if start_request is not None:
+        raw_attempt_id = start_request.attempt_id
+
     content_type = (request.headers.get("content-type") or "").lower()
     if "multipart/form-data" in content_type:
         form = await request.form()
-        raw_attempt_id = form.get("attempt_id")
+        raw_attempt_id = form.get("attempt_id") or raw_attempt_id
         selected_course_id = form.get("course_id")
         selected_clip_id = form.get("clip_id")
         selected_chapter_id = form.get("chapter_id")
@@ -61,13 +69,19 @@ async def start_evaluation(request: Request, db: Session = Depends(get_db)):
         except Exception:
             payload = {}
         if isinstance(payload, dict):
-            raw_attempt_id = payload.get("attempt_id")
+            raw_attempt_id = payload.get("attempt_id") or raw_attempt_id
             selected_course_id = payload.get("course_id")
             selected_clip_id = payload.get("clip_id")
             selected_chapter_id = payload.get("chapter_id")
 
-    attempt_id = _coerce_uuid(raw_attempt_id)
+    attempt_id = _require_uuid(raw_attempt_id, field_name="attempt_id")
     chapter_id = _resolve_chapter_id(db=db, attempt_id=attempt_id, chapter_id_value=selected_chapter_id)
+    if chapter_id is None:
+        raise HTTPException(status_code=400, detail="Unable to resolve chapter_id for the provided attempt_id.")
+
+    if learner_video_path is None:
+        learner_video_path = _resolve_learner_video_path(db=db, attempt_id=attempt_id)
+
     expert_video_path = _resolve_expert_video_path(
         db=db,
         chapter_id=chapter_id,
@@ -155,9 +169,14 @@ async def start_evaluation(request: Request, db: Session = Depends(get_db)):
         learner_motion=learner_motion_dict,
     )
     if not gate_result.passed:
+        persisted_evaluation_id = _persist_out_of_context_result(
+            db=db,
+            attempt_id=attempt_id,
+            gate_reasons=gate_result.reasons,
+        )
         print(f"[EVAL] REJECTED by context gate: {gate_result.reasons}")
         return EvaluationStartResponse(
-            evaluation_id=uuid4(),
+            evaluation_id=UUID(persisted_evaluation_id),
             attempt_id=attempt_id,
             status="out_of_context",
             message=OUT_OF_CONTEXT_MESSAGE,
@@ -195,38 +214,73 @@ async def start_evaluation(request: Request, db: Session = Depends(get_db)):
 
 
 @router.get("/{evaluation_id}/status", response_model=EvaluationStatusResponse)
-async def get_evaluation_status(evaluation_id: UUID):
+async def get_evaluation_status(evaluation_id: UUID, db: Session = Depends(get_db)):
     """Poll evaluation processing status."""
+    row = (
+        db.query(EvaluationModel)
+        .filter(EvaluationModel.id == str(evaluation_id))
+        .first()
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="Evaluation not found")
+
     return EvaluationStatusResponse(
         evaluation_id=evaluation_id,
-        attempt_id=UUID("00000000-0000-0000-0000-000000000000"),
-        status="running",
-        current_stage="perception",
-        message="Processing in progress...",
+        attempt_id=UUID(str(row.attempt_id)),
+        status=str(row.status),
+        current_stage="completed" if str(row.status) in {"completed", "evaluated"} else "processing",
+        message="Evaluation completed." if str(row.status) in {"completed", "evaluated"} else "Evaluation in progress.",
     )
 
 
 @router.get("/{evaluation_id}/result", response_model=EvaluationResultOut)
-async def get_evaluation_result(evaluation_id: UUID):
+async def get_evaluation_result(evaluation_id: UUID, db: Session = Depends(get_db)):
     """Get final evaluation result. Only available when status is terminal."""
+    row = (
+        db.query(EvaluationModel)
+        .options(
+            joinedload(EvaluationModel.attempt),
+            joinedload(EvaluationModel.feedback),
+        )
+        .filter(EvaluationModel.id == str(evaluation_id))
+        .first()
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="Evaluation not found")
+
+    metrics_payload = row.metrics or {}
+    metrics = EvaluationMetrics(
+        angle_deviation=float(metrics_payload.get("angle_deviation", 0.0)),
+        trajectory_deviation=float(metrics_payload.get("trajectory_deviation", 0.0)),
+        velocity_difference=float(metrics_payload.get("velocity_difference", 0.0)),
+        smoothness_score=float(metrics_payload.get("smoothness_score", 0.0)),
+        timing_score=float(metrics_payload.get("timing_score", 0.0)),
+        hand_openness_deviation=float(metrics_payload.get("hand_openness_deviation", 0.0)),
+        tool_alignment_deviation=float(metrics_payload.get("tool_alignment_deviation", 0.0)),
+        dtw_similarity=float(metrics_payload.get("dtw_similarity", 0.0)),
+    )
+
+    chapter_id = None
+    if row.attempt is not None:
+        try:
+            chapter_id = UUID(str(row.attempt.chapter_id))
+        except Exception:
+            chapter_id = None
+    if chapter_id is None:
+        raise HTTPException(status_code=500, detail="Evaluation data is missing chapter linkage.")
+
+    feedback_text = row.feedback.explanation_text if row.feedback is not None else None
     return EvaluationResultOut(
         evaluation_id=evaluation_id,
-        chapter_id=UUID("00000000-0000-0000-0000-000000000000"),
-        expert_video_id=UUID("00000000-0000-0000-0000-000000000001"),
-        learner_video_id=UUID("00000000-0000-0000-0000-000000000000"),
-        status="completed",
-        score=75,
-        metrics=EvaluationMetrics(
-            angle_deviation=8.5,
-            trajectory_deviation=12.3,
-            velocity_difference=15.0,
-            smoothness_score=0.7,
-            timing_score=0.65,
-            hand_openness_deviation=0.2,
-            tool_alignment_deviation=6.2,
-        ),
-        summary="Placeholder evaluation summary",
-        ai_text="Placeholder AI explanation",
+        chapter_id=chapter_id,
+        expert_video_id=UUID(str(row.expert_video_id)),
+        learner_video_id=UUID(str(row.learner_video_id)),
+        status=str(row.status),
+        score=int(round(float(row.overall_score or 0.0))),
+        metrics=metrics,
+        summary=row.summary_text,
+        ai_text=feedback_text,
+        created_at=row.created_at,
     )
 
 
@@ -263,6 +317,23 @@ async def get_evaluation_by_id(evaluation_id: str, db: Session = Depends(get_db)
 
 
 def _to_persisted_out(row: EvaluationModel) -> PersistedEvaluationOut:
+    feedback = (
+        row.feedback
+        if hasattr(row, "feedback")
+        else None
+    )
+    explanation_payload = {}
+    if feedback is not None:
+        explanation_payload = {
+            "mode": feedback.mode,
+            "model_name": feedback.model_name,
+            "explanation_text": feedback.explanation_text,
+            "strengths": feedback.strengths or [],
+            "weaknesses": feedback.weaknesses or [],
+            "advice": feedback.advice,
+            "cited_timestamps": feedback.cited_timestamps or [],
+        }
+
     return PersistedEvaluationOut(
         id=str(row.id),
         attempt_id=str(row.attempt_id),
@@ -271,16 +342,18 @@ def _to_persisted_out(row: EvaluationModel) -> PersistedEvaluationOut:
         per_metric_breakdown=row.per_metric_breakdown or {},
         key_error_moments=row.key_error_moments or [],
         semantic_phases=row.semantic_phases or {},
-        explanation={},
+        explanation=explanation_payload,
         created_at=row.created_at,
     )
 
 
-def _coerce_uuid(value) -> UUID:
+def _require_uuid(value: Any, field_name: str) -> UUID:
+    if value is None or str(value).strip() == "":
+        raise HTTPException(status_code=400, detail=f"{field_name} is required.")
     try:
         return UUID(str(value))
     except Exception:
-        return uuid4()
+        raise HTTPException(status_code=400, detail=f"Invalid {field_name}. Expected UUID format.")
 
 
 def _resolve_chapter_id(db: Session, attempt_id: UUID, chapter_id_value: Any) -> UUID | None:
@@ -325,6 +398,97 @@ def _resolve_expert_video_path(
             return mapped
 
     return find_first_expert_video_file()
+
+
+def _resolve_learner_video_path(*, db: Session, attempt_id: UUID) -> Path | None:
+    attempt = (
+        db.query(Attempt)
+        .options(joinedload(Attempt.learner_video))
+        .filter(Attempt.id == str(attempt_id))
+        .first()
+    )
+    if attempt is None:
+        raise HTTPException(status_code=404, detail="Attempt not found for provided attempt_id.")
+    if attempt.learner_video is None or not attempt.learner_video.file_path:
+        raise HTTPException(status_code=400, detail="Learner video is not linked to the provided attempt.")
+
+    try:
+        resolved_path = settings.STORAGE_ROOT / normalize_storage_key(attempt.learner_video.file_path)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Learner video file path is invalid.")
+
+    if not resolved_path.exists():
+        raise HTTPException(status_code=400, detail="Learner video file does not exist on disk.")
+    return resolved_path
+
+
+def _persist_out_of_context_result(*, db: Session, attempt_id: UUID, gate_reasons: list[str]) -> str:
+    attempt = db.query(Attempt).filter(Attempt.id == str(attempt_id)).first()
+    if attempt is None:
+        raise HTTPException(status_code=404, detail="Attempt not found for provided attempt_id.")
+
+    expert_video = (
+        db.query(Video)
+        .filter(Video.chapter_id == attempt.chapter_id, Video.video_role == "expert")
+        .order_by(Video.created_at.asc())
+        .first()
+    )
+    if expert_video is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Expert video record not found for this chapter; cannot persist out_of_context result.",
+        )
+
+    row = db.query(EvaluationModel).filter(EvaluationModel.attempt_id == attempt.id).first()
+    if row is None:
+        row = EvaluationModel(
+            attempt_id=attempt.id,
+            expert_video_id=expert_video.id,
+            learner_video_id=attempt.learner_video_id,
+        )
+        db.add(row)
+
+    row.overall_score = 0
+    row.status = "out_of_context"
+    row.gate_passed = False
+    row.gate_reasons = gate_reasons
+    row.metrics = {}
+    row.per_metric_breakdown = {}
+    row.key_error_moments = []
+    row.semantic_phases = {}
+    row.summary_text = OUT_OF_CONTEXT_MESSAGE
+    attempt.status = "out_of_context"
+
+    feedback_text = OUT_OF_CONTEXT_MESSAGE
+    if gate_reasons:
+        feedback_text = f"{OUT_OF_CONTEXT_MESSAGE} Reasons: " + "; ".join(gate_reasons)
+
+    feedback_row = (
+        db.query(EvaluationFeedback)
+        .filter(EvaluationFeedback.evaluation_id == row.id)
+        .first()
+    )
+    if feedback_row is None:
+        feedback_row = EvaluationFeedback(
+            evaluation_id=row.id,
+            mode="rule_based",
+            explanation_text=feedback_text,
+        )
+        db.add(feedback_row)
+
+    feedback_row.mode = "rule_based"
+    feedback_row.model_name = "context_gate"
+    feedback_row.explanation_text = feedback_text
+    feedback_row.strengths = None
+    feedback_row.weaknesses = gate_reasons or None
+    feedback_row.advice = [
+        "Please upload a learner practice video that matches the same chapter task as the expert."
+    ]
+    feedback_row.cited_timestamps = None
+
+    db.commit()
+    db.refresh(row)
+    return str(row.id)
 
 
 async def _save_uploaded_file(uploaded_file) -> Path:

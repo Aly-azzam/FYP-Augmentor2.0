@@ -127,6 +127,9 @@ async def create_learner_attempt_upload(
     user_id: Optional[uuid.UUID] = None,
 ) -> UploadResult:
     """Validate, save, and persist a learner upload for a chapter."""
+    if user_id is None:
+        raise UploadValidationError("user_id is required.")
+
     extension = validate_upload_file(file)
 
     chapter = await _get_chapter_with_context(db, chapter_id)
@@ -157,7 +160,7 @@ async def create_learner_attempt_upload(
         attempt = Attempt(
             id=attempt_id,
             chapter_id=chapter.id,
-            user_id=user_id,
+            user_id=str(user_id),
             learner_video_id=learner_video.id,
             status=AttemptStatus.UPLOADED.value,
             original_filename=file.filename,

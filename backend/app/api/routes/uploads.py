@@ -1,4 +1,3 @@
-from typing import Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
@@ -21,7 +20,7 @@ router = APIRouter(prefix="/api/uploads", tags=["Uploads"])
 async def upload_practice_video(
     chapter_id: UUID = Form(...),
     file: UploadFile = File(...),
-    user_id: Optional[UUID] = Form(None),
+    user_id: UUID = Form(...),
     db: Session = Depends(get_db),
 ):
     """Upload a learner practice video and persist its attempt record."""
