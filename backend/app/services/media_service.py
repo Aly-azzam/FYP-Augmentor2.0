@@ -12,7 +12,7 @@ from sqlalchemy.orm import joinedload
 from app.core.config import settings
 from app.core.constants import ALLOWED_VIDEO_EXTENSIONS
 from app.models.chapter import Chapter
-from app.models.expert_video import ExpertVideo
+from app.models.video import Video
 
 
 @dataclass
@@ -68,10 +68,11 @@ def find_first_expert_video_file() -> Optional[Path]:
 
 def get_default_expert_video_asset(db: Session) -> Optional[ExpertVideoAsset]:
     result = db.execute(
-        select(ExpertVideo)
-        .options(joinedload(ExpertVideo.chapter))
-        .join(Chapter, ExpertVideo.chapter_id == Chapter.id)
-        .order_by(Chapter.order.asc(), ExpertVideo.created_at.asc())
+        select(Video)
+        .options(joinedload(Video.chapter))
+        .join(Chapter, Video.chapter_id == Chapter.id)
+        .where(Video.video_role == "expert")
+        .order_by(Chapter.order.asc(), Video.created_at.asc())
     )
     expert_videos = result.scalars().all()
 

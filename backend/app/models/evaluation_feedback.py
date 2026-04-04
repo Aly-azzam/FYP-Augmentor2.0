@@ -6,7 +6,7 @@ from sqlalchemy import DateTime, ForeignKey, String, Text, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from app.core.database import Base
+from app.db.base import Base
 
 
 class EvaluationFeedback(Base):
@@ -19,8 +19,9 @@ class EvaluationFeedback(Base):
     )
     evaluation_id: Mapped[str] = mapped_column(
         PG_UUID(as_uuid=False),
-        ForeignKey("evaluations.id"),
+        ForeignKey("evaluations.id", ondelete="CASCADE"),
         nullable=False,
+        unique=True,
     )
     mode: Mapped[str] = mapped_column(String(50), nullable=False)
     model_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
@@ -30,7 +31,7 @@ class EvaluationFeedback(Base):
     advice: Mapped[Optional[dict[str, Any] | list[str] | str]] = mapped_column(JSONB, nullable=True)
     cited_timestamps: Mapped[Optional[list[dict[str, Any]]]] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=False), server_default=func.now(), nullable=False
+        DateTime(timezone=True), server_default=func.now(), nullable=False
     )
 
-    evaluation = relationship("EvaluationResult", back_populates="feedback")
+    evaluation: Mapped["Evaluation"] = relationship("Evaluation", back_populates="feedback")

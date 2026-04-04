@@ -13,8 +13,9 @@ from sqlalchemy.orm import Session, selectinload
 from app.core.config import settings
 from app.core.constants import ALLOWED_VIDEO_EXTENSIONS, ALLOWED_VIDEO_TYPES, AttemptStatus
 from app.models.chapter import Chapter
-from app.models.learner_attempt import LearnerAttempt
+from app.models.attempt import Attempt
 from app.models.user import User
+from app.models.video import Video
 
 CHUNK_SIZE_BYTES = 1024 * 1024
 
@@ -33,7 +34,8 @@ class RelatedResourceNotFoundError(LookupError):
 
 @dataclass
 class UploadResult:
-    attempt: LearnerAttempt
+    attempt: Attempt
+    learner_video: Video
     expert_video_id: Optional[uuid.UUID]
 
 
@@ -136,23 +138,35 @@ async def create_learner_attempt_upload(
     attempt_id = uuid.uuid4()
     relative_path = _build_relative_storage_path(attempt_id, extension)
 
-    attempt = LearnerAttempt(
-        id=attempt_id,
-        chapter_id=chapter.id,
-        user_id=user_id,
-        status=AttemptStatus.CREATED.value,
-        original_filename=file.filename,
-        content_type=(file.content_type or None),
-        video_path=str(relative_path).replace(os.sep, "/"),
-    )
-
     try:
         file_size_bytes = await save_upload_file(file, relative_path)
-        attempt.file_size_bytes = file_size_bytes
-        attempt.status = AttemptStatus.UPLOADED.value
+        learner_video = Video(
+            owner_user_id=str(user_id) if user_id is not None else None,
+            chapter_id=str(chapter.id),
+            video_role="learner_upload",
+            source_video_id=None,
+            file_path=str(relative_path).replace(os.sep, "/"),
+            file_name=file.filename,
+            mime_type=(file.content_type or None),
+            file_size_bytes=file_size_bytes,
+            storage_provider="local",
+        )
+        db.add(learner_video)
+        db.flush()
+
+        attempt = Attempt(
+            id=attempt_id,
+            chapter_id=chapter.id,
+            user_id=user_id,
+            learner_video_id=learner_video.id,
+            status=AttemptStatus.UPLOADED.value,
+            original_filename=file.filename,
+            error_reason=None,
+        )
 
         db.add(attempt)
         db.commit()
+        db.refresh(learner_video)
         db.refresh(attempt)
     except UploadValidationError:
         db.rollback()
@@ -165,4 +179,4 @@ async def create_learner_attempt_upload(
         raise UploadPersistenceError("Failed to save learner video upload.") from exc
 
     expert_video_id = chapter.expert_video.id if chapter.expert_video is not None else None
-    return UploadResult(attempt=attempt, expert_video_id=expert_video_id)
+    return UploadResult(attempt=attempt, learner_video=learner_video, expert_video_id=expert_video_id)

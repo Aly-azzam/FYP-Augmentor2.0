@@ -8,10 +8,11 @@ from pathlib import Path
 from typing import Any
 
 from sqlalchemy import text
-from sqlalchemy.exc import OperationalError
 
 from app.schemas.evaluation_schema import EvaluationResult as EvaluationResultSchema, MetricSet
-from app.models.evaluation_result import EvaluationResult as EvaluationResultModel
+from app.models.attempt import Attempt
+from app.models.evaluation import Evaluation as EvaluationModel
+from app.models.video import Video
 from app.core.database import SessionLocal, engine
 from app.services.angle_metrics_service import (
     compute_angle_deviation,
@@ -306,22 +307,33 @@ def _persist_evaluation_result(
     owns_session = db is None
     session = db or SessionLocal()
     try:
-        return _insert_db_result(
-            session=session,
-            attempt_id=attempt_id,
-            score=score,
-            metrics=metrics,
-            per_metric_breakdown=per_metric_breakdown,
-            key_error_moments=key_error_moments,
-            semantic_phases=semantic_phases,
-            explanation=explanation,
+        attempt_row = (
+            session.query(Attempt)
+            .filter(Attempt.id == str(attempt_id))
+            .first()
         )
-    except OperationalError:
-        session.rollback()
-        _ensure_evaluation_results_schema()
+        if attempt_row is None:
+            raise ValueError(f"Attempt not found for evaluation persistence: {attempt_id}")
+
+        expert_video_row = (
+            session.query(Video)
+            .filter(
+                Video.chapter_id == attempt_row.chapter_id,
+                Video.video_role == "expert",
+            )
+            .order_by(Video.created_at.asc())
+            .first()
+        )
+        if expert_video_row is None:
+            raise ValueError(
+                f"Expert video not found for chapter_id={attempt_row.chapter_id}"
+            )
+
         return _insert_db_result(
             session=session,
             attempt_id=attempt_id,
+            expert_video_id=str(expert_video_row.id),
+            learner_video_id=str(attempt_row.learner_video_id),
             score=score,
             metrics=metrics,
             per_metric_breakdown=per_metric_breakdown,
@@ -348,6 +360,8 @@ def _insert_db_result(
     *,
     session,
     attempt_id: str,
+    expert_video_id: str,
+    learner_video_id: str,
     score: float,
     metrics: dict[str, Any],
     per_metric_breakdown: dict[str, Any],
@@ -355,35 +369,24 @@ def _insert_db_result(
     semantic_phases: dict[str, Any],
     explanation: dict[str, Any],
 ) -> str:
-    db_result = EvaluationResultModel(
+    db_result = EvaluationModel(
         attempt_id=attempt_id,
-        score=score,
+        expert_video_id=expert_video_id,
+        learner_video_id=learner_video_id,
+        overall_score=score,
+        status="completed",
+        context_confidence=None,
+        score_confidence=None,
+        explanation_confidence=None,
+        gate_passed=True,
+        gate_reasons=[],
         metrics=metrics,
         per_metric_breakdown=per_metric_breakdown,
         key_error_moments=key_error_moments,
         semantic_phases=semantic_phases,
-        explanation=explanation,
+        summary_text=str(explanation.get("explanation", "")) if isinstance(explanation, dict) else "",
     )
     session.add(db_result)
     session.commit()
     session.refresh(db_result)
     return str(db_result.id)
-
-
-def _ensure_evaluation_results_schema() -> None:
-    required_columns = {
-        "metrics": "JSON",
-        "per_metric_breakdown": "JSON",
-        "key_error_moments": "JSON",
-        "semantic_phases": "JSON",
-        "explanation": "JSON",
-    }
-    with engine.begin() as connection:
-        rows = connection.execute(text("PRAGMA table_info(evaluation_results)")).fetchall()
-        existing = {str(row[1]) for row in rows}
-        for column_name, column_type in required_columns.items():
-            if column_name in existing:
-                continue
-            connection.execute(
-                text(f"ALTER TABLE evaluation_results ADD COLUMN {column_name} {column_type}")
-            )

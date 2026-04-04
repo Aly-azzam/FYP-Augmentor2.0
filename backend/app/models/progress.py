@@ -12,7 +12,7 @@ from typing import Optional
 from sqlalchemy import Float, Integer, ForeignKey, DateTime, String, func
 from sqlalchemy.orm import Mapped, mapped_column
 
-from app.core.database import Base
+from app.db.base import Base
 
 
 class Progress(Base):

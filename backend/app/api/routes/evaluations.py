@@ -11,9 +11,9 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.database import get_db
-from app.models.evaluation_result import EvaluationResult as EvaluationResultModel
-from app.models.expert_video import ExpertVideo
-from app.models.learner_attempt import LearnerAttempt
+from app.models.evaluation import Evaluation as EvaluationModel
+from app.models.video import Video
+from app.models.attempt import Attempt
 from app.schemas.upload_schema import (
     EvaluationStartResponse,
     EvaluationStatusResponse,
@@ -233,9 +233,9 @@ async def get_evaluation_result(evaluation_id: UUID):
 @router.get("/history/{attempt_id}", response_model=EvaluationHistoryOut)
 async def get_evaluation_history(attempt_id: str, db: Session = Depends(get_db)):
     rows = (
-        db.query(EvaluationResultModel)
-        .filter(EvaluationResultModel.attempt_id == attempt_id)
-        .order_by(EvaluationResultModel.created_at.desc())
+        db.query(EvaluationModel)
+        .filter(EvaluationModel.attempt_id == attempt_id)
+        .order_by(EvaluationModel.created_at.desc())
         .all()
     )
     return EvaluationHistoryOut(evaluations=[_to_persisted_out(row) for row in rows])
@@ -244,9 +244,9 @@ async def get_evaluation_history(attempt_id: str, db: Session = Depends(get_db))
 @router.get("/progress/{attempt_id}", response_model=AttemptProgressOut)
 async def get_evaluation_progress(attempt_id: str, db: Session = Depends(get_db)):
     rows = (
-        db.query(EvaluationResultModel)
-        .filter(EvaluationResultModel.attempt_id == attempt_id)
-        .order_by(EvaluationResultModel.created_at.desc())
+        db.query(EvaluationModel)
+        .filter(EvaluationModel.attempt_id == attempt_id)
+        .order_by(EvaluationModel.created_at.desc())
         .all()
     )
     evaluations = [_to_persisted_out(row).model_dump() for row in rows]
@@ -256,22 +256,22 @@ async def get_evaluation_progress(attempt_id: str, db: Session = Depends(get_db)
 
 @router.get("/{evaluation_id}", response_model=PersistedEvaluationOut)
 async def get_evaluation_by_id(evaluation_id: str, db: Session = Depends(get_db)):
-    row = db.query(EvaluationResultModel).filter(EvaluationResultModel.id == evaluation_id).first()
+    row = db.query(EvaluationModel).filter(EvaluationModel.id == evaluation_id).first()
     if row is None:
         raise HTTPException(status_code=404, detail="Evaluation not found")
     return _to_persisted_out(row)
 
 
-def _to_persisted_out(row: EvaluationResultModel) -> PersistedEvaluationOut:
+def _to_persisted_out(row: EvaluationModel) -> PersistedEvaluationOut:
     return PersistedEvaluationOut(
         id=str(row.id),
         attempt_id=str(row.attempt_id),
-        score=float(row.score or 0.0),
+        score=float(row.overall_score or 0.0),
         metrics=row.metrics or {},
         per_metric_breakdown=row.per_metric_breakdown or {},
         key_error_moments=row.key_error_moments or [],
         semantic_phases=row.semantic_phases or {},
-        explanation=row.explanation or {},
+        explanation={},
         created_at=row.created_at,
     )
 
@@ -290,7 +290,7 @@ def _resolve_chapter_id(db: Session, attempt_id: UUID, chapter_id_value: Any) ->
     except Exception:
         pass
 
-    attempt = db.query(LearnerAttempt).filter(LearnerAttempt.id == str(attempt_id)).first()
+    attempt = db.query(Attempt).filter(Attempt.id == str(attempt_id)).first()
     if attempt is None:
         return None
     try:
@@ -307,7 +307,7 @@ def _resolve_expert_video_path(
     clip_id: str | None,
 ) -> Path | None:
     if chapter_id is not None:
-        row = db.query(ExpertVideo).filter(ExpertVideo.chapter_id == str(chapter_id)).first()
+        row = db.query(Video).filter(Video.chapter_id == str(chapter_id), Video.video_role == "expert").first()
         if row is not None and row.file_path:
             try:
                 return settings.STORAGE_ROOT / normalize_storage_key(row.file_path)

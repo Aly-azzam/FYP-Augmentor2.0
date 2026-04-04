@@ -48,7 +48,7 @@ async def upload_practice_video(
         expert_video_id=result.expert_video_id,
         upload_status=result.attempt.status,
         original_filename=result.attempt.original_filename or file.filename or "",
-        stored_path=result.attempt.video_path or "",
-        video_url=build_storage_url(result.attempt.video_path) if result.attempt.video_path else None,
+        stored_path=result.learner_video.file_path or "",
+        video_url=build_storage_url(result.learner_video.file_path) if result.learner_video.file_path else None,
         message="Video uploaded successfully. Learner attempt is ready for evaluation.",
     )

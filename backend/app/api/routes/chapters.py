@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session, selectinload
 
 from app.core.database import get_db
 from app.models.chapter import Chapter
-from app.models.expert_video import ExpertVideo
+from app.models.video import Video
 from app.schemas.course_schema import ChapterDetail, ExpertVideoAssetOut, ExpertVideoOut
 from app.services.media_service import (
     build_storage_url,
@@ -120,9 +120,9 @@ def get_chapter(chapter_id: UUID, db: Session = Depends(get_db)):
 def get_expert_video(chapter_id: UUID, db: Session = Depends(get_db)):
     """Get expert reference video for a chapter."""
     result = db.execute(
-        select(ExpertVideo).where(
-            ExpertVideo.chapter_id == chapter_id,
-            ExpertVideo.video_role == "expert",
+        select(Video).where(
+            Video.chapter_id == chapter_id,
+            Video.video_role == "expert",
         )
     )
     expert_video = result.scalar_one_or_none()
