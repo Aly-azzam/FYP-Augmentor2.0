@@ -7,6 +7,7 @@ import {
   RefreshCw,
   Clock,
   Trophy,
+  Upload,
   Sun,
   Moon,
   Bot,
@@ -32,6 +33,7 @@ const navLinks = [
   { label: 'Compare Studio', path: '/compare', icon: RefreshCw },
   { label: 'History', path: '/history', icon: Clock },
   { label: 'Achievements', path: '/achievements', icon: Trophy },
+  { label: 'Expert Upload', path: '/expert-videos', icon: Upload },
 ] as const;
 
 export default function TopNav() {

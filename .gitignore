@@ -5,7 +5,19 @@ dist/
 .cursor/
 __pycache__/
 *.pyc
-backend/storage/uploads/*
-backend/storage/processed/**/*
-backend/storage/outputs/**/*
+
+# Python virtual environments (often created next to backend/)
+.venv/
+venv/
+ENV/
+
+# TypeScript incremental build cache
+*.tsbuildinfo
+
+# Local file storage: uploads, generated media, pipeline runs (keep dirs with .gitkeep only)
+backend/storage/uploads/**
+backend/storage/processed/**
+backend/storage/outputs/**
+backend/storage/mediapipe/**
+backend/storage/expert/**
 !**/.gitkeep

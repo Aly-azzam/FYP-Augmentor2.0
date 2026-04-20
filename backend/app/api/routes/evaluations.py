@@ -9,13 +9,14 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.orm import Session, joinedload
 
 from app.core.config import settings
+from app.core.constants import AttemptStatus
 from app.core.database import get_db
 from app.models.evaluation import Evaluation as EvaluationModel
 from app.models.evaluation_feedback import EvaluationFeedback
 from app.models.video import Video
 from app.models.attempt import Attempt
+from app.models.user import User
 from app.schemas.upload_schema import (
-    EvaluationStartRequest,
     EvaluationStartResponse,
     EvaluationStatusResponse,
 )
@@ -40,7 +41,6 @@ MIN_VALID_LANDMARK_FRAMES = 3
 @router.post("/start", response_model=EvaluationStartResponse)
 async def start_evaluation(
     request: Request,
-    start_request: EvaluationStartRequest | None = None,
     db: Session = Depends(get_db),
 ):
     """Run the real evaluation pipeline: video -> MediaPipe -> motion -> DTW -> score."""
@@ -50,8 +50,8 @@ async def start_evaluation(
     selected_clip_id = None
     selected_chapter_id = None
     learner_video_path: Path | None = None
-    if start_request is not None:
-        raw_attempt_id = start_request.attempt_id
+    uploaded_filename: str | None = None
+    uploaded_content_type: str | None = None
 
     content_type = (request.headers.get("content-type") or "").lower()
     if "multipart/form-data" in content_type:
@@ -62,6 +62,8 @@ async def start_evaluation(
         selected_chapter_id = form.get("chapter_id")
         uploaded_file = form.get("file")
         if uploaded_file is not None and hasattr(uploaded_file, "filename"):
+            uploaded_filename = str(getattr(uploaded_file, "filename", "") or "")
+            uploaded_content_type = str(getattr(uploaded_file, "content_type", "") or "") or None
             learner_video_path = await _save_uploaded_file(uploaded_file)
     else:
         try:
@@ -74,8 +76,35 @@ async def start_evaluation(
             selected_clip_id = payload.get("clip_id")
             selected_chapter_id = payload.get("chapter_id")
 
-    attempt_id = _require_uuid(raw_attempt_id, field_name="attempt_id")
-    chapter_id = _resolve_chapter_id(db=db, attempt_id=attempt_id, chapter_id_value=selected_chapter_id)
+    attempt_id: UUID | None = None
+    if raw_attempt_id is not None and str(raw_attempt_id).strip() != "":
+        attempt_id = _require_uuid(raw_attempt_id, field_name="attempt_id")
+
+    if attempt_id is None:
+        chapter_id = _resolve_optional_chapter_id(
+            chapter_id_value=selected_chapter_id,
+            clip_id_value=selected_clip_id,
+        )
+        if chapter_id is None:
+            raise HTTPException(
+                status_code=400,
+                detail="attempt_id is required unless chapter_id (or a UUID clip_id) is provided with a learner file.",
+            )
+        if learner_video_path is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Learner video file is required when attempt_id is not provided.",
+            )
+        attempt_id = _create_temporary_attempt(
+            db=db,
+            chapter_id=chapter_id,
+            learner_video_path=learner_video_path,
+            original_filename=uploaded_filename,
+            mime_type=uploaded_content_type,
+        )
+    else:
+        chapter_id = _resolve_chapter_id(db=db, attempt_id=attempt_id, chapter_id_value=selected_chapter_id)
+
     if chapter_id is None:
         raise HTTPException(status_code=400, detail="Unable to resolve chapter_id for the provided attempt_id.")
 
@@ -370,6 +399,69 @@ def _resolve_chapter_id(db: Session, attempt_id: UUID, chapter_id_value: Any) ->
         return UUID(str(attempt.chapter_id))
     except Exception:
         return None
+
+
+def _resolve_optional_chapter_id(*, chapter_id_value: Any, clip_id_value: Any) -> UUID | None:
+    """Resolve chapter UUID directly from request fields without requiring attempt_id."""
+    for value in (chapter_id_value, clip_id_value):
+        if value is None or str(value).strip() == "":
+            continue
+        try:
+            return UUID(str(value))
+        except Exception:
+            continue
+    return None
+
+
+def _create_temporary_attempt(
+    *,
+    db: Session,
+    chapter_id: UUID,
+    learner_video_path: Path,
+    original_filename: str | None,
+    mime_type: str | None,
+) -> UUID:
+    """Create a lightweight attempt+learner video record for ad-hoc Compare Studio uploads."""
+    user = db.query(User).order_by(User.created_at.asc()).first()
+    if user is None:
+        raise HTTPException(
+            status_code=400,
+            detail="No user record found to own this attempt. Seed at least one user first.",
+        )
+
+    try:
+        learner_video = Video(
+            owner_user_id=user.id,
+            chapter_id=str(chapter_id),
+            video_role="learner",
+            file_path=normalize_storage_key(learner_video_path),
+            file_name=original_filename or learner_video_path.name,
+            mime_type=mime_type,
+            file_size_bytes=learner_video_path.stat().st_size if learner_video_path.exists() else None,
+        )
+        db.add(learner_video)
+        db.flush()
+
+        attempt = Attempt(
+            user_id=user.id,
+            chapter_id=str(chapter_id),
+            learner_video_id=learner_video.id,
+            status=AttemptStatus.UPLOADED.value,
+            original_filename=original_filename or learner_video_path.name,
+        )
+        db.add(attempt)
+        db.commit()
+        db.refresh(attempt)
+        return UUID(str(attempt.id))
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to create temporary learner attempt: {exc}",
+        ) from exc
 
 
 def _resolve_expert_video_path(

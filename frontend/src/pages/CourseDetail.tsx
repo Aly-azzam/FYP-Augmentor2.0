@@ -1,4 +1,4 @@
-import { useEffect, useMemo } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useParams, useNavigate, Link } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import {
@@ -13,22 +13,47 @@ import { courses, getClipsForCourse } from '../services/mock/courses';
 import { Progress } from '../components/ui/progress';
 import { formatDuration } from '../utils/helpers';
 
+type BackendChapterClip = {
+  id: string;
+  title: string;
+  duration: number;
+  description: string;
+  thumbnail: string;
+  keyPoints: string[];
+  expertVideoUrl?: string;
+};
+
+type BackendChapter = {
+  id: string;
+  title: string;
+  order: number;
+  expert_video?: {
+    url: string;
+    file_path: string;
+  } | null;
+};
+
 export default function CourseDetail() {
   const { courseId } = useParams<{ courseId: string }>();
   const navigate = useNavigate();
   const setSelectedCourse = useCourseStore((s) => s.setSelectedCourse);
   const setSelectedClip = useCourseStore((s) => s.setSelectedClip);
   const setRobotMessage = useUIStore((s) => s.setRobotMessage);
+  const [backendClips, setBackendClips] = useState<BackendChapterClip[]>([]);
 
   const course = useMemo(
     () => courses.find((c) => c.id === courseId),
     [courseId],
   );
 
-  const clips = useMemo(
-    () => (courseId ? getClipsForCourse(courseId) : []),
-    [courseId],
-  );
+  const mockClips = useMemo(() => (courseId ? getClipsForCourse(courseId) : []), [courseId]);
+
+  const clips = useMemo(() => {
+    if (courseId === 'pottery-wheel' && backendClips.length > 0) {
+      return backendClips;
+    }
+    return mockClips;
+  }, [backendClips, courseId, mockClips]);
 
   useEffect(() => {
     if (course) {
@@ -43,6 +68,54 @@ export default function CourseDetail() {
       setRobotMessage(null);
     };
   }, [course, setSelectedCourse, setRobotMessage]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadBackendChapterClips = async () => {
+      if (courseId !== 'pottery-wheel') {
+        setBackendClips([]);
+        return;
+      }
+
+      try {
+        const response = await fetch('/api/chapters');
+        if (!response.ok) {
+          throw new Error('Failed to load chapters');
+        }
+
+        const payload = (await response.json()) as BackendChapter[];
+        const chapterClips: BackendChapterClip[] = payload.map((chapter) => ({
+          id: chapter.id,
+          title: chapter.title,
+          duration: 10,
+          description: chapter.expert_video
+            ? 'This chapter has a linked expert video from backend storage.'
+            : 'No expert video linked yet. Upload one from Expert Upload.',
+          thumbnail: '/course-pottery.jpg',
+          expertVideoUrl: chapter.expert_video?.url,
+          keyPoints: chapter.expert_video
+            ? ['Chapter is linked to a real expert video', 'Open Compare Studio to use this exact expert reference']
+            : ['Upload an expert video for this chapter', 'Then return here and open Compare Studio'],
+        }));
+
+        chapterClips.sort((a, b) => a.title.localeCompare(b.title));
+        if (!cancelled) {
+          setBackendClips(chapterClips);
+        }
+      } catch {
+        if (!cancelled) {
+          setBackendClips([]);
+        }
+      }
+    };
+
+    void loadBackendChapterClips();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [courseId]);
 
   const handleClipClick = (clipId: string) => {
     if (!course) return;
@@ -222,7 +295,7 @@ export default function CourseDetail() {
             className="text-small"
             style={{ color: 'var(--text-secondary)' }}
           >
-            {course.totalClips} videos
+            {clips.length} videos
           </span>
         </div>
 

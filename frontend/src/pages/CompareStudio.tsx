@@ -26,6 +26,8 @@ import {
   Flag,
   Video,
   Sparkles,
+  Activity,
+  Loader2,
 } from 'lucide-react';
 import {
   Tabs,
@@ -85,6 +87,36 @@ const COLOR_SWATCHES = [
 ];
 
 const PLAYBACK_RATES = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 2];
+
+// ── MediaPipe integration ──────────────────────────────────────────────────
+
+interface MediaPipeRunSummary {
+  run_id: string;
+  source_video_path: string;
+  fps: number;
+  frame_count: number;
+  width: number;
+  height: number;
+  created_at: string;
+  selected_hand_policy: string;
+  total_frames: number;
+  frames_with_detection: number;
+  detection_rate: number;
+  right_hand_selected_count: number;
+  left_hand_selected_count: number;
+}
+
+interface MediaPipeRunResult {
+  run_id: string;
+  run_folder: string;
+  detections_json_path: string;
+  features_json_path: string;
+  metadata_json_path: string;
+  annotated_video_path: string;
+  annotated_video_url: string | null;
+  summary: MediaPipeRunSummary;
+  partial_errors?: string[];
+}
 
 const scoreColor = (score: number): string => {
   if (score >= 90) return '#22c55e';
@@ -206,6 +238,14 @@ export default function CompareStudio() {
   const [learnerMuted, setLearnerMuted] = useState(false);
   const [apiEvaluationResult, setApiEvaluationResult] = useState<any | null>(null);
 
+  // MediaPipe integration state.
+  const [mediapipeRun, setMediapipeRun] = useState<MediaPipeRunResult | null>(null);
+  const [isMediapipeProcessing, setIsMediapipeProcessing] = useState(false);
+  const [mediapipeError, setMediapipeError] = useState<string | null>(null);
+  const [mediapipeVideoVersion, setMediapipeVideoVersion] = useState(0);
+  // Learner panel toggle: show raw uploaded video vs annotated MediaPipe output.
+  const [showAnnotatedLearner, setShowAnnotatedLearner] = useState(false);
+
   // ── Refs ──────────────────────────────────────────────────────────────────
 
   const expertVideoRef = useRef<HTMLVideoElement>(null);
@@ -222,6 +262,7 @@ export default function CompareStudio() {
   const course = courses.find((c) => c.id === selectedCourse);
   const clips = selectedCourse ? getClipsForCourse(selectedCourse) : [];
   const clip = clips.find((c) => c.id === selectedClip);
+  const hasSelectedExpertReference = Boolean(selectedClip || requestedClipId);
   const requestedCourseId = searchParams.get('courseId');
   const requestedClipId = searchParams.get('clipId');
 
@@ -266,29 +307,51 @@ export default function CompareStudio() {
     let isCancelled = false;
 
     const loadSelectedExpertVideo = async () => {
-      if (!clip) {
-        return;
-      }
-
-      if (clip.expertVideoUrl) {
-        setExpertVideoError(null);
-        setExpertVideoUrl(clip.expertVideoUrl);
-        return;
-      }
-
       try {
+        // 1) Prefer clip-linked URL (mock/static path).
+        if (clip?.expertVideoUrl) {
+          if (!isCancelled) {
+            setExpertVideoError(null);
+            setExpertVideoUrl(clip.expertVideoUrl);
+          }
+          return;
+        }
+
+        // 2) If selectedClip is a real chapter UUID, resolve chapter expert video.
+        if (selectedClip) {
+          const chapterResponse = await fetch(
+            `/api/chapters/${encodeURIComponent(selectedClip)}/expert-video`,
+          );
+          if (chapterResponse.ok) {
+            const chapterPayload = (await chapterResponse.json()) as { url: string };
+            if (!isCancelled) {
+              setExpertVideoError(null);
+              setExpertVideoUrl(chapterPayload.url);
+            }
+            return;
+          }
+        }
+
+        // 3) Fallback to backend default expert video so "Open Compare Studio"
+        // still loads the latest uploaded expert reference.
+        const defaultResponse = await fetch('/api/chapters/default/expert-video');
+        if (defaultResponse.ok) {
+          const defaultPayload = (await defaultResponse.json()) as { url: string };
+          if (!isCancelled) {
+            setExpertVideoError(null);
+            setExpertVideoUrl(defaultPayload.url);
+          }
+          return;
+        }
+
         if (!isCancelled) {
           setExpertVideoUrl(null);
-          setExpertVideoError(
-            'This selected clip does not have a real expert video linked yet.',
-          );
+          setExpertVideoError('No expert video is linked yet. Upload one from Expert Upload.');
         }
       } catch {
         if (!isCancelled) {
           setExpertVideoUrl(null);
-          setExpertVideoError(
-            'This selected clip does not have a real expert video linked yet.',
-          );
+          setExpertVideoError('No expert video is linked yet. Upload one from Expert Upload.');
         }
       }
     };
@@ -298,7 +361,7 @@ export default function CompareStudio() {
     return () => {
       isCancelled = true;
     };
-  }, [clip]);
+  }, [clip, selectedClip]);
 
   // Timer tick
   useEffect(() => {
@@ -379,6 +442,10 @@ export default function CompareStudio() {
         setLearnerCurrentTime(0);
         setLearnerDuration(0);
         setApiEvaluationResult(null);
+        setMediapipeRun(null);
+        setMediapipeError(null);
+        setMediapipeVideoVersion(0);
+        setShowAnnotatedLearner(false);
         resetEvaluation();
         toast.success('Practice video ready');
       };
@@ -467,6 +534,68 @@ export default function CompareStudio() {
     setEvaluationProgress,
     resetEvaluation,
   ]);
+
+  // ── MediaPipe run ────────────────────────────────────────────────────────
+
+  const runMediapipe = useCallback(async () => {
+    if (!userVideo) {
+      toast.error('Upload a practice video first');
+      return;
+    }
+
+    setIsMediapipeProcessing(true);
+    setMediapipeError(null);
+
+    try {
+      const formData = new FormData();
+      formData.append('file', userVideo);
+
+      const response = await fetch('/api/mediapipe/process-upload', {
+        method: 'POST',
+        body: formData,
+      });
+
+      let payload: any = null;
+      try {
+        payload = await response.json();
+      } catch {
+        payload = null;
+      }
+
+      if (!response.ok) {
+        const detail =
+          payload?.detail ||
+          payload?.message ||
+          `MediaPipe failed with status ${response.status}`;
+        throw new Error(detail);
+      }
+
+      const result = payload as MediaPipeRunResult;
+      setMediapipeRun(result);
+      setMediapipeVideoVersion(Date.now());
+      setShowAnnotatedLearner(Boolean(result.annotated_video_url));
+
+      const detectedPct = Math.round((result.summary.detection_rate || 0) * 100);
+      toast.success(`MediaPipe ready — ${detectedPct}% frames detected`);
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : 'MediaPipe pipeline failed.';
+      setMediapipeError(message);
+      toast.error(message);
+    } finally {
+      setIsMediapipeProcessing(false);
+    }
+  }, [userVideo]);
+
+  const annotatedLearnerSource =
+    mediapipeRun?.annotated_video_url && mediapipeVideoVersion > 0
+      ? `${mediapipeRun.annotated_video_url}${mediapipeRun.annotated_video_url.includes('?') ? '&' : '?'}v=${mediapipeVideoVersion}`
+      : mediapipeRun?.annotated_video_url ?? null;
+
+  const learnerVideoSource =
+    showAnnotatedLearner && annotatedLearnerSource
+      ? annotatedLearnerSource
+      : userVideoUrl;
 
   // ── Video helpers ────────────────────────────────────────────────────────
 
@@ -651,7 +780,7 @@ export default function CompareStudio() {
             Expert Video
           </span>
 
-          {clip && expertVideoUrl ? (
+          {expertVideoUrl ? (
             <>
               <div
                 className="video-container"
@@ -664,7 +793,7 @@ export default function CompareStudio() {
                   ref={expertVideoRef}
                   key={expertVideoUrl ?? 'missing-expert-video'}
                   src={expertVideoUrl ?? undefined}
-                  poster={clip.thumbnail}
+                  poster={clip?.thumbnail}
                   preload="metadata"
                   playsInline
                   onTimeUpdate={() => {
@@ -719,11 +848,11 @@ export default function CompareStudio() {
                   }}
                 />
                 <p className="empty-state-title">
-                  {clip ? 'Expert Video Unavailable' : 'Choose An Expert Video'}
+                  {hasSelectedExpertReference ? 'Expert Video Unavailable' : 'Choose An Expert Video'}
                 </p>
                 <p className="empty-state-description">
-                  {clip
-                    ? (expertVideoError ?? 'Start the backend and make sure the selected expert video is available.')
+                  {hasSelectedExpertReference
+                    ? (expertVideoError ?? 'Loading expert video for the selected chapter...')
                     : 'Go to the course page, choose the expert video you want, then press start comparison.'}
                 </p>
               </div>
@@ -751,7 +880,41 @@ export default function CompareStudio() {
               Your Practice
             </span>
             {userVideoUrl ? (
-              <>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)', flexWrap: 'wrap' }}>
+                {mediapipeRun?.annotated_video_url && (
+                  <div
+                    role="tablist"
+                    aria-label="Learner video source"
+                    style={{
+                      display: 'inline-flex',
+                      border: '1px solid var(--border-default)',
+                      borderRadius: 'var(--radius-sm)',
+                      overflow: 'hidden',
+                    }}
+                  >
+                    <button
+                      type="button"
+                      role="tab"
+                      aria-selected={!showAnnotatedLearner}
+                      className={`btn ${!showAnnotatedLearner ? 'btn-primary' : 'btn-ghost'}`}
+                      style={{ borderRadius: 0, fontSize: '0.75rem', padding: 'var(--space-xs) var(--space-sm)' }}
+                      onClick={() => setShowAnnotatedLearner(false)}
+                    >
+                      Original
+                    </button>
+                    <button
+                      type="button"
+                      role="tab"
+                      aria-selected={showAnnotatedLearner}
+                      className={`btn ${showAnnotatedLearner ? 'btn-primary' : 'btn-ghost'}`}
+                      style={{ borderRadius: 0, fontSize: '0.75rem', padding: 'var(--space-xs) var(--space-sm)' }}
+                      onClick={() => setShowAnnotatedLearner(true)}
+                    >
+                      <Activity size={12} style={{ marginRight: 4 }} />
+                      MediaPipe
+                    </button>
+                  </div>
+                )}
                 <input
                   ref={learnerFileInputRef}
                   type="file"
@@ -779,7 +942,7 @@ export default function CompareStudio() {
                   <Upload size={14} />
                   Change video
                 </button>
-              </>
+              </div>
             ) : null}
           </div>
 
@@ -790,12 +953,13 @@ export default function CompareStudio() {
                 style={{
                   aspectRatio: '16/9',
                   marginBottom: 'var(--space-sm)',
+                  position: 'relative',
                 }}
               >
                 <video
-                  key={userVideoUrl}
+                  key={learnerVideoSource ?? userVideoUrl}
                   ref={learnerVideoRef}
-                  src={userVideoUrl}
+                  src={learnerVideoSource ?? undefined}
                   onTimeUpdate={() => {
                     if (learnerVideoRef.current)
                       setLearnerCurrentTime(learnerVideoRef.current.currentTime);
@@ -805,6 +969,23 @@ export default function CompareStudio() {
                       setLearnerDuration(learnerVideoRef.current.duration);
                   }}
                 />
+                {showAnnotatedLearner && mediapipeRun?.annotated_video_url && (
+                  <span
+                    className="badge badge-blue"
+                    style={{
+                      position: 'absolute',
+                      top: 8,
+                      left: 8,
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: 4,
+                      fontSize: '0.65rem',
+                    }}
+                  >
+                    <Activity size={10} />
+                    MediaPipe
+                  </span>
+                )}
               </div>
 
               {renderTimeline(learnerCurrentTime, learnerDuration, (e) =>
@@ -877,6 +1058,7 @@ export default function CompareStudio() {
             <TabsList>
               <TabsTrigger value="tools">Tools</TabsTrigger>
               <TabsTrigger value="evaluate">Evaluate</TabsTrigger>
+              <TabsTrigger value="mediapipe">MediaPipe</TabsTrigger>
               <TabsTrigger value="timers">Timers</TabsTrigger>
             </TabsList>
 
@@ -1316,6 +1498,268 @@ export default function CompareStudio() {
                   </button>
                 </div>
               )}
+            </TabsContent>
+
+            {/* ── Tab: MediaPipe ───────────────────────────────────────── */}
+            <TabsContent value="mediapipe">
+              <div
+                style={{
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: 'var(--space-md)',
+                  padding: 'var(--space-sm) 0',
+                }}
+              >
+                <div
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 'var(--space-sm)',
+                  }}
+                >
+                  <Activity size={18} style={{ color: 'var(--accent-primary)' }} />
+                  <span className="text-small" style={{ fontWeight: 600 }}>
+                    Hand Tracking (MediaPipe)
+                  </span>
+                </div>
+                <p
+                  className="text-small"
+                  style={{ color: 'var(--text-muted)', margin: 0 }}
+                >
+                  Run MediaPipe on your practice video to produce an annotated
+                  overlay with hand landmarks, wrist trajectory and bounding
+                  box. Toggle between the original and the annotated version
+                  above the learner video.
+                </p>
+
+                <button
+                  className="btn btn-primary"
+                  style={{
+                    width: '100%',
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    gap: 'var(--space-xs)',
+                  }}
+                  disabled={!userVideo || isMediapipeProcessing}
+                  onClick={runMediapipe}
+                >
+                  {isMediapipeProcessing ? (
+                    <>
+                      <Loader2
+                        size={14}
+                        style={{ animation: 'spin 1s linear infinite' }}
+                      />
+                      Processing...
+                    </>
+                  ) : (
+                    <>
+                      <Activity size={14} />
+                      {mediapipeRun ? 'Run Again' : 'Run MediaPipe'}
+                    </>
+                  )}
+                </button>
+
+                {!userVideo && (
+                  <p
+                    className="text-small"
+                    style={{
+                      color: 'var(--text-muted)',
+                      textAlign: 'center',
+                      margin: 0,
+                    }}
+                  >
+                    Upload a practice video to enable MediaPipe.
+                  </p>
+                )}
+
+                {mediapipeError && (
+                  <div
+                    className="text-small"
+                    style={{
+                      background: 'var(--bg-tertiary)',
+                      border: '1px solid var(--danger, #ef4444)',
+                      color: 'var(--danger, #ef4444)',
+                      borderRadius: 'var(--radius-md)',
+                      padding: 'var(--space-sm) var(--space-md)',
+                    }}
+                  >
+                    {mediapipeError}
+                  </div>
+                )}
+
+                {mediapipeRun && (
+                  <>
+                    <div
+                      style={{
+                        display: 'grid',
+                        gridTemplateColumns: '1fr 1fr',
+                        gap: 'var(--space-sm)',
+                      }}
+                    >
+                      <div
+                        className="stat-card"
+                        style={{ padding: 'var(--space-sm)' }}
+                      >
+                        <div
+                          className="stat-value"
+                          style={{ fontSize: '1.25rem' }}
+                        >
+                          {Math.round(
+                            (mediapipeRun.summary.detection_rate || 0) * 100,
+                          )}
+                          %
+                        </div>
+                        <div
+                          className="stat-label"
+                          style={{ fontSize: '0.7rem' }}
+                        >
+                          Detection rate
+                        </div>
+                      </div>
+                      <div
+                        className="stat-card"
+                        style={{ padding: 'var(--space-sm)' }}
+                      >
+                        <div
+                          className="stat-value"
+                          style={{ fontSize: '1.25rem' }}
+                        >
+                          {mediapipeRun.summary.frames_with_detection}/
+                          {mediapipeRun.summary.total_frames}
+                        </div>
+                        <div
+                          className="stat-label"
+                          style={{ fontSize: '0.7rem' }}
+                        >
+                          Frames with detection
+                        </div>
+                      </div>
+                      <div
+                        className="stat-card"
+                        style={{ padding: 'var(--space-sm)' }}
+                      >
+                        <div
+                          className="stat-value"
+                          style={{ fontSize: '1.25rem' }}
+                        >
+                          {mediapipeRun.summary.right_hand_selected_count}
+                        </div>
+                        <div
+                          className="stat-label"
+                          style={{ fontSize: '0.7rem' }}
+                        >
+                          Right hand frames
+                        </div>
+                      </div>
+                      <div
+                        className="stat-card"
+                        style={{ padding: 'var(--space-sm)' }}
+                      >
+                        <div
+                          className="stat-value"
+                          style={{ fontSize: '1.25rem' }}
+                        >
+                          {mediapipeRun.summary.left_hand_selected_count}
+                        </div>
+                        <div
+                          className="stat-label"
+                          style={{ fontSize: '0.7rem' }}
+                        >
+                          Left hand frames
+                        </div>
+                      </div>
+                    </div>
+
+                    <div
+                      style={{
+                        display: 'flex',
+                        flexDirection: 'column',
+                        gap: 'var(--space-xs)',
+                        fontSize: '0.75rem',
+                        color: 'var(--text-secondary)',
+                      }}
+                    >
+                      <span>
+                        <strong>run_id:</strong>{' '}
+                        <code
+                          style={{
+                            fontFamily: 'var(--font-mono)',
+                            fontSize: '0.7rem',
+                          }}
+                        >
+                          {mediapipeRun.run_id}
+                        </code>
+                      </span>
+                      <span>
+                        <strong>fps:</strong> {mediapipeRun.summary.fps.toFixed(2)}{' '}
+                        • <strong>frames:</strong>{' '}
+                        {mediapipeRun.summary.frame_count} •{' '}
+                        <strong>size:</strong> {mediapipeRun.summary.width}×
+                        {mediapipeRun.summary.height}
+                      </span>
+                    </div>
+
+                    <div
+                      style={{
+                        display: 'flex',
+                        flexWrap: 'wrap',
+                        gap: 'var(--space-xs)',
+                      }}
+                    >
+                      {mediapipeRun.annotated_video_url && (
+                        <a
+                          className="btn btn-secondary"
+                          style={{ fontSize: '0.75rem', flex: 1 }}
+                          href={mediapipeRun.annotated_video_url}
+                          target="_blank"
+                          rel="noreferrer"
+                        >
+                          Open annotated.mp4
+                        </a>
+                      )}
+                      <a
+                        className="btn btn-ghost"
+                        style={{ fontSize: '0.75rem', flex: 1 }}
+                        href={`/storage/mediapipe/runs/${encodeURIComponent(
+                          mediapipeRun.run_id,
+                        )}/detections.json`}
+                        target="_blank"
+                        rel="noreferrer"
+                      >
+                        detections.json
+                      </a>
+                      <a
+                        className="btn btn-ghost"
+                        style={{ fontSize: '0.75rem', flex: 1 }}
+                        href={`/storage/mediapipe/runs/${encodeURIComponent(
+                          mediapipeRun.run_id,
+                        )}/features.json`}
+                        target="_blank"
+                        rel="noreferrer"
+                      >
+                        features.json
+                      </a>
+                    </div>
+
+                    {mediapipeRun.partial_errors &&
+                      mediapipeRun.partial_errors.length > 0 && (
+                        <div
+                          className="text-small"
+                          style={{
+                            color: 'var(--text-muted)',
+                            background: 'var(--bg-tertiary)',
+                            borderRadius: 'var(--radius-md)',
+                            padding: 'var(--space-sm) var(--space-md)',
+                          }}
+                        >
+                          <strong>Warnings:</strong>{' '}
+                          {mediapipeRun.partial_errors.join('; ')}
+                        </div>
+                      )}
+                  </>
+                )}
+              </div>
             </TabsContent>
 
             {/* ── Tab: Timers ──────────────────────────────────────────── */}

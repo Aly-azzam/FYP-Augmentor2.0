@@ -1,19 +1,29 @@
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from pathlib import Path
+from uuid import uuid4
+
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
+from app.core.config import settings
 from app.core.database import get_db
 from app.models.chapter import Chapter
 from app.models.video import Video
-from app.schemas.course_schema import ChapterDetail, ExpertVideoAssetOut, ExpertVideoOut
+from app.schemas.course_schema import (
+    ChapterDetail,
+    ExpertVideoAssetOut,
+    ExpertVideoOut,
+    ExpertVideoUploadResponse,
+)
 from app.services.media_service import (
     build_storage_url,
     get_default_expert_video_asset,
     normalize_storage_key,
     storage_path_exists,
 )
+from app.services.upload_service import UploadValidationError, save_upload_file, validate_upload_file
 
 router = APIRouter(prefix="/api/chapters", tags=["Chapters"])
 
@@ -153,4 +163,94 @@ def get_expert_video(chapter_id: UUID, db: Session = Depends(get_db)):
         url=build_storage_url(storage_key),
         duration_seconds=expert_video.duration_seconds,
         fps=expert_video.fps,
+    )
+
+
+@router.post("/{chapter_id}/expert-video", response_model=ExpertVideoUploadResponse)
+async def upload_expert_video(
+    chapter_id: UUID,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    """Upload or replace the expert reference video for a chapter."""
+    chapter = db.execute(select(Chapter).where(Chapter.id == chapter_id)).scalar_one_or_none()
+    if chapter is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Chapter not found.")
+
+    try:
+        extension = validate_upload_file(file)
+    except UploadValidationError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+    relative_path = Path("expert") / str(chapter_id) / f"{uuid4()}{extension}"
+    old_storage_key: str | None = None
+
+    existing_expert = db.execute(
+        select(Video).where(
+            Video.chapter_id == str(chapter_id),
+            Video.video_role == "expert",
+        )
+    ).scalar_one_or_none()
+    if existing_expert is not None:
+        try:
+            old_storage_key = normalize_storage_key(existing_expert.file_path)
+        except ValueError:
+            old_storage_key = None
+
+    try:
+        file_size_bytes = await save_upload_file(file, relative_path)
+    except UploadValidationError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to store uploaded expert video.",
+        ) from exc
+
+    storage_key = relative_path.as_posix()
+    try:
+        if existing_expert is None:
+            expert_video = Video(
+                owner_user_id=None,
+                chapter_id=str(chapter_id),
+                video_role="expert",
+                source_video_id=None,
+                file_path=storage_key,
+                file_name=file.filename,
+                mime_type=(file.content_type or None),
+                file_size_bytes=file_size_bytes,
+                storage_provider="local",
+            )
+            db.add(expert_video)
+            db.flush()
+        else:
+            existing_expert.file_path = storage_key
+            existing_expert.file_name = file.filename
+            existing_expert.mime_type = file.content_type or None
+            existing_expert.file_size_bytes = file_size_bytes
+            expert_video = existing_expert
+
+        db.commit()
+        db.refresh(expert_video)
+    except Exception as exc:
+        db.rollback()
+        saved_file = settings.STORAGE_ROOT / relative_path
+        if saved_file.exists():
+            saved_file.unlink()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to persist uploaded expert video.",
+        ) from exc
+
+    if old_storage_key and old_storage_key != storage_key:
+        old_path = settings.STORAGE_ROOT / old_storage_key
+        if old_path.exists():
+            old_path.unlink()
+
+    return ExpertVideoUploadResponse(
+        message="Expert video uploaded successfully.",
+        chapter_id=chapter_id,
+        expert_video_id=UUID(str(expert_video.id)),
+        file_path=storage_key,
+        url=build_storage_url(storage_key),
     )

@@ -34,6 +34,14 @@ class ExpertVideoAssetOut(BaseModel):
     expert_video_id: Optional[UUID] = None
 
 
+class ExpertVideoUploadResponse(BaseModel):
+    message: str
+    chapter_id: UUID
+    expert_video_id: UUID
+    file_path: str
+    url: str
+
+
 class ChapterDetail(BaseModel):
     id: UUID
     course_id: UUID

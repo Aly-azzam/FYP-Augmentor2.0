@@ -39,8 +39,8 @@ class Settings(BaseSettings):
     EXPLANATION_MODE: str = "rule"
 
     model_config = SettingsConfigDict(
-        env_file=".env",
-        env_file_encoding="utf-8"
+        env_file=str(Path(__file__).resolve().parents[2] / ".env"),
+        env_file_encoding="utf-8",
     )
 
 

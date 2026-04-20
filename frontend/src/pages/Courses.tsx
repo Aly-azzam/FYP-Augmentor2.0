@@ -142,6 +142,9 @@ export default function Courses() {
             <Link to="/compare" className="btn btn-secondary">
               Open Compare Studio
             </Link>
+            <Link to="/expert-videos" className="btn btn-ghost">
+              Manage Expert Videos
+            </Link>
           </div>
         </div>
 
