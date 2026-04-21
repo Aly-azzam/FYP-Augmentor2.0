@@ -52,6 +52,29 @@ class Video(Base):
         nullable=False,
     )
 
+    # ---- MediaPipe expert-reference fields (only populated for expert rows) ----
+    # These are populated by the one-time offline expert preprocessing flow
+    # (``app.services.expert_mediapipe_service``) and read later by the
+    # learner comparison pipeline. They are always nullable because a
+    # freshly-uploaded expert video has not been preprocessed yet, and
+    # learner videos never populate these columns.
+    mediapipe_source_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    mediapipe_detections_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    mediapipe_features_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    mediapipe_metadata_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    mediapipe_annotated_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    mediapipe_status: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    mediapipe_processed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    mediapipe_pipeline_version: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    mediapipe_fps: Mapped[Decimal | None] = mapped_column(Numeric, nullable=True)
+    mediapipe_frame_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    mediapipe_detection_rate: Mapped[Decimal | None] = mapped_column(Numeric, nullable=True)
+    mediapipe_selected_hand_policy: Mapped[str | None] = mapped_column(
+        String(50), nullable=True
+    )
+
     owner_user: Mapped["User | None"] = relationship("User", back_populates="videos")
     chapter: Mapped["Chapter | None"] = relationship("Chapter", back_populates="videos")
     source_video: Mapped["Video | None"] = relationship(
