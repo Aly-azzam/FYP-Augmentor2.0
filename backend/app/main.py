@@ -7,8 +7,9 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.core.database import get_db
 from app.api.routes import courses, chapters, uploads, evaluations, history, progress
-from app.api.routes import expert_mediapipe
+from app.api.routes import expert_mediapipe, expert_sam2, inspection
 from app.api.mediapipe import router as mediapipe_router
+from app.api.sam2 import router as sam2_router
 from fastapi import Depends
 from app.models.user import User
 from app.models.course import Course
@@ -42,7 +43,10 @@ app.include_router(evaluations.router)
 app.include_router(history.router)
 app.include_router(progress.router)
 app.include_router(mediapipe_router)
+app.include_router(sam2_router)
 app.include_router(expert_mediapipe.router)
+app.include_router(expert_sam2.router)
+app.include_router(inspection.router)
 app.mount("/storage", StaticFiles(directory=settings.STORAGE_ROOT), name="storage")
 
 @app.get("/health", tags=["Health"])

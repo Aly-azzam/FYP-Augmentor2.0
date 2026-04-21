@@ -155,7 +155,8 @@ const potteryWheelClips: VideoClip[] = [
     description:
       'This is the real pottery expert video currently available in the system. Choose it to start side-by-side comparison in Compare Studio.',
     thumbnail: '/course-pottery.jpg',
-    expertVideoUrl: '/storage/expert/pottery.mp4',
+    expertVideoUrl:
+      '/storage/expert/f74747fa-f929-4862-9c59-9f5a8d42c00e/8231868c-970d-4bb3-9487-e7e0d0e8d10f.mp4',
     keyPoints: [
       'Watch the real expert demo currently stored in the backend',
       'Use this clip as the expert reference on the left side of Compare Studio',

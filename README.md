@@ -60,6 +60,48 @@ The architecture and components are under active development.
 
 ---
 
+## Development Note (Expert Upload)
+
+If the **Expert Upload / Expert Video Manager** page shows:
+
+`Could not load chapters. Make sure the backend is running.`
+
+the frontend cannot reach the backend API.
+
+- Frontend dev server proxies `/api` and `/storage` to `http://localhost:8001` by default.
+- Start the backend on port `8001` before using Expert Upload:
+
+`uvicorn app.main:app --reload --port 8001`
+
+- If you use a different backend port, set `AUGMENTOR_API_TARGET` in the frontend environment to match it.
+
+---
+
+## Database Recovery & Test Safety
+
+If DB rows are lost but files still exist under `backend/storage`, run:
+
+- Audit only (read-only):
+  - `python -m app.scripts.recover_storage_registry`
+- Re-register recoverable expert rows:
+  - `python -m app.scripts.recover_storage_registry --apply --create-missing-chapters`
+
+Notes:
+- Recovery only re-registers expert records when a source video file still exists on disk.
+- Learner runtime run folders (`storage/mediapipe/runs`, `storage/sam2/runs`) are audit-only in this helper.
+
+### Pytest DB isolation (important)
+
+Pytest now requires `TEST_DATABASE_URL` and refuses to run if it matches the app `DATABASE_URL`.
+
+Example:
+- `set TEST_DATABASE_URL=postgresql+psycopg://augmentor_user:augmentor_password@localhost:5432/augmentor_test_db`
+- `pytest`
+
+This prevents destructive test setup (`drop_all/create_all`) from touching the real app database.
+
+---
+
 ## Contributors
 
 Final Year Project – Computer & Communication Engineering

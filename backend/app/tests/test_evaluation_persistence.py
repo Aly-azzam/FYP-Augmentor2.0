@@ -17,6 +17,15 @@ from app.services.evaluation_engine_service import run_evaluation_pipeline
 from app.services.progress_service import compute_progress
 
 
+def _assert_safe_test_engine() -> None:
+    engine_url = str(engine.url).lower()
+    if not any(marker in engine_url for marker in ("test", "pytest", "sqlite", "tmp")):
+        raise RuntimeError(
+            "Refusing destructive DB test against a non-test engine URL. "
+            f"Resolved engine URL: {engine.url}"
+        )
+
+
 def _build_modern_motion_payload(video_id: str, scalar_series: list[float]) -> dict:
     frames = []
     for idx, scalar in enumerate(scalar_series):
@@ -55,6 +64,7 @@ def _build_modern_motion_payload(video_id: str, scalar_series: list[float]) -> d
 
 
 def _ensure_base_data(attempt_id: str) -> None:
+    _assert_safe_test_engine()
     _ = ExpertVideo
     _ = Progress
     _ = User

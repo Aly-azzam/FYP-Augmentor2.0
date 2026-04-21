@@ -75,6 +75,26 @@ class Video(Base):
         String(50), nullable=True
     )
 
+    # ---- SAM 2 expert-reference fields (only populated for expert rows) ----
+    # Populated by the one-time offline expert SAM 2 preprocessing flow
+    # (``app.services.expert_sam2_service``). They mirror the MediaPipe
+    # columns above: all nullable, only expert rows carry values, and the
+    # file paths are stored relative to ``settings.STORAGE_ROOT``.
+    sam2_source_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    sam2_raw_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    sam2_summary_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    sam2_metadata_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    sam2_annotated_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    sam2_status: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    sam2_processed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    sam2_pipeline_version: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    sam2_model_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    sam2_fps: Mapped[Decimal | None] = mapped_column(Numeric, nullable=True)
+    sam2_frame_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    sam2_detection_rate: Mapped[Decimal | None] = mapped_column(Numeric, nullable=True)
+
     owner_user: Mapped["User | None"] = relationship("User", back_populates="videos")
     chapter: Mapped["Chapter | None"] = relationship("Chapter", back_populates="videos")
     source_video: Mapped["Video | None"] = relationship(

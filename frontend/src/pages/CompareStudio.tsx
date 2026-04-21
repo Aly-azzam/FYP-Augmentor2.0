@@ -28,6 +28,7 @@ import {
   Sparkles,
   Activity,
   Loader2,
+  Scissors,
 } from 'lucide-react';
 import {
   Tabs,
@@ -118,6 +119,82 @@ interface MediaPipeRunResult {
   partial_errors?: string[];
 }
 
+type InspectionModel = 'mediapipe' | 'sam2' | 'optical_flow';
+
+interface Sam2LearnerMediaPipeInfo {
+  run_id: string;
+  run_folder: string;
+  features_json_path: string;
+  metadata_json_path: string;
+  annotated_video_path: string;
+  annotated_video_url: string | null;
+  total_frames: number;
+  frames_with_detection: number;
+  detection_rate: number;
+}
+
+interface Sam2LearnerMetadata {
+  run_id: string;
+  source_video_path: string;
+  pipeline_name: string;
+  model_name: string;
+  device: string;
+  gpu_name?: string | null;
+  model_checkpoint_path?: string | null;
+  model_config_path?: string | null;
+  created_at: string;
+  fps: number;
+  frame_count: number;
+  width: number;
+  height: number;
+  analysis_start_frame_index: number;
+  analysis_end_frame_index: number;
+  frame_stride: number;
+  total_frames_processed: number;
+  frames_with_mask: number;
+  detection_rate: number;
+  target_object_id: number;
+  init_prompt: unknown;
+  warnings: string[];
+}
+
+interface Sam2LearnerSummary {
+  run_id: string;
+  pipeline_name: string;
+  model_name: string;
+  total_frames: number;
+  frames_with_mask: number;
+  detection_rate: number;
+  mean_mask_area_px: number | null;
+  min_mask_area_px: number | null;
+  max_mask_area_px: number | null;
+  std_mask_area_px: number | null;
+  mean_centroid_speed_px_per_frame: number | null;
+  track_fragmentation_count: number;
+  working_region: unknown;
+  warnings: string[];
+}
+
+interface Sam2LearnerResult {
+  run_id: string;
+  run_folder: string;
+  raw_json_path: string;
+  summary_json_path: string;
+  metadata_json_path: string;
+  annotated_video_path: string | null;
+  annotated_video_url: string | null;
+  source_video_path: string;
+  initialization_debug_image_path: string | null;
+  initialization_debug_image_url: string | null;
+  device: string;
+  frame_stride: number;
+  metadata: Sam2LearnerMetadata;
+  summary: Sam2LearnerSummary;
+  raw_preview: unknown | null;
+  mediapipe?: Sam2LearnerMediaPipeInfo | null;
+  warnings: string[];
+}
+
 const scoreColor = (score: number): string => {
   if (score >= 90) return '#22c55e';
   if (score >= 70) return '#3b82f6';
@@ -139,6 +216,15 @@ function isValidPracticeVideo(file: File): boolean {
   if (t === 'video/mp4' || t === 'video/quicktime') return true;
   const ext = file.name.toLowerCase().match(/\.([^.]+)$/)?.[1];
   return ext === 'mp4' || ext === 'mov';
+}
+
+function prettyJson(value: unknown): string {
+  if (value === null || value === undefined) return '(no data)';
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
 }
 
 const TOUR_STEPS = [
@@ -243,8 +329,19 @@ export default function CompareStudio() {
   const [isMediapipeProcessing, setIsMediapipeProcessing] = useState(false);
   const [mediapipeError, setMediapipeError] = useState<string | null>(null);
   const [mediapipeVideoVersion, setMediapipeVideoVersion] = useState(0);
-  // Learner panel toggle: show raw uploaded video vs annotated MediaPipe output.
-  const [showAnnotatedLearner, setShowAnnotatedLearner] = useState(false);
+  const [selectedExpertVideoId, setSelectedExpertVideoId] = useState<string | null>(null);
+  const [inspectionModel, setInspectionModel] = useState<InspectionModel>('mediapipe');
+  // Learner overlay: show the raw uploaded video, the MediaPipe annotated
+  // output, or the SAM 2 annotated output (Compare Studio is learner-focused).
+  const [learnerOverlay, setLearnerOverlay] = useState<'none' | 'mediapipe' | 'sam2'>('none');
+
+  // SAM2 learner (Compare Studio) integration state. This is the
+  // learner-focused SAM2 flow: upload -> MediaPipe -> SAM2 -> annotated.
+  const [sam2LearnerRun, setSam2LearnerRun] = useState<Sam2LearnerResult | null>(null);
+  const [isSam2LearnerProcessing, setIsSam2LearnerProcessing] = useState(false);
+  const [sam2LearnerError, setSam2LearnerError] = useState<string | null>(null);
+  const [sam2LearnerVideoVersion, setSam2LearnerVideoVersion] = useState(0);
+  const [showSam2RawPreview, setShowSam2RawPreview] = useState(false);
 
   // ── Refs ──────────────────────────────────────────────────────────────────
 
@@ -262,9 +359,9 @@ export default function CompareStudio() {
   const course = courses.find((c) => c.id === selectedCourse);
   const clips = selectedCourse ? getClipsForCourse(selectedCourse) : [];
   const clip = clips.find((c) => c.id === selectedClip);
-  const hasSelectedExpertReference = Boolean(selectedClip || requestedClipId);
   const requestedCourseId = searchParams.get('courseId');
   const requestedClipId = searchParams.get('clipId');
+  const hasSelectedExpertReference = Boolean(selectedClip || requestedClipId);
 
   // ── Effects ──────────────────────────────────────────────────────────────
 
@@ -298,6 +395,7 @@ export default function CompareStudio() {
     if (!clip) {
       setExpertVideoUrl(null);
       setExpertVideoError(null);
+      setSelectedExpertVideoId(null);
       setExpertCurrentTime(0);
       setExpertDuration(0);
     }
@@ -308,49 +406,61 @@ export default function CompareStudio() {
 
     const loadSelectedExpertVideo = async () => {
       try {
-        // 1) Prefer clip-linked URL (mock/static path).
-        if (clip?.expertVideoUrl) {
-          if (!isCancelled) {
-            setExpertVideoError(null);
-            setExpertVideoUrl(clip.expertVideoUrl);
-          }
-          return;
-        }
-
-        // 2) If selectedClip is a real chapter UUID, resolve chapter expert video.
+        // 1) If selectedClip is a real chapter UUID, resolve chapter expert video first.
+        // This ensures Compare Studio uses the latest backend expert reference,
+        // not a stale static mock path.
         if (selectedClip) {
           const chapterResponse = await fetch(
             `/api/chapters/${encodeURIComponent(selectedClip)}/expert-video`,
           );
           if (chapterResponse.ok) {
-            const chapterPayload = (await chapterResponse.json()) as { url: string };
+            const chapterPayload = (await chapterResponse.json()) as {
+              id?: string;
+              url: string;
+            };
             if (!isCancelled) {
               setExpertVideoError(null);
               setExpertVideoUrl(chapterPayload.url);
+              setSelectedExpertVideoId(chapterPayload.id ?? null);
             }
             return;
           }
         }
 
-        // 3) Fallback to backend default expert video so "Open Compare Studio"
-        // still loads the latest uploaded expert reference.
+        // 2) Fallback to backend default expert video (still backend-managed).
         const defaultResponse = await fetch('/api/chapters/default/expert-video');
         if (defaultResponse.ok) {
-          const defaultPayload = (await defaultResponse.json()) as { url: string };
+          const defaultPayload = (await defaultResponse.json()) as {
+            expert_video_id?: string;
+            url: string;
+          };
           if (!isCancelled) {
             setExpertVideoError(null);
             setExpertVideoUrl(defaultPayload.url);
+            setSelectedExpertVideoId(defaultPayload.expert_video_id ?? null);
+          }
+          return;
+        }
+
+        // 3) Last-resort fallback for legacy mock clips.
+        if (clip?.expertVideoUrl) {
+          if (!isCancelled) {
+            setExpertVideoError(null);
+            setExpertVideoUrl(clip.expertVideoUrl);
+            setSelectedExpertVideoId(null);
           }
           return;
         }
 
         if (!isCancelled) {
           setExpertVideoUrl(null);
+          setSelectedExpertVideoId(null);
           setExpertVideoError('No expert video is linked yet. Upload one from Expert Upload.');
         }
       } catch {
         if (!isCancelled) {
           setExpertVideoUrl(null);
+          setSelectedExpertVideoId(null);
           setExpertVideoError('No expert video is linked yet. Upload one from Expert Upload.');
         }
       }
@@ -445,7 +555,10 @@ export default function CompareStudio() {
         setMediapipeRun(null);
         setMediapipeError(null);
         setMediapipeVideoVersion(0);
-        setShowAnnotatedLearner(false);
+        setSam2LearnerRun(null);
+        setSam2LearnerError(null);
+        setSam2LearnerVideoVersion(0);
+        setLearnerOverlay('none');
         resetEvaluation();
         toast.success('Practice video ready');
       };
@@ -573,7 +686,9 @@ export default function CompareStudio() {
       const result = payload as MediaPipeRunResult;
       setMediapipeRun(result);
       setMediapipeVideoVersion(Date.now());
-      setShowAnnotatedLearner(Boolean(result.annotated_video_url));
+      if (result.annotated_video_url) {
+        setLearnerOverlay('mediapipe');
+      }
 
       const detectedPct = Math.round((result.summary.detection_rate || 0) * 100);
       toast.success(`MediaPipe ready — ${detectedPct}% frames detected`);
@@ -587,15 +702,131 @@ export default function CompareStudio() {
     }
   }, [userVideo]);
 
-  const annotatedLearnerSource =
+  // ── SAM 2 learner run (Compare Studio pipeline) ───────────────────────────
+  //
+  // Triggered by the "Run SAM2" button. The backend endpoint runs
+  // MediaPipe first and then SAM 2 on the same learner video, so a
+  // single click gives us the complete pipeline output (annotated video,
+  // metadata/summary, and the initialization debug image).
+  const runSam2Learner = useCallback(async () => {
+    if (!userVideo) {
+      toast.error('Upload a practice video first');
+      return;
+    }
+
+    setIsSam2LearnerProcessing(true);
+    setSam2LearnerError(null);
+
+    try {
+      const formData = new FormData();
+      formData.append('file', userVideo);
+
+      const response = await fetch('/api/sam2/process-upload', {
+        method: 'POST',
+        body: formData,
+      });
+
+      let payload: any = null;
+      try {
+        payload = await response.json();
+      } catch {
+        payload = null;
+      }
+
+      if (!response.ok) {
+        const detail = payload?.detail;
+        let message: string;
+        if (detail && typeof detail === 'object') {
+          if (detail.error_type === 'SAM2AssetsMissingError') {
+            message =
+              'SAM2 model assets are missing. Backend SAM2 processing cannot run yet.';
+          } else if (detail.stage === 'mediapipe') {
+            message = `MediaPipe step failed: ${detail.message ?? 'unknown error'}`;
+          } else if (typeof detail.message === 'string') {
+            message = detail.message;
+          } else {
+            message = `SAM2 failed with status ${response.status}`;
+          }
+        } else if (typeof detail === 'string') {
+          message = detail;
+        } else {
+          message = `SAM2 failed with status ${response.status}`;
+        }
+        throw new Error(message);
+      }
+
+      const result = payload as Sam2LearnerResult;
+      setSam2LearnerRun(result);
+      setSam2LearnerVideoVersion(Date.now());
+      if (result.mediapipe?.annotated_video_url) {
+        setMediapipeRun({
+          run_id: result.mediapipe.run_id,
+          run_folder: result.mediapipe.run_folder,
+          detections_json_path: '',
+          features_json_path: result.mediapipe.features_json_path,
+          metadata_json_path: result.mediapipe.metadata_json_path,
+          annotated_video_path: result.mediapipe.annotated_video_path,
+          annotated_video_url: result.mediapipe.annotated_video_url,
+          summary: {
+            run_id: result.mediapipe.run_id,
+            source_video_path: result.source_video_path,
+            fps: result.metadata.fps,
+            frame_count: result.metadata.frame_count,
+            width: result.metadata.width,
+            height: result.metadata.height,
+            created_at: result.metadata.created_at,
+            selected_hand_policy: 'prefer_right_else_first',
+            total_frames: result.mediapipe.total_frames,
+            frames_with_detection: result.mediapipe.frames_with_detection,
+            detection_rate: result.mediapipe.detection_rate,
+            right_hand_selected_count: 0,
+            left_hand_selected_count: 0,
+          },
+        });
+        setMediapipeVideoVersion(Date.now());
+      }
+      if (result.annotated_video_url) {
+        setLearnerOverlay('sam2');
+      }
+
+      const maskedPct = Math.round((result.summary.detection_rate || 0) * 100);
+      toast.success(
+        `SAM2 ready — ${result.device.toUpperCase()} • stride ${result.frame_stride} • ${maskedPct}% frames with mask`,
+      );
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : 'SAM2 pipeline failed.';
+      setSam2LearnerError(message);
+      toast.error(message);
+    } finally {
+      setIsSam2LearnerProcessing(false);
+    }
+  }, [userVideo]);
+
+  // Compare Studio is learner-focused. The SAM 2 tab now shows the
+  // learner pipeline (MediaPipe -> SAM 2) run on the uploaded practice
+  // video; we intentionally do NOT surface the expert SAM 2 inspection
+  // payload here anymore.
+
+  const mediapipeAnnotatedSource =
     mediapipeRun?.annotated_video_url && mediapipeVideoVersion > 0
       ? `${mediapipeRun.annotated_video_url}${mediapipeRun.annotated_video_url.includes('?') ? '&' : '?'}v=${mediapipeVideoVersion}`
       : mediapipeRun?.annotated_video_url ?? null;
 
-  const learnerVideoSource =
-    showAnnotatedLearner && annotatedLearnerSource
-      ? annotatedLearnerSource
-      : userVideoUrl;
+  const sam2AnnotatedSource =
+    sam2LearnerRun?.annotated_video_url && sam2LearnerVideoVersion > 0
+      ? `${sam2LearnerRun.annotated_video_url}${sam2LearnerRun.annotated_video_url.includes('?') ? '&' : '?'}v=${sam2LearnerVideoVersion}`
+      : sam2LearnerRun?.annotated_video_url ?? null;
+
+  const learnerVideoSource = (() => {
+    if (learnerOverlay === 'mediapipe' && mediapipeAnnotatedSource) {
+      return mediapipeAnnotatedSource;
+    }
+    if (learnerOverlay === 'sam2' && sam2AnnotatedSource) {
+      return sam2AnnotatedSource;
+    }
+    return userVideoUrl;
+  })();
 
   // ── Video helpers ────────────────────────────────────────────────────────
 
@@ -881,7 +1112,7 @@ export default function CompareStudio() {
             </span>
             {userVideoUrl ? (
               <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)', flexWrap: 'wrap' }}>
-                {mediapipeRun?.annotated_video_url && (
+                {(mediapipeRun?.annotated_video_url || sam2LearnerRun?.annotated_video_url) && (
                   <div
                     role="tablist"
                     aria-label="Learner video source"
@@ -895,24 +1126,39 @@ export default function CompareStudio() {
                     <button
                       type="button"
                       role="tab"
-                      aria-selected={!showAnnotatedLearner}
-                      className={`btn ${!showAnnotatedLearner ? 'btn-primary' : 'btn-ghost'}`}
+                      aria-selected={learnerOverlay === 'none'}
+                      className={`btn ${learnerOverlay === 'none' ? 'btn-primary' : 'btn-ghost'}`}
                       style={{ borderRadius: 0, fontSize: '0.75rem', padding: 'var(--space-xs) var(--space-sm)' }}
-                      onClick={() => setShowAnnotatedLearner(false)}
+                      onClick={() => setLearnerOverlay('none')}
                     >
                       Original
                     </button>
-                    <button
-                      type="button"
-                      role="tab"
-                      aria-selected={showAnnotatedLearner}
-                      className={`btn ${showAnnotatedLearner ? 'btn-primary' : 'btn-ghost'}`}
-                      style={{ borderRadius: 0, fontSize: '0.75rem', padding: 'var(--space-xs) var(--space-sm)' }}
-                      onClick={() => setShowAnnotatedLearner(true)}
-                    >
-                      <Activity size={12} style={{ marginRight: 4 }} />
-                      MediaPipe
-                    </button>
+                    {mediapipeRun?.annotated_video_url && (
+                      <button
+                        type="button"
+                        role="tab"
+                        aria-selected={learnerOverlay === 'mediapipe'}
+                        className={`btn ${learnerOverlay === 'mediapipe' ? 'btn-primary' : 'btn-ghost'}`}
+                        style={{ borderRadius: 0, fontSize: '0.75rem', padding: 'var(--space-xs) var(--space-sm)' }}
+                        onClick={() => setLearnerOverlay('mediapipe')}
+                      >
+                        <Activity size={12} style={{ marginRight: 4 }} />
+                        MediaPipe
+                      </button>
+                    )}
+                    {sam2LearnerRun?.annotated_video_url && (
+                      <button
+                        type="button"
+                        role="tab"
+                        aria-selected={learnerOverlay === 'sam2'}
+                        className={`btn ${learnerOverlay === 'sam2' ? 'btn-primary' : 'btn-ghost'}`}
+                        style={{ borderRadius: 0, fontSize: '0.75rem', padding: 'var(--space-xs) var(--space-sm)' }}
+                        onClick={() => setLearnerOverlay('sam2')}
+                      >
+                        <Scissors size={12} style={{ marginRight: 4 }} />
+                        SAM2
+                      </button>
+                    )}
                   </div>
                 )}
                 <input
@@ -969,7 +1215,7 @@ export default function CompareStudio() {
                       setLearnerDuration(learnerVideoRef.current.duration);
                   }}
                 />
-                {showAnnotatedLearner && mediapipeRun?.annotated_video_url && (
+                {learnerOverlay === 'mediapipe' && mediapipeRun?.annotated_video_url && (
                   <span
                     className="badge badge-blue"
                     style={{
@@ -984,6 +1230,23 @@ export default function CompareStudio() {
                   >
                     <Activity size={10} />
                     MediaPipe
+                  </span>
+                )}
+                {learnerOverlay === 'sam2' && sam2LearnerRun?.annotated_video_url && (
+                  <span
+                    className="badge badge-green"
+                    style={{
+                      position: 'absolute',
+                      top: 8,
+                      left: 8,
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: 4,
+                      fontSize: '0.65rem',
+                    }}
+                  >
+                    <Scissors size={10} />
+                    SAM2
                   </span>
                 )}
               </div>
@@ -1510,255 +1773,699 @@ export default function CompareStudio() {
                   padding: 'var(--space-sm) 0',
                 }}
               >
-                <div
-                  style={{
-                    display: 'flex',
-                    alignItems: 'center',
-                    gap: 'var(--space-sm)',
-                  }}
-                >
-                  <Activity size={18} style={{ color: 'var(--accent-primary)' }} />
-                  <span className="text-small" style={{ fontWeight: 600 }}>
-                    Hand Tracking (MediaPipe)
-                  </span>
-                </div>
-                <p
-                  className="text-small"
-                  style={{ color: 'var(--text-muted)', margin: 0 }}
-                >
-                  Run MediaPipe on your practice video to produce an annotated
-                  overlay with hand landmarks, wrist trajectory and bounding
-                  box. Toggle between the original and the annotated version
-                  above the learner video.
-                </p>
+                <Tabs value={inspectionModel} onValueChange={(v) => setInspectionModel(v as InspectionModel)}>
+                  <TabsList>
+                    <TabsTrigger value="mediapipe">MediaPipe</TabsTrigger>
+                    <TabsTrigger value="sam2">SAM2</TabsTrigger>
+                    <TabsTrigger value="optical_flow">Optical Flow</TabsTrigger>
+                  </TabsList>
 
-                <button
-                  className="btn btn-primary"
-                  style={{
-                    width: '100%',
-                    display: 'inline-flex',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    gap: 'var(--space-xs)',
-                  }}
-                  disabled={!userVideo || isMediapipeProcessing}
-                  onClick={runMediapipe}
-                >
-                  {isMediapipeProcessing ? (
-                    <>
-                      <Loader2
-                        size={14}
-                        style={{ animation: 'spin 1s linear infinite' }}
-                      />
-                      Processing...
-                    </>
-                  ) : (
-                    <>
-                      <Activity size={14} />
-                      {mediapipeRun ? 'Run Again' : 'Run MediaPipe'}
-                    </>
-                  )}
-                </button>
-
-                {!userVideo && (
-                  <p
-                    className="text-small"
-                    style={{
-                      color: 'var(--text-muted)',
-                      textAlign: 'center',
-                      margin: 0,
-                    }}
-                  >
-                    Upload a practice video to enable MediaPipe.
-                  </p>
-                )}
-
-                {mediapipeError && (
-                  <div
-                    className="text-small"
-                    style={{
-                      background: 'var(--bg-tertiary)',
-                      border: '1px solid var(--danger, #ef4444)',
-                      color: 'var(--danger, #ef4444)',
-                      borderRadius: 'var(--radius-md)',
-                      padding: 'var(--space-sm) var(--space-md)',
-                    }}
-                  >
-                    {mediapipeError}
-                  </div>
-                )}
-
-                {mediapipeRun && (
-                  <>
-                    <div
-                      style={{
-                        display: 'grid',
-                        gridTemplateColumns: '1fr 1fr',
-                        gap: 'var(--space-sm)',
-                      }}
-                    >
-                      <div
-                        className="stat-card"
-                        style={{ padding: 'var(--space-sm)' }}
-                      >
-                        <div
-                          className="stat-value"
-                          style={{ fontSize: '1.25rem' }}
-                        >
-                          {Math.round(
-                            (mediapipeRun.summary.detection_rate || 0) * 100,
-                          )}
-                          %
-                        </div>
-                        <div
-                          className="stat-label"
-                          style={{ fontSize: '0.7rem' }}
-                        >
-                          Detection rate
-                        </div>
-                      </div>
-                      <div
-                        className="stat-card"
-                        style={{ padding: 'var(--space-sm)' }}
-                      >
-                        <div
-                          className="stat-value"
-                          style={{ fontSize: '1.25rem' }}
-                        >
-                          {mediapipeRun.summary.frames_with_detection}/
-                          {mediapipeRun.summary.total_frames}
-                        </div>
-                        <div
-                          className="stat-label"
-                          style={{ fontSize: '0.7rem' }}
-                        >
-                          Frames with detection
-                        </div>
-                      </div>
-                      <div
-                        className="stat-card"
-                        style={{ padding: 'var(--space-sm)' }}
-                      >
-                        <div
-                          className="stat-value"
-                          style={{ fontSize: '1.25rem' }}
-                        >
-                          {mediapipeRun.summary.right_hand_selected_count}
-                        </div>
-                        <div
-                          className="stat-label"
-                          style={{ fontSize: '0.7rem' }}
-                        >
-                          Right hand frames
-                        </div>
-                      </div>
-                      <div
-                        className="stat-card"
-                        style={{ padding: 'var(--space-sm)' }}
-                      >
-                        <div
-                          className="stat-value"
-                          style={{ fontSize: '1.25rem' }}
-                        >
-                          {mediapipeRun.summary.left_hand_selected_count}
-                        </div>
-                        <div
-                          className="stat-label"
-                          style={{ fontSize: '0.7rem' }}
-                        >
-                          Left hand frames
-                        </div>
-                      </div>
-                    </div>
-
+                  <TabsContent value="mediapipe">
                     <div
                       style={{
                         display: 'flex',
                         flexDirection: 'column',
-                        gap: 'var(--space-xs)',
-                        fontSize: '0.75rem',
-                        color: 'var(--text-secondary)',
+                        gap: 'var(--space-md)',
+                        marginTop: 'var(--space-sm)',
                       }}
                     >
-                      <span>
-                        <strong>run_id:</strong>{' '}
-                        <code
-                          style={{
-                            fontFamily: 'var(--font-mono)',
-                            fontSize: '0.7rem',
-                          }}
-                        >
-                          {mediapipeRun.run_id}
-                        </code>
-                      </span>
-                      <span>
-                        <strong>fps:</strong> {mediapipeRun.summary.fps.toFixed(2)}{' '}
-                        • <strong>frames:</strong>{' '}
-                        {mediapipeRun.summary.frame_count} •{' '}
-                        <strong>size:</strong> {mediapipeRun.summary.width}×
-                        {mediapipeRun.summary.height}
-                      </span>
-                    </div>
-
-                    <div
-                      style={{
-                        display: 'flex',
-                        flexWrap: 'wrap',
-                        gap: 'var(--space-xs)',
-                      }}
-                    >
-                      {mediapipeRun.annotated_video_url && (
-                        <a
-                          className="btn btn-secondary"
-                          style={{ fontSize: '0.75rem', flex: 1 }}
-                          href={mediapipeRun.annotated_video_url}
-                          target="_blank"
-                          rel="noreferrer"
-                        >
-                          Open annotated.mp4
-                        </a>
-                      )}
-                      <a
-                        className="btn btn-ghost"
-                        style={{ fontSize: '0.75rem', flex: 1 }}
-                        href={`/storage/mediapipe/runs/${encodeURIComponent(
-                          mediapipeRun.run_id,
-                        )}/detections.json`}
-                        target="_blank"
-                        rel="noreferrer"
+                      <div
+                        style={{
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: 'var(--space-sm)',
+                        }}
                       >
-                        detections.json
-                      </a>
-                      <a
-                        className="btn btn-ghost"
-                        style={{ fontSize: '0.75rem', flex: 1 }}
-                        href={`/storage/mediapipe/runs/${encodeURIComponent(
-                          mediapipeRun.run_id,
-                        )}/features.json`}
-                        target="_blank"
-                        rel="noreferrer"
+                        <Activity size={18} style={{ color: 'var(--accent-primary)' }} />
+                        <span className="text-small" style={{ fontWeight: 600 }}>
+                          Hand Tracking (MediaPipe)
+                        </span>
+                      </div>
+                      <p
+                        className="text-small"
+                        style={{ color: 'var(--text-muted)', margin: 0 }}
                       >
-                        features.json
-                      </a>
-                    </div>
+                        Run MediaPipe on your practice video to produce an annotated
+                        overlay with hand landmarks, wrist trajectory and bounding
+                        box. Toggle between the original and the annotated version
+                        above the learner video.
+                      </p>
 
-                    {mediapipeRun.partial_errors &&
-                      mediapipeRun.partial_errors.length > 0 && (
-                        <div
+                      <button
+                        className="btn btn-primary"
+                        style={{
+                          width: '100%',
+                          display: 'inline-flex',
+                          alignItems: 'center',
+                          justifyContent: 'center',
+                          gap: 'var(--space-xs)',
+                        }}
+                        disabled={!userVideo || isMediapipeProcessing}
+                        onClick={runMediapipe}
+                      >
+                        {isMediapipeProcessing ? (
+                          <>
+                            <Loader2
+                              size={14}
+                              style={{ animation: 'spin 1s linear infinite' }}
+                            />
+                            Processing...
+                          </>
+                        ) : (
+                          <>
+                            <Activity size={14} />
+                            {mediapipeRun ? 'Run Again' : 'Run MediaPipe'}
+                          </>
+                        )}
+                      </button>
+
+                      {!userVideo && (
+                        <p
                           className="text-small"
                           style={{
                             color: 'var(--text-muted)',
+                            textAlign: 'center',
+                            margin: 0,
+                          }}
+                        >
+                          Upload a practice video to enable MediaPipe.
+                        </p>
+                      )}
+
+                      {mediapipeError && (
+                        <div
+                          className="text-small"
+                          style={{
                             background: 'var(--bg-tertiary)',
+                            border: '1px solid var(--danger, #ef4444)',
+                            color: 'var(--danger, #ef4444)',
                             borderRadius: 'var(--radius-md)',
                             padding: 'var(--space-sm) var(--space-md)',
                           }}
                         >
-                          <strong>Warnings:</strong>{' '}
-                          {mediapipeRun.partial_errors.join('; ')}
+                          {mediapipeError}
                         </div>
                       )}
-                  </>
-                )}
+
+                      {mediapipeRun && (
+                        <>
+                          <div
+                            style={{
+                              display: 'grid',
+                              gridTemplateColumns: '1fr 1fr',
+                              gap: 'var(--space-sm)',
+                            }}
+                          >
+                            <div
+                              className="stat-card"
+                              style={{ padding: 'var(--space-sm)' }}
+                            >
+                              <div
+                                className="stat-value"
+                                style={{ fontSize: '1.25rem' }}
+                              >
+                                {Math.round(
+                                  (mediapipeRun.summary.detection_rate || 0) * 100,
+                                )}
+                                %
+                              </div>
+                              <div
+                                className="stat-label"
+                                style={{ fontSize: '0.7rem' }}
+                              >
+                                Detection rate
+                              </div>
+                            </div>
+                            <div
+                              className="stat-card"
+                              style={{ padding: 'var(--space-sm)' }}
+                            >
+                              <div
+                                className="stat-value"
+                                style={{ fontSize: '1.25rem' }}
+                              >
+                                {mediapipeRun.summary.frames_with_detection}/
+                                {mediapipeRun.summary.total_frames}
+                              </div>
+                              <div
+                                className="stat-label"
+                                style={{ fontSize: '0.7rem' }}
+                              >
+                                Frames with detection
+                              </div>
+                            </div>
+                            <div
+                              className="stat-card"
+                              style={{ padding: 'var(--space-sm)' }}
+                            >
+                              <div
+                                className="stat-value"
+                                style={{ fontSize: '1.25rem' }}
+                              >
+                                {mediapipeRun.summary.right_hand_selected_count}
+                              </div>
+                              <div
+                                className="stat-label"
+                                style={{ fontSize: '0.7rem' }}
+                              >
+                                Right hand frames
+                              </div>
+                            </div>
+                            <div
+                              className="stat-card"
+                              style={{ padding: 'var(--space-sm)' }}
+                            >
+                              <div
+                                className="stat-value"
+                                style={{ fontSize: '1.25rem' }}
+                              >
+                                {mediapipeRun.summary.left_hand_selected_count}
+                              </div>
+                              <div
+                                className="stat-label"
+                                style={{ fontSize: '0.7rem' }}
+                              >
+                                Left hand frames
+                              </div>
+                            </div>
+                          </div>
+
+                          <div
+                            style={{
+                              display: 'flex',
+                              flexDirection: 'column',
+                              gap: 'var(--space-xs)',
+                              fontSize: '0.75rem',
+                              color: 'var(--text-secondary)',
+                            }}
+                          >
+                            <span>
+                              <strong>run_id:</strong>{' '}
+                              <code
+                                style={{
+                                  fontFamily: 'var(--font-mono)',
+                                  fontSize: '0.7rem',
+                                }}
+                              >
+                                {mediapipeRun.run_id}
+                              </code>
+                            </span>
+                            <span>
+                              <strong>fps:</strong> {mediapipeRun.summary.fps.toFixed(2)}{' '}
+                              • <strong>frames:</strong>{' '}
+                              {mediapipeRun.summary.frame_count} •{' '}
+                              <strong>size:</strong> {mediapipeRun.summary.width}×
+                              {mediapipeRun.summary.height}
+                            </span>
+                          </div>
+
+                          <div
+                            style={{
+                              display: 'flex',
+                              flexWrap: 'wrap',
+                              gap: 'var(--space-xs)',
+                            }}
+                          >
+                            {mediapipeRun.annotated_video_url && (
+                              <a
+                                className="btn btn-secondary"
+                                style={{ fontSize: '0.75rem', flex: 1 }}
+                                href={mediapipeRun.annotated_video_url}
+                                target="_blank"
+                                rel="noreferrer"
+                              >
+                                Open annotated.mp4
+                              </a>
+                            )}
+                            <a
+                              className="btn btn-ghost"
+                              style={{ fontSize: '0.75rem', flex: 1 }}
+                              href={`/storage/mediapipe/runs/${encodeURIComponent(
+                                mediapipeRun.run_id,
+                              )}/detections.json`}
+                              target="_blank"
+                              rel="noreferrer"
+                            >
+                              detections.json
+                            </a>
+                            <a
+                              className="btn btn-ghost"
+                              style={{ fontSize: '0.75rem', flex: 1 }}
+                              href={`/storage/mediapipe/runs/${encodeURIComponent(
+                                mediapipeRun.run_id,
+                              )}/features.json`}
+                              target="_blank"
+                              rel="noreferrer"
+                            >
+                              features.json
+                            </a>
+                          </div>
+
+                          {mediapipeRun.partial_errors &&
+                            mediapipeRun.partial_errors.length > 0 && (
+                              <div
+                                className="text-small"
+                                style={{
+                                  color: 'var(--text-muted)',
+                                  background: 'var(--bg-tertiary)',
+                                  borderRadius: 'var(--radius-md)',
+                                  padding: 'var(--space-sm) var(--space-md)',
+                                }}
+                              >
+                                <strong>Warnings:</strong>{' '}
+                                {mediapipeRun.partial_errors.join('; ')}
+                              </div>
+                            )}
+                        </>
+                      )}
+                    </div>
+                  </TabsContent>
+
+                  <TabsContent value="sam2">
+                    <div
+                      style={{
+                        display: 'flex',
+                        flexDirection: 'column',
+                        gap: 'var(--space-md)',
+                        marginTop: 'var(--space-sm)',
+                      }}
+                    >
+                      <div
+                        style={{
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: 'var(--space-sm)',
+                        }}
+                      >
+                        <Scissors size={18} style={{ color: 'var(--accent-primary)' }} />
+                        <span className="text-small" style={{ fontWeight: 600 }}>
+                          Hand Segmentation (SAM2)
+                        </span>
+                      </div>
+                      <p
+                        className="text-small"
+                        style={{ color: 'var(--text-muted)', margin: 0 }}
+                      >
+                        Run the MediaPipe -&gt; SAM2 pipeline on your practice
+                        video. MediaPipe builds the initialization prompt
+                        automatically; SAM2 then segments the hand and writes
+                        the annotated video, masks and summary. Toggle
+                        between Original / MediaPipe / SAM2 above the learner
+                        video to compare outputs.
+                      </p>
+
+                      <button
+                        className="btn btn-primary"
+                        style={{
+                          width: '100%',
+                          display: 'inline-flex',
+                          alignItems: 'center',
+                          justifyContent: 'center',
+                          gap: 'var(--space-xs)',
+                        }}
+                        disabled={!userVideo || isSam2LearnerProcessing}
+                        onClick={runSam2Learner}
+                      >
+                        {isSam2LearnerProcessing ? (
+                          <>
+                            <Loader2
+                              size={14}
+                              style={{ animation: 'spin 1s linear infinite' }}
+                            />
+                            Processing (MediaPipe -&gt; SAM2)...
+                          </>
+                        ) : (
+                          <>
+                            <Scissors size={14} />
+                            {sam2LearnerRun ? 'Run Again' : 'Run SAM2'}
+                          </>
+                        )}
+                      </button>
+
+                      {!userVideo && (
+                        <p
+                          className="text-small"
+                          style={{
+                            color: 'var(--text-muted)',
+                            textAlign: 'center',
+                            margin: 0,
+                          }}
+                        >
+                          Upload a practice video to enable SAM2.
+                        </p>
+                      )}
+
+                      {sam2LearnerError && (
+                        <div
+                          className="text-small"
+                          style={{
+                            background: 'var(--bg-tertiary)',
+                            border: '1px solid var(--danger, #ef4444)',
+                            color: 'var(--danger, #ef4444)',
+                            borderRadius: 'var(--radius-md)',
+                            padding: 'var(--space-sm) var(--space-md)',
+                          }}
+                        >
+                          {sam2LearnerError}
+                        </div>
+                      )}
+
+                      {sam2LearnerRun && (
+                        <>
+                          <div
+                            style={{
+                              display: 'grid',
+                              gridTemplateColumns: '1fr 1fr',
+                              gap: 'var(--space-sm)',
+                            }}
+                          >
+                            <div
+                              className="stat-card"
+                              style={{ padding: 'var(--space-sm)' }}
+                            >
+                              <div
+                                className="stat-value"
+                                style={{ fontSize: '1.25rem' }}
+                              >
+                                {Math.round(
+                                  (sam2LearnerRun.summary.detection_rate || 0) * 100,
+                                )}
+                                %
+                              </div>
+                              <div
+                                className="stat-label"
+                                style={{ fontSize: '0.7rem' }}
+                              >
+                                Frames with mask
+                              </div>
+                            </div>
+                            <div
+                              className="stat-card"
+                              style={{ padding: 'var(--space-sm)' }}
+                            >
+                              <div
+                                className="stat-value"
+                                style={{ fontSize: '1.25rem' }}
+                              >
+                                {sam2LearnerRun.summary.frames_with_mask}/
+                                {sam2LearnerRun.summary.total_frames}
+                              </div>
+                              <div
+                                className="stat-label"
+                                style={{ fontSize: '0.7rem' }}
+                              >
+                                Masked / total
+                              </div>
+                            </div>
+                            <div
+                              className="stat-card"
+                              style={{ padding: 'var(--space-sm)' }}
+                            >
+                              <div
+                                className="stat-value"
+                                style={{ fontSize: '1.25rem' }}
+                              >
+                                {sam2LearnerRun.device.toUpperCase()}
+                              </div>
+                              <div
+                                className="stat-label"
+                                style={{ fontSize: '0.7rem' }}
+                              >
+                                Device
+                                {sam2LearnerRun.metadata.gpu_name
+                                  ? ` (${sam2LearnerRun.metadata.gpu_name})`
+                                  : ''}
+                              </div>
+                            </div>
+                            <div
+                              className="stat-card"
+                              style={{ padding: 'var(--space-sm)' }}
+                            >
+                              <div
+                                className="stat-value"
+                                style={{ fontSize: '1.25rem' }}
+                              >
+                                {sam2LearnerRun.frame_stride}
+                              </div>
+                              <div
+                                className="stat-label"
+                                style={{ fontSize: '0.7rem' }}
+                              >
+                                frame_stride
+                              </div>
+                            </div>
+                          </div>
+
+                          <div
+                            style={{
+                              display: 'flex',
+                              flexDirection: 'column',
+                              gap: 'var(--space-xs)',
+                              fontSize: '0.75rem',
+                              color: 'var(--text-secondary)',
+                            }}
+                          >
+                            <span>
+                              <strong>run_id:</strong>{' '}
+                              <code
+                                style={{
+                                  fontFamily: 'var(--font-mono)',
+                                  fontSize: '0.7rem',
+                                }}
+                              >
+                                {sam2LearnerRun.run_id}
+                              </code>
+                            </span>
+                            <span>
+                              <strong>fps:</strong>{' '}
+                              {sam2LearnerRun.metadata.fps.toFixed(2)} •{' '}
+                              <strong>frames:</strong>{' '}
+                              {sam2LearnerRun.metadata.frame_count} •{' '}
+                              <strong>size:</strong>{' '}
+                              {sam2LearnerRun.metadata.width}×
+                              {sam2LearnerRun.metadata.height}
+                            </span>
+                          </div>
+
+                          {sam2LearnerRun.initialization_debug_image_url && (
+                            <div style={{ display: 'grid', gap: 4 }}>
+                              <span
+                                className="text-small"
+                                style={{ fontWeight: 600 }}
+                              >
+                                Initialization prompt (debug)
+                              </span>
+                              <a
+                                href={sam2LearnerRun.initialization_debug_image_url}
+                                target="_blank"
+                                rel="noreferrer"
+                                style={{
+                                  display: 'block',
+                                  borderRadius: 'var(--radius-sm)',
+                                  overflow: 'hidden',
+                                  border: '1px solid var(--border-default)',
+                                }}
+                              >
+                                <img
+                                  src={sam2LearnerRun.initialization_debug_image_url}
+                                  alt="SAM2 initialization prompt overlay"
+                                  style={{
+                                    display: 'block',
+                                    width: '100%',
+                                    height: 'auto',
+                                  }}
+                                />
+                              </a>
+                              <span
+                                className="text-small"
+                                style={{
+                                  color: 'var(--text-muted)',
+                                  fontSize: '0.7rem',
+                                }}
+                              >
+                                Point + bounding box used to initialize SAM2
+                                on the first valid MediaPipe frame.
+                              </span>
+                            </div>
+                          )}
+
+                          <div
+                            style={{
+                              display: 'flex',
+                              flexWrap: 'wrap',
+                              gap: 'var(--space-xs)',
+                            }}
+                          >
+                            {sam2LearnerRun.annotated_video_url && (
+                              <a
+                                className="btn btn-secondary"
+                                style={{ fontSize: '0.75rem', flex: 1 }}
+                                href={sam2LearnerRun.annotated_video_url}
+                                target="_blank"
+                                rel="noreferrer"
+                              >
+                                Open annotated.mp4
+                              </a>
+                            )}
+                            <a
+                              className="btn btn-ghost"
+                              style={{ fontSize: '0.75rem', flex: 1 }}
+                              href={`/storage/sam2/runs/${encodeURIComponent(
+                                sam2LearnerRun.run_id,
+                              )}/raw.json`}
+                              target="_blank"
+                              rel="noreferrer"
+                            >
+                              raw.json
+                            </a>
+                            <a
+                              className="btn btn-ghost"
+                              style={{ fontSize: '0.75rem', flex: 1 }}
+                              href={`/storage/sam2/runs/${encodeURIComponent(
+                                sam2LearnerRun.run_id,
+                              )}/summary.json`}
+                              target="_blank"
+                              rel="noreferrer"
+                            >
+                              summary.json
+                            </a>
+                            <a
+                              className="btn btn-ghost"
+                              style={{ fontSize: '0.75rem', flex: 1 }}
+                              href={`/storage/sam2/runs/${encodeURIComponent(
+                                sam2LearnerRun.run_id,
+                              )}/metadata.json`}
+                              target="_blank"
+                              rel="noreferrer"
+                            >
+                              metadata.json
+                            </a>
+                          </div>
+
+                          <div style={{ display: 'grid', gap: 'var(--space-sm)' }}>
+                            <div>
+                              <span
+                                className="text-small"
+                                style={{ fontWeight: 600 }}
+                              >
+                                metadata.json
+                              </span>
+                              <pre
+                                style={{
+                                  marginTop: 4,
+                                  maxHeight: 140,
+                                  overflow: 'auto',
+                                  background: 'var(--bg-tertiary)',
+                                  borderRadius: 'var(--radius-sm)',
+                                  padding: 'var(--space-sm)',
+                                  fontSize: '0.7rem',
+                                }}
+                              >
+                                {prettyJson(sam2LearnerRun.metadata)}
+                              </pre>
+                            </div>
+                            <div>
+                              <span
+                                className="text-small"
+                                style={{ fontWeight: 600 }}
+                              >
+                                summary.json
+                              </span>
+                              <pre
+                                style={{
+                                  marginTop: 4,
+                                  maxHeight: 140,
+                                  overflow: 'auto',
+                                  background: 'var(--bg-tertiary)',
+                                  borderRadius: 'var(--radius-sm)',
+                                  padding: 'var(--space-sm)',
+                                  fontSize: '0.7rem',
+                                }}
+                              >
+                                {prettyJson(sam2LearnerRun.summary)}
+                              </pre>
+                            </div>
+                            {Boolean(sam2LearnerRun.raw_preview) && (
+                              <div>
+                                <div
+                                  style={{
+                                    display: 'flex',
+                                    alignItems: 'center',
+                                    justifyContent: 'space-between',
+                                    gap: 'var(--space-xs)',
+                                  }}
+                                >
+                                  <span
+                                    className="text-small"
+                                    style={{ fontWeight: 600 }}
+                                  >
+                                    raw.json (preview)
+                                  </span>
+                                  <button
+                                    type="button"
+                                    className="btn btn-ghost"
+                                    style={{ fontSize: '0.7rem' }}
+                                    onClick={() =>
+                                      setShowSam2RawPreview((prev) => !prev)
+                                    }
+                                  >
+                                    {showSam2RawPreview ? 'Hide' : 'Show'}
+                                  </button>
+                                </div>
+                                {showSam2RawPreview && (
+                                  <pre
+                                    style={{
+                                      marginTop: 4,
+                                      maxHeight: 180,
+                                      overflow: 'auto',
+                                      background: 'var(--bg-tertiary)',
+                                      borderRadius: 'var(--radius-sm)',
+                                      padding: 'var(--space-sm)',
+                                      fontSize: '0.7rem',
+                                    }}
+                                  >
+                                    {prettyJson(sam2LearnerRun.raw_preview)}
+                                  </pre>
+                                )}
+                              </div>
+                            )}
+                          </div>
+
+                          {sam2LearnerRun.warnings?.length > 0 && (
+                            <div
+                              className="text-small"
+                              style={{
+                                color: 'var(--text-muted)',
+                                background: 'var(--bg-tertiary)',
+                                borderRadius: 'var(--radius-md)',
+                                padding: 'var(--space-sm) var(--space-md)',
+                              }}
+                            >
+                              <strong>Warnings:</strong>{' '}
+                              {sam2LearnerRun.warnings.join('; ')}
+                            </div>
+                          )}
+                        </>
+                      )}
+                    </div>
+                  </TabsContent>
+
+                  <TabsContent value="optical_flow">
+                    <div
+                      className="text-small"
+                      style={{
+                        color: 'var(--text-muted)',
+                        marginTop: 'var(--space-sm)',
+                        background: 'var(--bg-tertiary)',
+                        borderRadius: 'var(--radius-md)',
+                        padding: 'var(--space-sm) var(--space-md)',
+                      }}
+                    >
+                      Optical Flow inspection is reserved for later and will appear here in the same panel.
+                    </div>
+                  </TabsContent>
+                </Tabs>
+
               </div>
             </TabsContent>
 

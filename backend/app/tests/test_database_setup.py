@@ -9,7 +9,17 @@ from app.models.learner_attempt import LearnerAttempt
 from app.models.user import User
 
 
+def _assert_safe_test_engine() -> None:
+    engine_url = str(engine.url).lower()
+    if not any(marker in engine_url for marker in ("test", "pytest", "sqlite", "tmp")):
+        raise RuntimeError(
+            "Refusing destructive DB test against a non-test engine URL. "
+            f"Resolved engine URL: {engine.url}"
+        )
+
+
 def test_database_insert_and_query_evaluation_result() -> None:
+    _assert_safe_test_engine()
     _ = ExpertVideo
     _ = User
     Base.metadata.drop_all(bind=engine)
