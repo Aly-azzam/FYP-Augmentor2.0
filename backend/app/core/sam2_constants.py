@@ -172,6 +172,14 @@ SAM2_PROMPT_BOX_PADDING_RATIO: float = 0.15
 #: This guarantees SAM 2 always sees ``point inside box``.
 SAM2_PROMPT_POINT_INSIDE_BOX_MARGIN_PX: float = 2.0
 
+#: Pixel offset used to project a pen-tip proxy ahead of the grip center
+#: in the index-finger direction.
+SAM2_PEN_TIP_OFFSET_PX: float = 28.0
+
+#: Side length in pixels for the optional local box centered on the
+#: estimated pen-tip prompt.
+SAM2_PEN_TIP_BOX_SIZE_PX: float = 72.0
+
 #: Filename for the init-prompt debug image saved inside each SAM 2 run
 #: folder. The image shows the selected initialization frame with the point
 #: and/or box overlay so we can verify the prompt visually.

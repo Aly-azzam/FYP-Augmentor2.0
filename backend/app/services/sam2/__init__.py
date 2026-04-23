@@ -10,6 +10,7 @@ from app.services.sam2.pipeline_service import (
     load_sam2_contract_artifacts,
     process_learner_sam2,
     resolve_run_dir as resolve_pipeline_run_dir,
+    run_sam2_from_manual_prompt,
     run_sam2_from_mediapipe_prompt,
 )
 from app.services.sam2.sam2_service import (
@@ -69,6 +70,7 @@ __all__ = [
     "resolve_pipeline_run_dir",
     "resolve_run_dir",
     "resolve_video_path",
+    "run_sam2_from_manual_prompt",
     "run_sam2_from_mediapipe_prompt",
     "run_sam2_pipeline",
     "validate_sam2_assets",

@@ -5,16 +5,14 @@ produces rich ``detections.json`` / ``features.json`` artifacts for
 debugging. This module sits on top of it and provides the
 downstream-facing layer used by the rest of the backend:
 
-    * ``run_sam2_from_mediapipe_prompt`` — the single entry point that
-      auto-builds a SAM 2 prompt from a MediaPipe features document,
-      runs the pipeline, and emits the stable ``raw.json`` /
-      ``summary.json`` / ``metadata.json`` contract artifacts.
+    * ``run_sam2_from_manual_prompt`` — primary entry point for both
+      learner (Compare Studio click) and expert (CLI --x --y) flows.
+      Accepts a manually-specified pixel coordinate, builds a local box
+      around it, and runs SAM 2 without any MediaPipe dependency.
+    * ``run_sam2_from_mediapipe_prompt`` — legacy path kept for backward
+      compatibility. MediaPipe features.json -> auto-built prompt -> SAM 2.
     * ``process_learner_sam2`` — learner-runtime convenience wrapper.
-      Expert-side orchestration lives in ``expert_sam2_service.py``,
-      which consumes ``run_sam2_from_mediapipe_prompt`` under the hood.
-
-No UI, no manual point picking: the only supported learner flow is
-"MediaPipe features.json already exists -> derive prompt automatically".
+      Expert-side orchestration lives in ``expert_sam2_service.py``.
 """
 
 from __future__ import annotations
@@ -51,6 +49,8 @@ from app.schemas.sam2.sam2_contract_schema import (
 from app.schemas.sam2.sam2_schema import (
     SAM2DetectionsDocument,
     SAM2FeaturesDocument,
+    SAM2InitBox,
+    SAM2InitPoint,
     SAM2InitPrompt,
     SAM2RunMeta,
 )
@@ -65,7 +65,7 @@ from app.services.sam2.sam2_service import (
     build_sam2_auto_prompt,
     run_sam2_pipeline,
 )
-from app.utils.sam2.sam2_utils import LANDMARK_ALIAS_INDEX_TIP
+from app.utils.sam2.sam2_utils import LANDMARK_ALIAS_INDEX_TIP, get_video_info
 
 
 logger = logging.getLogger(__name__)
@@ -267,6 +267,134 @@ def _write_json(path: Path, document) -> None:
 # Public entry points
 # ---------------------------------------------------------------------------
 
+def run_sam2_from_manual_prompt(
+    video_path: str | Path,
+    *,
+    init_x: float,
+    init_y: float,
+    frame_index: int = 0,
+    box_half_size: int = 40,
+    run_id: Optional[str] = None,
+    analysis_mode: str = SAM2_DEFAULT_ANALYSIS_MODE,
+    max_seconds: float = SAM2_DEFAULT_MAX_SECONDS,
+    frame_stride: int = SAM2_DEFAULT_FRAME_STRIDE,
+    render_annotation: bool = True,
+    target_object_id: int = SAM2_DEFAULT_TARGET_OBJECT_ID,
+    device: Optional[str] = None,
+) -> SAM2ContractArtifacts:
+    """Run SAM 2 end-to-end from a manually specified pixel coordinate.
+
+    This is the primary initialization path for both:
+      * Learner (Compare Studio): the user clicks on the video frame.
+      * Expert (offline CLI): the operator passes ``--x`` and ``--y``.
+
+    MediaPipe is NOT involved in building the prompt.
+
+    The initialization prompt is a COMBINED box + point:
+      * ``box``  — a small ``2*box_half_size`` × ``2*box_half_size`` region
+                   centred on the click.  This is the PRIMARY SAM 2
+                   spatial constraint and is what prevents SAM 2 from
+                   expanding onto large flat regions (e.g. a notebook).
+      * ``point`` — the positive-click at the exact clicked coordinate,
+                   used as a disambiguation signal inside the box.
+
+    Keep ``box_half_size`` small (default 40 → 80×80 px total) so SAM 2
+    cannot grow the mask beyond the immediate neighbourhood of the click.
+
+    Args:
+        video_path:     Source video file.
+        init_x:         Clicked X coordinate in video pixel space.
+        init_y:         Clicked Y coordinate in video pixel space.
+        frame_index:    Frame to apply the prompt to (default 0 = first).
+        box_half_size:  Half-width/height of the constraint box (pixels).
+                        Default 40 → 80×80 total.  Increase only if the
+                        target object is larger than ~80 px.
+        run_id:         Optional run identifier; one is generated if omitted.
+        analysis_mode:  Forwarded to ``run_sam2_pipeline``.
+        max_seconds:    Forwarded to ``run_sam2_pipeline``.
+        frame_stride:   Forwarded to ``run_sam2_pipeline``.
+        render_annotation: Write annotated.mp4 overlay.
+        target_object_id: SAM 2 object-id slot.
+        device:         Force 'cuda' or 'cpu'; auto-detected when None.
+    """
+    effective_run_id = run_id or uuid4().hex
+
+    # Probe video to clamp coordinates to valid range.
+    resolved_video_path = Path(video_path)
+    info = get_video_info(resolved_video_path)
+    if "error" in info:
+        raise SAM2PipelineError(f"Could not read video metadata: {info['error']}")
+
+    vid_width = int(info["width"])
+    vid_height = int(info["height"])
+
+    # Clamp the clicked point inside the frame.
+    px = float(max(0.0, min(float(init_x), vid_width - 1)))
+    py = float(max(0.0, min(float(init_y), vid_height - 1)))
+
+    # Build a SMALL local axis-aligned box centred on the clicked point.
+    # The box is the PRIMARY SAM 2 spatial constraint — keeping it tight
+    # prevents the model from selecting large background regions.
+    bx_min = float(max(0.0, px - box_half_size))
+    by_min = float(max(0.0, py - box_half_size))
+    bx_max = float(min(float(vid_width), px + box_half_size))
+    by_max = float(min(float(vid_height), py + box_half_size))
+
+    box_w = bx_max - bx_min
+    box_h = by_max - by_min
+
+    # Use type="box" — the box is the primary constraint; the point
+    # is additional disambiguation inside the box.
+    init_prompt = SAM2InitPrompt(
+        type="box",
+        source="manual",
+        frame_index=frame_index,
+        target_object_id=target_object_id,
+        point=SAM2InitPoint(x=px, y=py, label=1),
+        box=SAM2InitBox(x_min=bx_min, y_min=by_min, x_max=bx_max, y_max=by_max),
+    )
+
+    logger.info(
+        "SAM2 manual prompt | run=%s | point=(%.1f, %.1f) | "
+        "box=(%.0f,%.0f,%.0f,%.0f) [%.0fx%.0f px] | "
+        "frame=%d | video=%dx%d",
+        effective_run_id,
+        px, py,
+        bx_min, by_min, bx_max, by_max,
+        box_w, box_h,
+        frame_index,
+        vid_width, vid_height,
+    )
+
+    debug_points: Dict[str, List[float]] = {"manual_click": [px, py]}
+
+    try:
+        underlying = run_sam2_pipeline(
+            video_path,
+            init_prompt,
+            run_id=effective_run_id,
+            analysis_mode=analysis_mode,
+            max_seconds=max_seconds,
+            frame_stride=frame_stride,
+            render_annotation=render_annotation,
+            device=device,
+            init_debug_points_xy=debug_points,
+        )
+    except (
+        SAM2InitError,
+        SAM2AssetsMissingError,
+        SAM2DependencyError,
+        SAM2GPUOutOfMemoryError,
+    ):
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise SAM2PipelineError(
+            f"SAM 2 pipeline failed for run {effective_run_id}: {exc}"
+        ) from exc
+
+    return _finalize_contract_artifacts(underlying)
+
+
 def run_sam2_from_mediapipe_prompt(
     video_path: str | Path,
     mediapipe_features_path: str | Path,
@@ -350,6 +478,10 @@ def run_sam2_from_mediapipe_prompt(
         "local_box_diagnostics": auto_prompt.get("local_box_diagnostics"),
         "hand_bbox_xyxy_px": auto_prompt.get("hand_bbox_xyxy_px"),
         "selection_diagnostics": auto_prompt.get("selection_diagnostics"),
+        "init_debug_points_xy": auto_prompt.get("init_debug_points_xy"),
+        "selected_candidate_name": auto_prompt.get("selected_candidate_name"),
+        "candidate_points_xy": auto_prompt.get("candidate_points_xy"),
+        "candidate_scores": auto_prompt.get("candidate_scores"),
     }
     logger.info("SAM2 prompt debug: %s", prompt_debug_payload)
     prompt_validation = auto_prompt.get("prompt_validation") or {}
@@ -370,6 +502,7 @@ def run_sam2_from_mediapipe_prompt(
             frame_stride=frame_stride,
             render_annotation=render_annotation,
             device=device,
+            init_debug_points_xy=auto_prompt.get("init_debug_points_xy"),
         )
     except (
         SAM2InitError,

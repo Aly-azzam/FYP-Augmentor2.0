@@ -1,20 +1,18 @@
 """FastAPI routes for the learner SAM 2 pipeline.
 
 These endpoints are the Compare Studio counterpart to the existing
-``/api/mediapipe`` routes: they accept a learner/practice video, run
-the full MediaPipe -> SAM 2 pipeline, and return the stable contract
-artifacts (raw/summary/metadata + annotated video) plus the
-initialization debug image used to build the SAM 2 prompt.
+``/api/mediapipe`` routes. SAM 2 initialization is now MANUAL: the
+learner must click on the object in the video before submitting the
+request. The clicked pixel coordinate is the source of truth for the
+SAM 2 prompt — MediaPipe is no longer used to derive the init point.
 
 Pipeline (intentionally sequential, not parallel):
 
     1. Persist the uploaded video under ``storage/sam2/sources/<run_id>/``.
-    2. Run MediaPipe Hands on the learner video — its ``features.json``
-       is the source of truth for the SAM 2 auto-prompt.
-    3. Build the SAM 2 prompt from MediaPipe (point + padded hand bbox,
-       averaged over the first few valid frames).
-    4. Run SAM 2 with that prompt on the same learner video.
-    5. Write ``raw.json`` / ``summary.json`` alongside the rich
+    2. Build the SAM 2 prompt from the manually clicked (init_x, init_y)
+       pixel coordinate + a local bounding box around it.
+    3. Run SAM 2 with that prompt on the same learner video.
+    4. Write ``raw.json`` / ``summary.json`` alongside the rich
        debug artifacts.
 
 Returned payload is explicitly shaped for the Compare Studio right
@@ -24,9 +22,7 @@ available) the ``initialization_debug_image`` path + public URL.
 
 from __future__ import annotations
 
-import json
 import logging
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
@@ -42,11 +38,6 @@ from app.schemas.sam2.sam2_contract_schema import (
 )
 from app.schemas.sam2.sam2_schema import SAM2RunMeta
 from app.services.media_service import build_storage_url
-from app.services.mediapipe.run_service import (
-    MediaPipeRunArtifacts,
-    MediaPipeRunError,
-    run_pipeline as run_mediapipe_pipeline,
-)
 from app.services.sam2 import (
     SAM2AssetsMissingError,
     SAM2ContractArtifacts,
@@ -57,7 +48,7 @@ from app.services.sam2 import (
     SAM2PipelineError,
     load_sam2_contract_artifacts,
     resolve_pipeline_run_dir,
-    run_sam2_from_mediapipe_prompt,
+    run_sam2_from_manual_prompt,
 )
 from app.services.upload_service import (
     UploadValidationError,
@@ -76,7 +67,7 @@ router = APIRouter(prefix="/api/sam2", tags=["SAM2"])
 # ---------------------------------------------------------------------------
 
 class SAM2LearnerMediaPipeInfo(BaseModel):
-    """Minimal MediaPipe summary echoed back with the SAM 2 payload."""
+    """Minimal MediaPipe summary echoed back with the SAM 2 payload (legacy field)."""
 
     run_id: str
     run_folder: str
@@ -143,20 +134,6 @@ def _storage_url_for(path: Optional[Path]) -> Optional[str]:
     return build_storage_url(key) if key else None
 
 
-def _mediapipe_info(artifacts: MediaPipeRunArtifacts) -> SAM2LearnerMediaPipeInfo:
-    return SAM2LearnerMediaPipeInfo(
-        run_id=artifacts.run_id,
-        run_folder=str(artifacts.run_dir),
-        features_json_path=str(artifacts.features_path),
-        metadata_json_path=str(artifacts.metadata_path),
-        annotated_video_path=str(artifacts.annotated_video_path),
-        annotated_video_url=_storage_url_for(artifacts.annotated_video_path),
-        total_frames=artifacts.metadata.total_frames,
-        frames_with_detection=artifacts.metadata.frames_with_detection,
-        detection_rate=artifacts.metadata.detection_rate,
-    )
-
-
 def _load_raw_document(path: Path) -> Optional[SAM2RawDocument]:
     if not path.is_file():
         return None
@@ -168,11 +145,7 @@ def _load_raw_document(path: Path) -> Optional[SAM2RawDocument]:
         return None
 
 
-def _build_response(
-    sam2: SAM2ContractArtifacts,
-    *,
-    mediapipe: Optional[MediaPipeRunArtifacts] = None,
-) -> SAM2LearnerResponse:
+def _build_response(sam2: SAM2ContractArtifacts) -> SAM2LearnerResponse:
     raw_document = sam2.raw if sam2.raw is not None else _load_raw_document(sam2.raw_path)
 
     return SAM2LearnerResponse(
@@ -195,7 +168,7 @@ def _build_response(
         metadata=sam2.metadata,
         summary=sam2.summary,
         raw_preview=raw_document,
-        mediapipe=_mediapipe_info(mediapipe) if mediapipe is not None else None,
+        mediapipe=None,
         warnings=list(sam2.warnings),
     )
 
@@ -248,49 +221,6 @@ def _raise_sam2_error(exc: SAM2Error) -> None:
     ) from exc
 
 
-@dataclass
-class _LearnerPipelineResult:
-    mediapipe: MediaPipeRunArtifacts
-    sam2: SAM2ContractArtifacts
-
-
-def _run_learner_pipeline(
-    source_path: Path,
-    *,
-    run_id: str,
-    frame_stride: int,
-    render_annotation: bool,
-    max_num_hands: int,
-    min_detection_confidence: float,
-    min_tracking_confidence: float,
-) -> _LearnerPipelineResult:
-    """Run MediaPipe -> SAM 2 on a learner video.
-
-    Errors from MediaPipe bubble up as ``MediaPipeRunError``; SAM 2
-    errors bubble up as ``SAM2Error`` subclasses so the route can
-    translate them into structured HTTP responses.
-    """
-    mediapipe_artifacts = run_mediapipe_pipeline(
-        source_path,
-        run_id=run_id,
-        max_num_hands=max_num_hands,
-        min_detection_confidence=min_detection_confidence,
-        min_tracking_confidence=min_tracking_confidence,
-        render_annotation=render_annotation,
-    )
-
-    sam2_artifacts = run_sam2_from_mediapipe_prompt(
-        source_path,
-        mediapipe_artifacts.features_path,
-        run_id=run_id,
-        frame_stride=frame_stride,
-        render_annotation=render_annotation,
-    )
-
-    return _LearnerPipelineResult(
-        mediapipe=mediapipe_artifacts,
-        sam2=sam2_artifacts,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -300,19 +230,30 @@ def _run_learner_pipeline(
 @router.post("/process-upload", response_model=SAM2LearnerResponse)
 async def process_uploaded_learner_video(
     file: UploadFile = File(...),
+    init_x: float = Form(..., description="Clicked X coordinate in video pixel space."),
+    init_y: float = Form(..., description="Clicked Y coordinate in video pixel space."),
+    box_half_size: int = Form(
+        default=40,
+        ge=10,
+        le=200,
+        description=(
+            "Half-side of the local constraint box centred on the click (pixels). "
+            "Default 40 → 80×80 px total. Keep small to prevent SAM2 from "
+            "selecting large background regions."
+        ),
+    ),
     run_id: Optional[str] = Form(default=None),
     frame_stride: int = Form(default=SAM2_DEFAULT_FRAME_STRIDE, ge=1),
     render_annotation: bool = Form(default=True),
-    max_num_hands: int = Form(default=2, ge=1, le=4),
-    min_detection_confidence: float = Form(default=0.5, ge=0.0, le=1.0),
-    min_tracking_confidence: float = Form(default=0.5, ge=0.0, le=1.0),
 ) -> SAM2LearnerResponse:
-    """Accept a learner video upload and run MediaPipe -> SAM 2 end-to-end.
+    """Accept a learner video upload and run SAM 2 from a manually selected point.
 
-    Compare Studio's "Run SAM 2" button posts the freshly-uploaded
-    practice video here. We always run MediaPipe first because the SAM
-    2 initialization prompt is derived from its output — there is no
-    manual point picking on the learner side.
+    Compare Studio's "Run SAM 2" button posts the practice video along
+    with the pixel coordinate (init_x, init_y) the learner clicked on
+    the video frame. SAM 2 is initialized from that point — MediaPipe
+    is NOT used to derive the prompt here.
+
+    The frontend must collect the click before enabling this endpoint.
     """
     try:
         extension = validate_upload_file(file)
@@ -342,25 +283,15 @@ async def process_uploaded_learner_video(
     source_path = Path(settings.STORAGE_ROOT) / source_relative_path
 
     try:
-        result = _run_learner_pipeline(
+        sam2_result = run_sam2_from_manual_prompt(
             source_path,
+            init_x=init_x,
+            init_y=init_y,
+            box_half_size=box_half_size,
             run_id=effective_run_id,
             frame_stride=frame_stride,
             render_annotation=render_annotation,
-            max_num_hands=max_num_hands,
-            min_detection_confidence=min_detection_confidence,
-            min_tracking_confidence=min_tracking_confidence,
         )
-    except MediaPipeRunError as exc:
-        logger.warning("Learner SAM 2: MediaPipe prerequisite failed: %s", exc)
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={
-                "error_type": "MediaPipeRunError",
-                "message": str(exc),
-                "stage": "mediapipe",
-            },
-        ) from exc
     except SAM2Error as exc:
         logger.warning("Learner SAM 2 failed (%s): %s", type(exc).__name__, exc)
         _raise_sam2_error(exc)
@@ -371,7 +302,7 @@ async def process_uploaded_learner_video(
             detail=f"SAM 2 pipeline failed: {exc}",
         ) from exc
 
-    return _build_response(result.sam2, mediapipe=result.mediapipe)
+    return _build_response(sam2_result)
 
 
 @router.get("/result/{run_id}", response_model=SAM2LearnerResponse)

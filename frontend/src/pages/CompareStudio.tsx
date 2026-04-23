@@ -336,12 +336,26 @@ export default function CompareStudio() {
   const [learnerOverlay, setLearnerOverlay] = useState<'none' | 'mediapipe' | 'sam2'>('none');
 
   // SAM2 learner (Compare Studio) integration state. This is the
-  // learner-focused SAM2 flow: upload -> MediaPipe -> SAM2 -> annotated.
+  // learner-focused SAM2 flow: upload -> user clicks -> SAM2 -> annotated.
   const [sam2LearnerRun, setSam2LearnerRun] = useState<Sam2LearnerResult | null>(null);
   const [isSam2LearnerProcessing, setIsSam2LearnerProcessing] = useState(false);
   const [sam2LearnerError, setSam2LearnerError] = useState<string | null>(null);
   const [sam2LearnerVideoVersion, setSam2LearnerVideoVersion] = useState(0);
   const [showSam2RawPreview, setShowSam2RawPreview] = useState(false);
+
+  // Manual SAM2 initialization: the user must click on the learner video to
+  // choose the target object before running SAM2.
+  // normalizedX/Y are in [0,1] range (used to draw the on-video marker).
+  // pixelX/Y are the actual video pixel coordinates sent to the backend.
+  const [sam2InitPoint, setSam2InitPoint] = useState<{
+    normalizedX: number;
+    normalizedY: number;
+    pixelX: number;
+    pixelY: number;
+  } | null>(null);
+  // Half-side of the constraint box sent to the backend (pixels).
+  // Smaller = tighter constraint = less likely to capture the background.
+  const [sam2BoxHalfSize, setSam2BoxHalfSize] = useState<number>(40);
 
   // ── Refs ──────────────────────────────────────────────────────────────────
 
@@ -559,6 +573,7 @@ export default function CompareStudio() {
         setSam2LearnerError(null);
         setSam2LearnerVideoVersion(0);
         setLearnerOverlay('none');
+        setSam2InitPoint(null);
         resetEvaluation();
         toast.success('Practice video ready');
       };
@@ -713,6 +728,10 @@ export default function CompareStudio() {
       toast.error('Upload a practice video first');
       return;
     }
+    if (!sam2InitPoint) {
+      toast.error('Click on the object you want to track before running SAM2');
+      return;
+    }
 
     setIsSam2LearnerProcessing(true);
     setSam2LearnerError(null);
@@ -720,6 +739,9 @@ export default function CompareStudio() {
     try {
       const formData = new FormData();
       formData.append('file', userVideo);
+      formData.append('init_x', String(sam2InitPoint.pixelX));
+      formData.append('init_y', String(sam2InitPoint.pixelY));
+      formData.append('box_half_size', String(sam2BoxHalfSize));
 
       const response = await fetch('/api/sam2/process-upload', {
         method: 'POST',
@@ -801,7 +823,7 @@ export default function CompareStudio() {
     } finally {
       setIsSam2LearnerProcessing(false);
     }
-  }, [userVideo]);
+  }, [userVideo, sam2InitPoint, sam2BoxHalfSize]);
 
   // Compare Studio is learner-focused. The SAM 2 tab now shows the
   // learner pipeline (MediaPipe -> SAM 2) run on the uploaded practice
@@ -827,6 +849,33 @@ export default function CompareStudio() {
     }
     return userVideoUrl;
   })();
+
+  // ── SAM2 init-point click ────────────────────────────────────────────────
+
+  const handleLearnerVideoClick = useCallback(
+    (e: React.MouseEvent<HTMLDivElement>) => {
+      // Only active when: video is uploaded, we're on the SAM2 tab, not
+      // showing an annotated overlay (click on original frame only).
+      if (!userVideoUrl || learnerOverlay !== 'none') return;
+
+      const container = e.currentTarget;
+      const rect = container.getBoundingClientRect();
+      const normalizedX = (e.clientX - rect.left) / rect.width;
+      const normalizedY = (e.clientY - rect.top) / rect.height;
+
+      // Compute actual video pixel coordinates from the natural video size.
+      const videoEl = learnerVideoRef.current;
+      const pixelX = videoEl
+        ? normalizedX * videoEl.videoWidth
+        : normalizedX * rect.width;
+      const pixelY = videoEl
+        ? normalizedY * videoEl.videoHeight
+        : normalizedY * rect.height;
+
+      setSam2InitPoint({ normalizedX, normalizedY, pixelX, pixelY });
+    },
+    [userVideoUrl, learnerOverlay],
+  );
 
   // ── Video helpers ────────────────────────────────────────────────────────
 
@@ -1200,7 +1249,9 @@ export default function CompareStudio() {
                   aspectRatio: '16/9',
                   marginBottom: 'var(--space-sm)',
                   position: 'relative',
+                  cursor: learnerOverlay === 'none' ? 'crosshair' : 'default',
                 }}
+                onClick={handleLearnerVideoClick}
               >
                 <video
                   key={learnerVideoSource ?? userVideoUrl}
@@ -1215,6 +1266,72 @@ export default function CompareStudio() {
                       setLearnerDuration(learnerVideoRef.current.duration);
                   }}
                 />
+
+                {/* SAM2 init-point marker — shows the click point + constraint box */}
+                {sam2InitPoint && learnerOverlay === 'none' && (() => {
+                  const videoEl = learnerVideoRef.current;
+                  const natW = videoEl?.videoWidth || 1;
+                  const natH = videoEl?.videoHeight || 1;
+                  // Convert box_half_size (video pixels) to % of container
+                  const boxHalfPctX = (sam2BoxHalfSize / natW) * 100;
+                  const boxHalfPctY = (sam2BoxHalfSize / natH) * 100;
+                  const cx = sam2InitPoint.normalizedX * 100;
+                  const cy = sam2InitPoint.normalizedY * 100;
+                  return (
+                    <svg
+                      style={{
+                        position: 'absolute',
+                        top: 0,
+                        left: 0,
+                        width: '100%',
+                        height: '100%',
+                        pointerEvents: 'none',
+                        overflow: 'visible',
+                      }}
+                    >
+                      {/* Constraint box outline */}
+                      <rect
+                        x={`${cx - boxHalfPctX}%`}
+                        y={`${cy - boxHalfPctY}%`}
+                        width={`${boxHalfPctX * 2}%`}
+                        height={`${boxHalfPctY * 2}%`}
+                        fill="rgba(249,115,22,0.08)"
+                        stroke="#f97316"
+                        strokeWidth="1.5"
+                        strokeDasharray="4 3"
+                        rx="2"
+                      />
+                      {/* Crosshair arms */}
+                      <line
+                        x1={`${cx}%`}
+                        y1={`calc(${cy}% - 18px)`}
+                        x2={`${cx}%`}
+                        y2={`calc(${cy}% + 18px)`}
+                        stroke="#f97316"
+                        strokeWidth="2"
+                        opacity="0.95"
+                      />
+                      <line
+                        x1={`calc(${cx}% - 18px)`}
+                        y1={`${cy}%`}
+                        x2={`calc(${cx}% + 18px)`}
+                        y2={`${cy}%`}
+                        stroke="#f97316"
+                        strokeWidth="2"
+                        opacity="0.95"
+                      />
+                      {/* Center dot */}
+                      <circle
+                        cx={`${cx}%`}
+                        cy={`${cy}%`}
+                        r="3.5"
+                        fill="#f97316"
+                        opacity="1"
+                      />
+                    </svg>
+                  );
+                })()}
+
                 {learnerOverlay === 'mediapipe' && mediapipeRun?.annotated_video_url && (
                   <span
                     className="badge badge-blue"
@@ -2059,20 +2176,119 @@ export default function CompareStudio() {
                       >
                         <Scissors size={18} style={{ color: 'var(--accent-primary)' }} />
                         <span className="text-small" style={{ fontWeight: 600 }}>
-                          Hand Segmentation (SAM2)
+                          Object Segmentation (SAM2)
                         </span>
                       </div>
-                      <p
-                        className="text-small"
-                        style={{ color: 'var(--text-muted)', margin: 0 }}
+
+                      {/* ── Instruction block ── */}
+                      <div
+                        style={{
+                          background: 'var(--bg-tertiary)',
+                          border: '1px solid var(--border-default)',
+                          borderRadius: 'var(--radius-md)',
+                          padding: 'var(--space-sm) var(--space-md)',
+                          display: 'flex',
+                          flexDirection: 'column',
+                          gap: 'var(--space-xs)',
+                        }}
                       >
-                        Run the MediaPipe -&gt; SAM2 pipeline on your practice
-                        video. MediaPipe builds the initialization prompt
-                        automatically; SAM2 then segments the hand and writes
-                        the annotated video, masks and summary. Toggle
-                        between Original / MediaPipe / SAM2 above the learner
-                        video to compare outputs.
-                      </p>
+                        <span className="text-small" style={{ fontWeight: 600, color: 'var(--text-primary)' }}>
+                          How to initialize SAM2
+                        </span>
+                        <p className="text-small" style={{ color: 'var(--text-secondary)', margin: 0 }}>
+                          Click directly on the object you want to track in the
+                          video on the left. An orange crosshair will appear at
+                          your selection.
+                        </p>
+                        <p
+                          className="text-small"
+                          style={{
+                            color: 'var(--warning, #f59e0b)',
+                            margin: 0,
+                            fontWeight: 500,
+                          }}
+                        >
+                          Click accurately — if the point is wrong, tracking
+                          will fail.
+                        </p>
+                      </div>
+
+                      {/* ── Box size control ── */}
+                      <div>
+                        <div
+                          style={{
+                            display: 'flex',
+                            justifyContent: 'space-between',
+                            alignItems: 'center',
+                            marginBottom: 'var(--space-xs)',
+                          }}
+                        >
+                          <span className="label" style={{ margin: 0 }}>
+                            Constraint box half-size
+                          </span>
+                          <span
+                            className="text-small"
+                            style={{ color: 'var(--text-secondary)', fontFamily: 'var(--font-mono)' }}
+                          >
+                            {sam2BoxHalfSize} px → {sam2BoxHalfSize * 2}×{sam2BoxHalfSize * 2} px
+                          </span>
+                        </div>
+                        <Slider
+                          value={[sam2BoxHalfSize]}
+                          min={10}
+                          max={120}
+                          step={5}
+                          onValueChange={([v]) => setSam2BoxHalfSize(v)}
+                        />
+                        <p
+                          className="text-small"
+                          style={{ color: 'var(--text-muted)', margin: '4px 0 0', fontSize: '0.68rem' }}
+                        >
+                          Smaller = tighter focus on the pen. Increase only if the object is large.
+                        </p>
+                      </div>
+
+                      {/* ── Point status ── */}
+                      {userVideo && (
+                        <div
+                          style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: 'var(--space-sm)',
+                            padding: 'var(--space-xs) var(--space-sm)',
+                            borderRadius: 'var(--radius-sm)',
+                            background: sam2InitPoint
+                              ? 'rgba(249,115,22,0.08)'
+                              : 'var(--bg-tertiary)',
+                            border: `1px solid ${sam2InitPoint ? '#f97316' : 'var(--border-default)'}`,
+                          }}
+                        >
+                          <div
+                            style={{
+                              width: 10,
+                              height: 10,
+                              borderRadius: '50%',
+                              background: sam2InitPoint ? '#f97316' : 'var(--text-muted)',
+                              flexShrink: 0,
+                            }}
+                          />
+                          <span className="text-small" style={{ color: sam2InitPoint ? '#f97316' : 'var(--text-muted)' }}>
+                            {sam2InitPoint
+                              ? `Point selected (${Math.round(sam2InitPoint.pixelX)}, ${Math.round(sam2InitPoint.pixelY)})`
+                              : 'No point selected — click on the video'}
+                          </span>
+                          {sam2InitPoint && (
+                            <button
+                              type="button"
+                              className="btn btn-ghost"
+                              style={{ marginLeft: 'auto', fontSize: '0.7rem', padding: '2px 6px' }}
+                              onClick={() => setSam2InitPoint(null)}
+                            >
+                              Clear
+                            </button>
+                          )}
+                        </div>
+                      )}
 
                       <button
                         className="btn btn-primary"
@@ -2083,8 +2299,15 @@ export default function CompareStudio() {
                           justifyContent: 'center',
                           gap: 'var(--space-xs)',
                         }}
-                        disabled={!userVideo || isSam2LearnerProcessing}
+                        disabled={!userVideo || !sam2InitPoint || isSam2LearnerProcessing}
                         onClick={runSam2Learner}
+                        title={
+                          !userVideo
+                            ? 'Upload a practice video first'
+                            : !sam2InitPoint
+                              ? 'Click on the video to select the tracking point first'
+                              : undefined
+                        }
                       >
                         {isSam2LearnerProcessing ? (
                           <>
@@ -2092,7 +2315,7 @@ export default function CompareStudio() {
                               size={14}
                               style={{ animation: 'spin 1s linear infinite' }}
                             />
-                            Processing (MediaPipe -&gt; SAM2)...
+                            Processing SAM2...
                           </>
                         ) : (
                           <>
@@ -2283,8 +2506,8 @@ export default function CompareStudio() {
                                   fontSize: '0.7rem',
                                 }}
                               >
-                                Point + bounding box used to initialize SAM2
-                                on the first valid MediaPipe frame.
+                                Manually selected point + local bounding box
+                                used to initialize SAM2 on frame 0.
                               </span>
                             </div>
                           )}

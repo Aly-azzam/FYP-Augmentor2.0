@@ -67,6 +67,7 @@ from app.services.sam2.pipeline_service import (
     SAM2ContractArtifacts,
     SAM2PipelineError,
     copy_contract_artifacts_to,
+    run_sam2_from_manual_prompt,
     run_sam2_from_mediapipe_prompt,
 )
 from app.services.sam2.sam2_service import (
@@ -506,6 +507,9 @@ def register_expert_sam2_reference(
     overwrite: bool = False,
     render_annotation: bool = True,
     pipeline_version: Optional[str] = None,
+    init_x: Optional[float] = None,
+    init_y: Optional[float] = None,
+    box_half_size: int = 40,
 ) -> ExpertSam2Reference:
     """One-time preprocessing of an expert reference video with SAM 2.
 
@@ -515,8 +519,10 @@ def register_expert_sam2_reference(
         2. If already completed and ``overwrite=False``, return as-is.
         3. Ensure the stable expert SAM 2 folder exists.
         4. Copy the source video into the stable folder as ``source.mp4``.
-        5. Run the SAM 2 pipeline seeded from the expert's MediaPipe
-           features.json (no UI clicks, ever).
+        5a. If ``init_x`` and ``init_y`` are provided: build the SAM 2
+            prompt from the manual coordinate (no MediaPipe dependency).
+        5b. Otherwise: seed from the expert's MediaPipe features.json
+            (legacy path, kept for backward compatibility).
         6. Copy raw/summary/metadata (+ optional annotated) into the
            stable folder.
         7. Parse ``metadata.json`` + ``summary.json`` to extract summary fields.
@@ -546,7 +552,14 @@ def register_expert_sam2_reference(
         )
 
     # Case B/C: fresh processing (or overwrite / incomplete) — run the pipeline.
-    mediapipe_features_path = _resolve_expert_mediapipe_features_path(video)
+    # If manual x,y were given, skip MediaPipe entirely.
+    use_manual = init_x is not None and init_y is not None
+
+    if not use_manual:
+        # Legacy: seed from expert MediaPipe features (requires prior mediapipe run).
+        mediapipe_features_path = _resolve_expert_mediapipe_features_path(video)
+    else:
+        mediapipe_features_path = None  # not used
 
     _mark_status(db, video, STATUS_PROCESSING)
 
@@ -563,12 +576,26 @@ def register_expert_sam2_reference(
             override_video_path=video_path,
         )
 
-        artifacts: SAM2ContractArtifacts = run_sam2_from_mediapipe_prompt(
-            source_in_expert,
-            mediapipe_features_path,
-            run_id=temp_run_id,
-            render_annotation=render_annotation,
-        )
+        if use_manual:
+            logger.info(
+                "Expert SAM 2 using MANUAL prompt (%.1f, %.1f) box_half=%d for %s",
+                init_x, init_y, box_half_size, expert_code,
+            )
+            artifacts: SAM2ContractArtifacts = run_sam2_from_manual_prompt(
+                source_in_expert,
+                init_x=float(init_x),
+                init_y=float(init_y),
+                box_half_size=box_half_size,
+                run_id=temp_run_id,
+                render_annotation=render_annotation,
+            )
+        else:
+            artifacts = run_sam2_from_mediapipe_prompt(
+                source_in_expert,
+                mediapipe_features_path,
+                run_id=temp_run_id,
+                render_annotation=render_annotation,
+            )
         temp_run_dir = artifacts.run_dir
 
         paths = copy_contract_artifacts_to(

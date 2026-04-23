@@ -67,6 +67,8 @@ from app.core.sam2_constants import (
     SAM2_PROMPT_SOURCE_MEDIAPIPE,
     SAM2_PROMPT_TYPE_BOX,
     SAM2_PROMPT_TYPE_POINT,
+    SAM2_PEN_TIP_BOX_SIZE_PX,
+    SAM2_PEN_TIP_OFFSET_PX,
     SAM2_RUNS_SUBDIR,
     SAM2_WORKING_REGION_BBOX_QUANTILE,
     SAM2_WORKING_REGION_PADDING_PX,
@@ -577,6 +579,162 @@ def _frame_normalized_bbox(frame: Any) -> Optional[Tuple[float, float, float, fl
     return min(xs), min(ys), max(xs), max(ys)
 
 
+def _absolute_landmark_from_wrist_relative(
+    frame: Any,
+    landmark_name: str,
+) -> Optional[Tuple[float, float]]:
+    """Return absolute normalized (x, y) for one wrist-relative landmark."""
+    wrist = getattr(frame, "wrist", None)
+    relative = getattr(frame, "wrist_relative_landmarks", None)
+    if not wrist or len(wrist) < 2 or not relative or not isinstance(relative, dict):
+        return None
+    offset = relative.get(landmark_name)
+    if not offset or len(offset) < 2:
+        return None
+    wx, wy = float(wrist[0]), float(wrist[1])
+    return wx + float(offset[0]), wy + float(offset[1])
+
+
+def _estimate_pen_tip_for_frame(
+    frame: Any,
+    *,
+    image_width: int,
+    image_height: int,
+    offset_px: float = SAM2_PEN_TIP_OFFSET_PX,
+) -> Optional[Dict[str, Any]]:
+    """Estimate robust action point from multiple pen-tip candidates."""
+    index_mcp_n = _absolute_landmark_from_wrist_relative(frame, "index_finger_mcp")
+    index_tip_n = _absolute_landmark_from_wrist_relative(frame, "index_finger_tip")
+    thumb_tip_n = _absolute_landmark_from_wrist_relative(frame, "thumb_tip")
+    if index_mcp_n is None or index_tip_n is None or thumb_tip_n is None:
+        return None
+
+    index_mcp_px = normalized_to_pixel_coords(
+        index_mcp_n[0], index_mcp_n[1], image_width, image_height
+    )
+    index_tip_px = normalized_to_pixel_coords(
+        index_tip_n[0], index_tip_n[1], image_width, image_height
+    )
+    thumb_tip_px = normalized_to_pixel_coords(
+        thumb_tip_n[0], thumb_tip_n[1], image_width, image_height
+    )
+
+    grip_center_px = (
+        (float(index_tip_px[0]) + float(thumb_tip_px[0])) * 0.5,
+        (float(index_tip_px[1]) + float(thumb_tip_px[1])) * 0.5,
+    )
+    index_pip_n = _absolute_landmark_from_wrist_relative(frame, "index_finger_pip")
+    index_pip_px: Optional[Tuple[float, float]] = None
+    if index_pip_n is not None:
+        index_pip_px = normalized_to_pixel_coords(
+            index_pip_n[0], index_pip_n[1], image_width, image_height
+        )
+
+    dir_x = float(index_tip_px[0]) - float(index_mcp_px[0])
+    dir_y = float(index_tip_px[1]) - float(index_mcp_px[1])
+    norm = float(np.hypot(dir_x, dir_y))
+    if norm <= 1e-6:
+        return None
+    dir_x /= norm
+    dir_y /= norm
+
+    def _clamp_xy(x: float, y: float) -> Tuple[float, float]:
+        return (
+            max(0.0, min(float(image_width - 1), float(x))),
+            max(0.0, min(float(image_height - 1), float(y))),
+        )
+
+    candidate_points: Dict[str, Tuple[float, float]] = {
+        "index_tip": _clamp_xy(float(index_tip_px[0]), float(index_tip_px[1])),
+        "grip_center": _clamp_xy(float(grip_center_px[0]), float(grip_center_px[1])),
+        "extended_from_index_tip": _clamp_xy(
+            float(index_tip_px[0]) + dir_x * float(offset_px),
+            float(index_tip_px[1]) + dir_y * float(offset_px),
+        ),
+        "extended_from_grip_center": _clamp_xy(
+            float(grip_center_px[0]) + dir_x * float(offset_px),
+            float(grip_center_px[1]) + dir_y * float(offset_px),
+        ),
+    }
+    if index_pip_px is not None:
+        candidate_points["index_pip"] = _clamp_xy(
+            float(index_pip_px[0]),
+            float(index_pip_px[1]),
+        )
+
+    bbox_n = _frame_normalized_bbox(frame)
+    if bbox_n is not None:
+        bx0, by0, bx1, by1 = (float(v) for v in bbox_n)
+        bx0 *= float(image_width)
+        bx1 *= float(image_width)
+        by0 *= float(image_height)
+        by1 *= float(image_height)
+        hand_diag = float(np.hypot(max(1.0, bx1 - bx0), max(1.0, by1 - by0)))
+        expanded = (
+            bx0 - 0.20 * (bx1 - bx0),
+            by0 - 0.20 * (by1 - by0),
+            bx1 + 0.20 * (bx1 - bx0),
+            by1 + 0.20 * (by1 - by0),
+        )
+    else:
+        hand_diag = float(max(image_width, image_height)) * 0.25
+        expanded = (0.0, 0.0, float(image_width - 1), float(image_height - 1))
+
+    def _point_in_rect(x: float, y: float, rect: Tuple[float, float, float, float]) -> bool:
+        return rect[0] <= x <= rect[2] and rect[1] <= y <= rect[3]
+
+    candidate_scores: Dict[str, float] = {}
+    for name, (cx, cy) in candidate_points.items():
+        score = 0.0
+        if _point_in_rect(cx, cy, expanded):
+            score += 2.0
+        else:
+            score -= 2.0
+
+        dist_to_grip = float(np.hypot(cx - grip_center_px[0], cy - grip_center_px[1]))
+        target_dist = float(offset_px) * 0.8
+        score -= abs(dist_to_grip - target_dist) / max(1.0, 0.6 * float(offset_px))
+
+        dist_to_wrist = float(np.hypot(cx - index_mcp_px[0], cy - index_mcp_px[1]))
+        if dist_to_wrist < 0.18 * hand_diag:
+            score -= 1.25
+        else:
+            score += 0.5
+
+        if name.startswith("extended_from_"):
+            score += 0.35
+
+        candidate_scores[name] = float(score)
+
+    selected_name = max(candidate_scores.keys(), key=lambda k: candidate_scores[k])
+    pen_tip_x, pen_tip_y = candidate_points[selected_name]
+    pen_tip_n = [
+        float(pen_tip_x) / float(max(1, image_width)),
+        float(pen_tip_y) / float(max(1, image_height)),
+    ]
+
+    return {
+        "point_xy": [float(pen_tip_x), float(pen_tip_y)],
+        "normalized_xy": pen_tip_n,
+        "selected_candidate": selected_name,
+        "candidate_points_xy": {
+            name: [float(x), float(y)] for name, (x, y) in candidate_points.items()
+        },
+        "candidate_scores": dict(candidate_scores),
+        "debug_points_xy": {
+            "index_mcp": [float(index_mcp_px[0]), float(index_mcp_px[1])],
+            "index_tip": [float(index_tip_px[0]), float(index_tip_px[1])],
+            "thumb_tip": [float(thumb_tip_px[0]), float(thumb_tip_px[1])],
+            "grip_center": [float(grip_center_px[0]), float(grip_center_px[1])],
+            **{
+                f"candidate_{name}": [float(x), float(y)]
+                for name, (x, y) in candidate_points.items()
+            },
+            "selected_pen_tip": [float(pen_tip_x), float(pen_tip_y)],
+        },
+    }
+
+
 def collect_first_n_valid_prompt_frames(
     features_document: MediaPipeFeaturesDocument,
     *,
@@ -584,39 +742,57 @@ def collect_first_n_valid_prompt_frames(
     fallback_order: Sequence[str] = DEFAULT_LANDMARK_FALLBACK_ORDER,
     start_frame_index: int = 0,
     max_frames: int = SAM2_PROMPT_AVERAGE_FRAME_COUNT,
+    image_width: Optional[int] = None,
+    image_height: Optional[int] = None,
+    pen_tip_offset_px: float = SAM2_PEN_TIP_OFFSET_PX,
 ) -> List[Dict[str, Any]]:
     """Collect up to ``max_frames`` valid MediaPipe prompt candidates.
 
-    For each frame we record the chosen anchor landmark (normalized) and
-    the normalized hand bounding box (when MediaPipe produced one). This
-    backs both the simple "first N consecutive" averaging path and the
-    larger candidate pool consumed by ``select_best_prompt_window``.
+    For each frame we estimate a pen-tip proxy from hand geometry:
+        index_mcp, index_tip, thumb_tip -> grip_center + direction * offset.
     """
     collected: List[Dict[str, Any]] = []
     if max_frames <= 0:
         return collected
+    if image_width is None or image_height is None:
+        raise SAM2InitError(
+            "collect_first_n_valid_prompt_frames requires image_width/image_height "
+            "for pen-tip estimation."
+        )
 
     for frame in features_document.frames:
         if int(frame.frame_index) < int(start_frame_index):
             continue
 
-        result = select_prompt_point_from_mediapipe_frame(
-            frame,
-            preferred_landmark=preferred_landmark,
-            fallback_order=fallback_order,
-        )
-        if result is None:
+        if not bool(getattr(frame, "has_detection", False)):
             continue
 
-        (nx, ny), source_alias = result
+        pen_tip = _estimate_pen_tip_for_frame(
+            frame,
+            image_width=int(image_width),
+            image_height=int(image_height),
+            offset_px=float(pen_tip_offset_px),
+        )
+        if pen_tip is None:
+            continue
+
+        nx, ny = float(pen_tip["normalized_xy"][0]), float(pen_tip["normalized_xy"][1])
         collected.append(
             {
                 "frame_index": int(frame.frame_index),
                 "timestamp_sec": float(frame.timestamp_sec),
-                "normalized_xy": [float(nx), float(ny)],
-                "source": source_alias,
+                "normalized_xy": [nx, ny],
+                "point_xy": [
+                    float(pen_tip["point_xy"][0]),
+                    float(pen_tip["point_xy"][1]),
+                ],
+                "source": "estimated_pen_tip",
+                "selected_candidate": str(pen_tip.get("selected_candidate") or "unknown"),
+                "candidate_points_xy": dict(pen_tip.get("candidate_points_xy") or {}),
+                "candidate_scores": dict(pen_tip.get("candidate_scores") or {}),
                 "handedness": getattr(frame, "handedness", None),
                 "normalized_bbox": _frame_normalized_bbox(frame),
+                "debug_points_xy": dict(pen_tip["debug_points_xy"]),
             }
         )
         if len(collected) >= int(max_frames):
@@ -651,7 +827,7 @@ def _score_candidate(
     # means we're closer to the canonical action anchor.
     if source == preferred_landmark:
         score += 1.0
-    else:
+    elif preferred_landmark:
         reasons.append(f"used_fallback:{source}")
 
     point_in_bounds = (
@@ -1064,21 +1240,12 @@ def build_sam2_auto_prompt(
     min_bbox_area_ratio: float = SAM2_PROMPT_MIN_BBOX_AREA_RATIO,
     max_bbox_area_ratio: float = SAM2_PROMPT_MAX_BBOX_AREA_RATIO,
     border_margin_norm: float = SAM2_PROMPT_BORDER_MARGIN_NORM,
+    pen_tip_offset_px: float = SAM2_PEN_TIP_OFFSET_PX,
+    pen_tip_box_size_px: float = SAM2_PEN_TIP_BOX_SIZE_PX,
 ) -> Dict[str, Any]:
     """Automatically derive a SAM 2 prompt from a MediaPipe features.json.
 
-    Selection logic:
-
-    1. Collect a pool of up to ``candidate_pool_size`` valid MediaPipe
-       frames starting from ``start_frame_index``.
-    2. Score every candidate with simple heuristics (bbox area not too
-       tiny / not too huge, bbox away from image borders, anchor point
-       inside bbox, preferred landmark rather than a fallback).
-    3. Slide an ``average_frame_count``-wide window over the scored pool
-       and pick the window with the best combined score + stability.
-    4. Average the anchor point and union the hand bboxes across the
-       chosen window (see ``_aggregate_box_and_point``) — the box also
-       gets padded by ``box_padding_ratio`` and clamped to the frame.
+    Build prompt from estimated pen-tip geometry, not raw fingertip.
     """
     path = Path(mediapipe_features_path)
     features_document = load_mediapipe_features(path)
@@ -1093,6 +1260,9 @@ def build_sam2_auto_prompt(
         fallback_order=fallback_order,
         start_frame_index=start_frame_index,
         max_frames=max(int(average_frame_count), int(candidate_pool_size)),
+        image_width=effective_width,
+        image_height=effective_height,
+        pen_tip_offset_px=float(pen_tip_offset_px),
     )
     if not pool:
         raise SAM2InitError(
@@ -1116,21 +1286,22 @@ def build_sam2_auto_prompt(
             f"in features.json at {path}."
         )
 
-    # Restore the original behavior used by the known-good learner run:
-    # initialize on the first valid detected frame.
     selection = chosen_window[0]
-    aggregate = _aggregate_box_and_point(
-        chosen_window,
-        image_width=effective_width,
-        image_height=effective_height,
-        padding_ratio=box_padding_ratio,
-    )
+    point_xy = [
+        float(selection["point_xy"][0]),
+        float(selection["point_xy"][1]),
+    ]
+    point_nx = float(selection["normalized_xy"][0])
+    point_ny = float(selection["normalized_xy"][1])
+    half = max(8.0, float(pen_tip_box_size_px) * 0.5)
+    x_min = max(0.0, float(point_xy[0]) - half)
+    y_min = max(0.0, float(point_xy[1]) - half)
+    x_max = min(float(effective_width - 1), float(point_xy[0]) + half)
+    y_max = min(float(effective_height - 1), float(point_xy[1]) + half)
+    box_xyxy = [x_min, y_min, x_max, y_max]
 
-    used_fallback = selection["source"] != preferred_landmark
+    used_fallback = False
     averaged_frame_indices = [int(f["frame_index"]) for f in chosen_window]
-    point_xy = aggregate["point_xy"]
-    box_xyxy = aggregate["box_xyxy"]
-    point_nx, point_ny = (float(v) for v in aggregate["point_normalized_xy"])
     point_inside_box: Optional[bool] = None
     bbox_area_ratio: Optional[float] = None
     bbox_too_large: Optional[bool] = None
@@ -1148,7 +1319,7 @@ def build_sam2_auto_prompt(
         "bbox_area_ratio": bbox_area_ratio,
         "bbox_too_large": bbox_too_large,
         "bbox_drifting_background": None,
-        "point_near_action_zone": bool(selection.get("source") == LANDMARK_ALIAS_INDEX_TIP),
+        "point_near_action_zone": True,
     }
 
     scored_frame_debug = [
@@ -1167,14 +1338,20 @@ def build_sam2_auto_prompt(
         }
         for c in chosen_window
     ]
+    selected_candidate_name = str(selection.get("selected_candidate") or "unknown")
+    candidate_points_xy = dict(selection.get("candidate_points_xy") or {})
+    candidate_scores = dict(selection.get("candidate_scores") or {})
 
     return {
         "frame_index": int(selection["frame_index"]),
         "timestamp_sec": float(selection["timestamp_sec"]),
         "point_xy": [float(point_xy[0]), float(point_xy[1])],
         "box_xyxy": box_xyxy,
-        "box_source": aggregate["box_source"],
+        "box_source": "pen_tip_local_box",
         "source": selection["source"],
+        "selected_candidate_name": selected_candidate_name,
+        "candidate_points_xy": candidate_points_xy,
+        "candidate_scores": candidate_scores,
         # Debug / provenance fields (useful in CLI logs + API responses):
         "preferred_landmark": preferred_landmark,
         "used_fallback": used_fallback,
@@ -1186,19 +1363,19 @@ def build_sam2_auto_prompt(
         "prompt_source": SAM2_PROMPT_SOURCE_MEDIAPIPE,
         "averaged_frame_count": len(chosen_window),
         "averaged_frame_indices": averaged_frame_indices,
-        "point_reanchored_to_box_center": bool(
-            aggregate.get("point_reanchored_to_box_center", False)
-        ),
+        "point_reanchored_to_box_center": False,
         "selection_diagnostics": {
             "selection_mode": "first_valid_window",
             "candidate_pool_size": len(scored_pool),
             "window_size": window_size,
             "selected_frame_index": int(selection["frame_index"]),
             "selected_reasons": list(selection.get("score", {}).get("reasons", [])),
+            "selected_action_candidate": selected_candidate_name,
         },
         "prompt_validation": prompt_validation,
         "hand_bbox_xyxy_px": None,
         "local_box_diagnostics": None,
+        "init_debug_points_xy": dict(selection.get("debug_points_xy") or {}),
         "scored_window_frames": scored_frame_debug,
     }
 
@@ -1261,6 +1438,9 @@ def build_init_prompt_from_mediapipe(
         "prompt_validation": auto.get("prompt_validation"),
         "local_box_diagnostics": auto.get("local_box_diagnostics"),
         "hand_bbox_xyxy_px": auto.get("hand_bbox_xyxy_px"),
+        "selected_candidate_name": auto.get("selected_candidate_name"),
+        "candidate_points_xy": auto.get("candidate_points_xy"),
+        "candidate_scores": auto.get("candidate_scores"),
     }
     logger.info("SAM2 auto-init prompt resolved: %s", log_payload)
 
@@ -1598,6 +1778,7 @@ def _save_init_prompt_debug_image(
     prompt: SAM2InitPrompt,
     output_path: Path,
     label: Optional[str] = None,
+    debug_points_xy: Optional[Dict[str, List[float]]] = None,
 ) -> Optional[Path]:
     """Draw the point and/or box on the init frame and save it.
 
@@ -1647,6 +1828,37 @@ def _save_init_prompt_debug_image(
         # Outer black ring then inner green dot for visibility on any bg.
         cv2.circle(annotated, (px, py), radius=8, color=(0, 0, 0), thickness=2)
         cv2.circle(annotated, (px, py), radius=5, color=(0, 255, 0), thickness=-1)
+
+    if debug_points_xy:
+        point_colors: Dict[str, tuple[int, int, int]] = {
+            "index_mcp": (255, 255, 0),    # cyan
+            "index_tip": (0, 255, 0),      # green
+            "thumb_tip": (255, 0, 255),    # magenta
+            "grip_center": (255, 165, 0),  # orange
+            "selected_pen_tip": (0, 0, 255),  # red
+            "candidate_index_tip": (0, 255, 0),
+            "candidate_grip_center": (255, 165, 0),
+            "candidate_extended_from_index_tip": (0, 200, 255),
+            "candidate_extended_from_grip_center": (255, 200, 0),
+            "candidate_index_pip": (180, 180, 255),
+        }
+        for key, raw_xy in debug_points_xy.items():
+            if not raw_xy or len(raw_xy) < 2:
+                continue
+            px = max(0, min(image_width - 1, int(round(float(raw_xy[0])))))
+            py = max(0, min(image_height - 1, int(round(float(raw_xy[1])))))
+            color = point_colors.get(key, (200, 200, 200))
+            cv2.circle(annotated, (px, py), radius=4, color=color, thickness=-1)
+            cv2.putText(
+                annotated,
+                key,
+                (px + 6, py - 6),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.4,
+                color,
+                1,
+                cv2.LINE_AA,
+            )
 
     if label:
         try:
@@ -1940,6 +2152,7 @@ def run_sam2_pipeline(
     frame_stride: int = SAM2_DEFAULT_FRAME_STRIDE,
     render_annotation: bool = True,
     device: Optional[str] = None,
+    init_debug_points_xy: Optional[Dict[str, List[float]]] = None,
 ) -> SAM2RunArtifacts:
     """Run SAM 2 on a single video and persist all artifacts.
 
@@ -2050,6 +2263,7 @@ def run_sam2_pipeline(
             prompt=init_prompt,
             output_path=run_dir / SAM2_INIT_DEBUG_IMAGE_FILENAME,
             label=debug_label,
+            debug_points_xy=init_debug_points_xy,
         )
     except Exception as exc:  # noqa: BLE001 - debug artifact is best-effort
         warnings.append(f"init_debug_image_failed: {exc}")

@@ -4,22 +4,23 @@ This is the MAIN way expert reference videos are preprocessed with SAM 2.
 It must NEVER be invoked from the learner compare / evaluation path at
 runtime — it is a manual, offline tool.
 
-SAM 2 is initialized automatically from the expert's MediaPipe features,
-so the MediaPipe expert flow must run FIRST. A typical end-to-end admin
-session looks like:
+SAM 2 initialization is now MANUAL: you must supply the pixel coordinate
+of the object to track via --x and --y.  MediaPipe is no longer used to
+derive the SAM 2 initialization prompt.
 
-    # 1) MediaPipe
-    python -m app.scripts.process_expert_mediapipe --expert_code <uuid>
+A typical end-to-end admin session:
 
-    # 2) SAM 2
-    python -m app.scripts.process_expert_sam2 --expert_code <uuid>
+    # Run SAM 2 with a manually clicked point
+    python -m app.scripts.process_expert_sam2 \
+        --expert_code <uuid> --x 640 --y 360
 
     python -m app.scripts.process_expert_sam2 \
-        --chapter_id <chapter_uuid> --overwrite
+        --chapter_id <chapter_uuid> --x 512 --y 280 --overwrite
 
     python -m app.scripts.process_expert_sam2 \
         --expert_code <uuid> \
-        --video_path C:/path/to/raw/expert.mp4
+        --video_path C:/path/to/raw/expert.mp4 \
+        --x 640 --y 360
 
 Positional semantics:
     --expert_code     The expert Video row's UUID (canonical expert
@@ -31,6 +32,10 @@ Positional semantics:
                       omitted, the MediaPipe expert ``source.mp4`` is
                       used if present, otherwise the path stored on the
                       Video row.
+    --x               X pixel coordinate of the object to track
+                      (mandatory for SAM 2 manual initialization).
+    --y               Y pixel coordinate of the object to track
+                      (mandatory for SAM 2 manual initialization).
     --overwrite       Rerun SAM 2 and replace any previously saved outputs.
 """
 
@@ -71,7 +76,16 @@ def _build_parser() -> argparse.ArgumentParser:
         description=(
             "Run SAM 2 preprocessing on an expert reference video once and "
             "save the outputs under storage/expert/sam2/<expert_code>/. "
-            "Requires that process_expert_mediapipe was run first."
+            "SAM 2 initialization is MANUAL: you must supply the pixel "
+            "coordinate of the object to track via --x and --y."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  python -m app.scripts.process_expert_sam2 \\\n"
+            "      --expert_code <uuid> --x 640 --y 360\n\n"
+            "  python -m app.scripts.process_expert_sam2 \\\n"
+            "      --chapter_id <chapter_uuid> --x 512 --y 280 --overwrite\n"
         ),
     )
     parser.add_argument(
@@ -99,6 +113,35 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Optional override for the source video path. Absolute path, "
             "CWD-relative path, or storage-relative key."
+        ),
+    )
+    parser.add_argument(
+        "--x",
+        dest="init_x",
+        type=float,
+        default=None,
+        help=(
+            "X pixel coordinate of the object to track (manual SAM 2 init). "
+            "Required unless --overwrite is used on an already-processed expert "
+            "that should reuse MediaPipe-derived results (legacy)."
+        ),
+    )
+    parser.add_argument(
+        "--y",
+        dest="init_y",
+        type=float,
+        default=None,
+        help="Y pixel coordinate of the object to track (manual SAM 2 init).",
+    )
+    parser.add_argument(
+        "--box_half_size",
+        dest="box_half_size",
+        type=int,
+        default=40,
+        help=(
+            "Half-side of the local constraint box around the clicked point (pixels). "
+            "Default 40 → 80×80 px total box. Keep small to prevent SAM 2 from "
+            "selecting large background regions like a notebook. (default: 40)"
         ),
     )
     parser.add_argument(
@@ -132,6 +175,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     if expert_code is None and args.chapter_id is None:
         parser.error("Provide --expert_code (or --expert_video_id) or --chapter_id.")
 
+    # Validate that --x and --y are either both given or both omitted.
+    if (args.init_x is None) != (args.init_y is None):
+        parser.error("--x and --y must be provided together.")
+
     expert_video_id = _parse_uuid(expert_code, field="--expert_code")
     chapter_id = _parse_uuid(args.chapter_id, field="--chapter_id")
 
@@ -148,13 +195,17 @@ def main(argv: Optional[list[str]] = None) -> int:
             video_path=video_path_arg,
             overwrite=args.overwrite,
             render_annotation=not args.no_annotation,
+            init_x=args.init_x,
+            init_y=args.init_y,
+            box_half_size=args.box_half_size,
         )
     except ExpertNotFoundError as exc:
         print(f"[FAIL] Expert not found: {exc}", file=sys.stderr)
         return 2
     except ExpertMediaPipeMissingError as exc:
         print(
-            f"[FAIL] MediaPipe expert reference is required first: {exc}",
+            f"[FAIL] MediaPipe expert reference is missing: {exc}\n"
+            "       Tip: provide --x <X> --y <Y> to skip MediaPipe and use a manual point.",
             file=sys.stderr,
         )
         return 3
