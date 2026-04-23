@@ -24,7 +24,7 @@ import logging
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 from app.core.config import settings
@@ -62,6 +62,7 @@ from app.services.sam2.sam2_service import (
     SAM2InitError,
     SAM2RunArtifacts,
     build_init_prompt_from_mediapipe,
+    build_sam2_auto_prompt,
     run_sam2_pipeline,
 )
 from app.utils.sam2.sam2_utils import LANDMARK_ALIAS_INDEX_TIP
@@ -325,6 +326,39 @@ def run_sam2_from_mediapipe_prompt(
         preferred_landmark=preferred_landmark,
         target_object_id=target_object_id,
     )
+    auto_prompt = build_sam2_auto_prompt(
+        mediapipe_features_path,
+        image_width=image_width,
+        image_height=image_height,
+        preferred_landmark=preferred_landmark,
+    )
+    point_xy = auto_prompt["point_xy"]
+    box_xyxy = auto_prompt.get("box_xyxy")
+    run_context = "expert" if str(effective_run_id).startswith("expert_sam2_") else "learner"
+    prompt_debug_payload: Dict[str, Any] = {
+        "run_id": effective_run_id,
+        "run_context": run_context,
+        "frame_index": int(auto_prompt["frame_index"]),
+        "timestamp_sec": float(auto_prompt["timestamp_sec"]),
+        "point_xy": [float(point_xy[0]), float(point_xy[1])],
+        "bbox_xyxy": ([float(v) for v in box_xyxy] if box_xyxy is not None else None),
+        "landmark_source": auto_prompt.get("source"),
+        "preferred_landmark": preferred_landmark,
+        "image_width": int(auto_prompt["image_width"]),
+        "image_height": int(auto_prompt["image_height"]),
+        "prompt_validation": auto_prompt.get("prompt_validation"),
+        "local_box_diagnostics": auto_prompt.get("local_box_diagnostics"),
+        "hand_bbox_xyxy_px": auto_prompt.get("hand_bbox_xyxy_px"),
+        "selection_diagnostics": auto_prompt.get("selection_diagnostics"),
+    }
+    logger.info("SAM2 prompt debug: %s", prompt_debug_payload)
+    prompt_validation = auto_prompt.get("prompt_validation") or {}
+    if (
+        not bool(prompt_validation.get("point_inside_bbox", True))
+        or bool(prompt_validation.get("bbox_too_large", False))
+        or bool(prompt_validation.get("bbox_drifting_background", False))
+    ):
+        logger.warning("SAM2 prompt validation flags: %s", prompt_validation)
 
     try:
         underlying = run_sam2_pipeline(

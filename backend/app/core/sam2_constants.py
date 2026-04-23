@@ -165,7 +165,7 @@ SAM2_PROMPT_BORDER_MARGIN_NORM: float = 0.01
 #: into the SAM 2 initialization box. Expressed as a fraction of the bbox
 #: width/height (e.g. 0.10 = 10% padding on each side). Kept moderate so the
 #: SAM 2 box remains hand-focused instead of capturing notebook / background.
-SAM2_PROMPT_BOX_PADDING_RATIO: float = 0.10
+SAM2_PROMPT_BOX_PADDING_RATIO: float = 0.15
 
 #: When the anchor point falls outside the final padded bbox (can happen with
 #: a jumpy fingertip vs. a laggy hand bbox) we re-anchor it to the box center.
@@ -175,7 +175,7 @@ SAM2_PROMPT_POINT_INSIDE_BOX_MARGIN_PX: float = 2.0
 #: Filename for the init-prompt debug image saved inside each SAM 2 run
 #: folder. The image shows the selected initialization frame with the point
 #: and/or box overlay so we can verify the prompt visually.
-SAM2_INIT_DEBUG_IMAGE_FILENAME: str = "init_prompt_debug.png"
+SAM2_INIT_DEBUG_IMAGE_FILENAME: str = "init_debug.png"
 SAM2_SUPPORTED_PROMPT_TYPES: tuple[str, ...] = (
     SAM2_PROMPT_TYPE_POINT,
     SAM2_PROMPT_TYPE_BOX,

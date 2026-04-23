@@ -882,6 +882,85 @@ def _resolve_features_image_size(
     return w, h
 
 
+def _find_prompt_candidate_at_or_after_frame(
+    candidates: Sequence[Dict[str, Any]],
+    *,
+    frame_index: int,
+) -> Optional[Dict[str, Any]]:
+    """Pick the first candidate whose frame index is >= ``frame_index``."""
+    target = int(frame_index)
+    for candidate in candidates:
+        if int(candidate["frame_index"]) >= target:
+            return candidate
+    return None
+
+
+def _build_local_box_around_point(
+    *,
+    point_xy: Sequence[float],
+    image_width: int,
+    image_height: int,
+    normalized_bbox: Optional[Tuple[float, float, float, float]],
+    min_side_px: int,
+    max_side_ratio: float,
+    from_hand_ratio: float,
+    default_side_ratio: float,
+) -> Tuple[List[float], Dict[str, Any]]:
+    """Build a small local box centered on the action point."""
+    px = float(point_xy[0])
+    py = float(point_xy[1])
+    short_side = float(min(image_width, image_height))
+    max_side_px = max(float(min_side_px), float(max_side_ratio) * short_side)
+    default_side_px = max(float(min_side_px), float(default_side_ratio) * short_side)
+
+    hand_bbox_dims: Optional[Tuple[float, float]] = None
+    if normalized_bbox is not None:
+        x_min_n, y_min_n, x_max_n, y_max_n = (float(v) for v in normalized_bbox)
+        bw_px = max(0.0, (x_max_n - x_min_n) * float(image_width))
+        bh_px = max(0.0, (y_max_n - y_min_n) * float(image_height))
+        if bw_px > 0.0 and bh_px > 0.0:
+            hand_bbox_dims = (bw_px, bh_px)
+
+    if hand_bbox_dims is not None:
+        local_side_px = float(from_hand_ratio) * min(hand_bbox_dims)
+        side_source = "hand_bbox_scaled"
+    else:
+        local_side_px = default_side_px
+        side_source = "default_ratio"
+
+    local_side_px = max(float(min_side_px), min(float(max_side_px), float(local_side_px)))
+    half = local_side_px * 0.5
+
+    x_min = max(0.0, px - half)
+    y_min = max(0.0, py - half)
+    x_max = min(float(image_width - 1), px + half)
+    y_max = min(float(image_height - 1), py + half)
+
+    if x_max - x_min < local_side_px:
+        if x_min <= 0.0:
+            x_max = min(float(image_width - 1), x_min + local_side_px)
+        elif x_max >= float(image_width - 1):
+            x_min = max(0.0, x_max - local_side_px)
+    if y_max - y_min < local_side_px:
+        if y_min <= 0.0:
+            y_max = min(float(image_height - 1), y_min + local_side_px)
+        elif y_max >= float(image_height - 1):
+            y_min = max(0.0, y_max - local_side_px)
+
+    diagnostics = {
+        "local_box_side_px": float(local_side_px),
+        "local_box_min_side_px": int(min_side_px),
+        "local_box_max_side_px": float(max_side_px),
+        "local_box_side_source": side_source,
+        "hand_bbox_dims_px": (
+            [float(hand_bbox_dims[0]), float(hand_bbox_dims[1])]
+            if hand_bbox_dims is not None
+            else None
+        ),
+    }
+    return [x_min, y_min, x_max, y_max], diagnostics
+
+
 def _aggregate_box_and_point(
     prompt_frames: Sequence[Dict[str, Any]],
     *,
@@ -988,8 +1067,7 @@ def build_sam2_auto_prompt(
 ) -> Dict[str, Any]:
     """Automatically derive a SAM 2 prompt from a MediaPipe features.json.
 
-    Selection logic (this replaces the old "first 5 consecutive valid
-    frames" heuristic, which was sensitive to a noisy video start):
+    Selection logic:
 
     1. Collect a pool of up to ``candidate_pool_size`` valid MediaPipe
        frames starting from ``start_frame_index``.
@@ -998,18 +1076,9 @@ def build_sam2_auto_prompt(
        inside bbox, preferred landmark rather than a fallback).
     3. Slide an ``average_frame_count``-wide window over the scored pool
        and pick the window with the best combined score + stability.
-    4. Average the anchor point and union the bounding boxes across the
+    4. Average the anchor point and union the hand bboxes across the
        chosen window (see ``_aggregate_box_and_point``) — the box also
        gets padded by ``box_padding_ratio`` and clamped to the frame.
-
-    When the pool is smaller than the requested window size we fall back
-    to the best single frame, matching the old behavior for short videos
-    and the unit test that only provides one detection frame.
-
-    The returned dict contains both a ``point_xy`` pixel anchor AND a
-    ``box_xyxy`` pixel rectangle when available. SAM 2 is then fed both
-    — the box drives initialization, the positive-click point
-    disambiguates which object inside the box we want.
     """
     path = Path(mediapipe_features_path)
     features_document = load_mediapipe_features(path)
@@ -1039,22 +1108,17 @@ def build_sam2_auto_prompt(
         border_margin=float(border_margin_norm),
     )
 
-    selection_result = _select_best_prompt_window(
-        scored_pool,
-        window_size=max(1, int(average_frame_count)),
-    )
-    chosen_window: List[Dict[str, Any]] = selection_result["window"]
-    selection_diagnostics: Dict[str, Any] = selection_result["diagnostics"]
-
+    window_size = max(1, int(average_frame_count))
+    chosen_window: List[Dict[str, Any]] = list(scored_pool[:window_size])
     if not chosen_window:
         raise SAM2InitError(
             "No MediaPipe frame with a usable hand detection was found "
             f"in features.json at {path}."
         )
 
-    # Use the middle of the window as the "initialization frame" —
-    # that's the most representative frame of the averaged prompt.
-    selection = chosen_window[len(chosen_window) // 2]
+    # Restore the original behavior used by the known-good learner run:
+    # initialize on the first valid detected frame.
+    selection = chosen_window[0]
     aggregate = _aggregate_box_and_point(
         chosen_window,
         image_width=effective_width,
@@ -1064,6 +1128,29 @@ def build_sam2_auto_prompt(
 
     used_fallback = selection["source"] != preferred_landmark
     averaged_frame_indices = [int(f["frame_index"]) for f in chosen_window]
+    point_xy = aggregate["point_xy"]
+    box_xyxy = aggregate["box_xyxy"]
+    point_nx, point_ny = (float(v) for v in aggregate["point_normalized_xy"])
+    point_inside_box: Optional[bool] = None
+    bbox_area_ratio: Optional[float] = None
+    bbox_too_large: Optional[bool] = None
+    if box_xyxy is not None:
+        x_min, y_min, x_max, y_max = (float(v) for v in box_xyxy)
+        point_inside_box = (
+            x_min <= float(point_xy[0]) <= x_max and y_min <= float(point_xy[1]) <= y_max
+        )
+        bbox_area_ratio = (
+            max(0.0, x_max - x_min) * max(0.0, y_max - y_min)
+        ) / float(max(1, effective_width * effective_height))
+        bbox_too_large = bool(bbox_area_ratio > 0.55)
+    prompt_validation = {
+        "point_inside_bbox": point_inside_box,
+        "bbox_area_ratio": bbox_area_ratio,
+        "bbox_too_large": bbox_too_large,
+        "bbox_drifting_background": None,
+        "point_near_action_zone": bool(selection.get("source") == LANDMARK_ALIAS_INDEX_TIP),
+    }
+
     scored_frame_debug = [
         {
             "frame_index": int(c["frame_index"]),
@@ -1075,8 +1162,8 @@ def build_sam2_auto_prompt(
                 if c["score"].get("area_ratio") is not None
                 else None
             ),
-            "reasons": list(c["score"].get("reasons", [])),
             "source": c["source"],
+            "reasons": list(c["score"].get("reasons", [])),
         }
         for c in chosen_window
     ]
@@ -1084,15 +1171,15 @@ def build_sam2_auto_prompt(
     return {
         "frame_index": int(selection["frame_index"]),
         "timestamp_sec": float(selection["timestamp_sec"]),
-        "point_xy": aggregate["point_xy"],
-        "box_xyxy": aggregate["box_xyxy"],
+        "point_xy": [float(point_xy[0]), float(point_xy[1])],
+        "box_xyxy": box_xyxy,
         "box_source": aggregate["box_source"],
         "source": selection["source"],
         # Debug / provenance fields (useful in CLI logs + API responses):
         "preferred_landmark": preferred_landmark,
         "used_fallback": used_fallback,
         "handedness": selection.get("handedness"),
-        "normalized_xy": aggregate["point_normalized_xy"],
+        "normalized_xy": [point_nx, point_ny],
         "image_width": effective_width,
         "image_height": effective_height,
         "mediapipe_features_path": str(path),
@@ -1102,7 +1189,16 @@ def build_sam2_auto_prompt(
         "point_reanchored_to_box_center": bool(
             aggregate.get("point_reanchored_to_box_center", False)
         ),
-        "selection_diagnostics": selection_diagnostics,
+        "selection_diagnostics": {
+            "selection_mode": "first_valid_window",
+            "candidate_pool_size": len(scored_pool),
+            "window_size": window_size,
+            "selected_frame_index": int(selection["frame_index"]),
+            "selected_reasons": list(selection.get("score", {}).get("reasons", [])),
+        },
+        "prompt_validation": prompt_validation,
+        "hand_bbox_xyxy_px": None,
+        "local_box_diagnostics": None,
         "scored_window_frames": scored_frame_debug,
     }
 
@@ -1150,7 +1246,8 @@ def build_init_prompt_from_mediapipe(
         "point_xy": [float(px), float(py)],
         "box_xyxy": box_xyxy,
         "box_source": auto.get("box_source"),
-        "prompt_source": auto.get("source"),
+        "landmark_source": auto.get("source"),
+        "prompt_source": auto.get("prompt_source"),
         "preferred_landmark": preferred_landmark,
         "used_fallback": bool(auto.get("used_fallback")),
         "image_width": int(auto["image_width"]),
@@ -1161,6 +1258,9 @@ def build_init_prompt_from_mediapipe(
             auto.get("point_reanchored_to_box_center", False)
         ),
         "selection_diagnostics": auto.get("selection_diagnostics"),
+        "prompt_validation": auto.get("prompt_validation"),
+        "local_box_diagnostics": auto.get("local_box_diagnostics"),
+        "hand_bbox_xyxy_px": auto.get("hand_bbox_xyxy_px"),
     }
     logger.info("SAM2 auto-init prompt resolved: %s", log_payload)
 
