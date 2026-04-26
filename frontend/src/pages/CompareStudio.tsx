@@ -259,12 +259,12 @@ export default function CompareStudio() {
 
   // ── Derived data ─────────────────────────────────────────────────────────
 
+  const requestedCourseId = searchParams.get('courseId');
+  const requestedClipId = searchParams.get('clipId');
   const course = courses.find((c) => c.id === selectedCourse);
   const clips = selectedCourse ? getClipsForCourse(selectedCourse) : [];
   const clip = clips.find((c) => c.id === selectedClip);
   const hasSelectedExpertReference = Boolean(selectedClip || requestedClipId);
-  const requestedCourseId = searchParams.get('courseId');
-  const requestedClipId = searchParams.get('clipId');
 
   // ── Effects ──────────────────────────────────────────────────────────────
 

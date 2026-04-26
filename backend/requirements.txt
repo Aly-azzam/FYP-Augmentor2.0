@@ -11,3 +11,4 @@ pytest
 numpy
 opencv-python
 mediapipe
+psycopg2-binary

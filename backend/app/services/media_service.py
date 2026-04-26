@@ -58,9 +58,19 @@ def find_first_expert_video_file() -> Optional[Path]:
     if not expert_root.exists() or not expert_root.is_dir():
         return None
 
+    preferred_names = (
+        "expert video.mp4",
+        "expert.mp4",
+        "expert1.mp4",
+    )
+    for name in preferred_names:
+        candidate = expert_root / name
+        if candidate.is_file() and candidate.suffix.lower() in ALLOWED_VIDEO_EXTENSIONS:
+            return candidate
+
     expert_files = sorted(
         file_path
-        for file_path in expert_root.rglob("*")
+        for file_path in expert_root.iterdir()
         if file_path.is_file() and file_path.suffix.lower() in ALLOWED_VIDEO_EXTENSIONS
     )
     return expert_files[0] if expert_files else None
