@@ -12,7 +12,7 @@ service architecture:
 Scope is limited to:
 
     * running SAM 2 on a single video
-    * producing hand masks + mask centroid + mask bbox + mask area
+    * producing learner-local region masks + centroid + bbox + area
     * deriving a ROI / working region for later region-support logic
 
 Explicitly NOT part of this step:
@@ -54,6 +54,9 @@ from app.core.sam2_constants import (
     SAM2_FEATURES_FILENAME,
     SAM2_FRAMES_SUBDIR,
     SAM2_INIT_DEBUG_IMAGE_FILENAME,
+    SAM2_LOCAL_ROI_MAX_SIDE_RATIO,
+    SAM2_LOCAL_ROI_MIN_SIDE_RATIO,
+    SAM2_LOCAL_ROI_SCALE_RATIO,
     SAM2_MASKS_SUBDIR,
     SAM2_METADATA_FILENAME,
     SAM2_PIPELINE_NAME,
@@ -65,6 +68,9 @@ from app.core.sam2_constants import (
     SAM2_PROMPT_MIN_BBOX_AREA_RATIO,
     SAM2_PROMPT_POINT_INSIDE_BOX_MARGIN_PX,
     SAM2_PROMPT_SOURCE_MEDIAPIPE,
+    SAM2_TEMPORAL_MAX_CENTROID_JUMP_RATIO,
+    SAM2_TEMPORAL_MIN_COMPONENT_AREA_RATIO,
+    SAM2_TEMPORAL_SMOOTHING_WINDOW,
     SAM2_PROMPT_TYPE_BOX,
     SAM2_PROMPT_TYPE_POINT,
     SAM2_RUNS_SUBDIR,
@@ -88,6 +94,7 @@ from app.schemas.sam2.sam2_schema import (
 from app.schemas.mediapipe.mediapipe_schema import MediaPipeFeaturesDocument
 from app.utils.sam2.sam2_utils import (
     DEFAULT_LANDMARK_FALLBACK_ORDER,
+    LANDMARK_ALIAS_HAND_CENTER,
     LANDMARK_ALIAS_INDEX_TIP,
     ensure_clean_dir,
     extract_frame_range_to_folder,
@@ -505,7 +512,7 @@ def _load_sibling_metadata(features_path: Path) -> Optional[dict]:
 def find_first_valid_sam2_prompt(
     features_document: MediaPipeFeaturesDocument,
     *,
-    preferred_landmark: str = LANDMARK_ALIAS_INDEX_TIP,
+    preferred_landmark: str = LANDMARK_ALIAS_HAND_CENTER,
     fallback_order: Sequence[str] = DEFAULT_LANDMARK_FALLBACK_ORDER,
     start_frame_index: int = 0,
 ) -> Optional[Dict[str, Any]]:
@@ -580,7 +587,7 @@ def _frame_normalized_bbox(frame: Any) -> Optional[Tuple[float, float, float, fl
 def collect_first_n_valid_prompt_frames(
     features_document: MediaPipeFeaturesDocument,
     *,
-    preferred_landmark: str = LANDMARK_ALIAS_INDEX_TIP,
+    preferred_landmark: str = LANDMARK_ALIAS_HAND_CENTER,
     fallback_order: Sequence[str] = DEFAULT_LANDMARK_FALLBACK_ORDER,
     start_frame_index: int = 0,
     max_frames: int = SAM2_PROMPT_AVERAGE_FRAME_COUNT,
@@ -609,6 +616,18 @@ def collect_first_n_valid_prompt_frames(
             continue
 
         (nx, ny), source_alias = result
+        wrist = getattr(frame, "wrist", None)
+        hand_center = getattr(frame, "hand_center", None)
+        wrist_xy = (
+            [float(wrist[0]), float(wrist[1])]
+            if wrist is not None and len(wrist) >= 2
+            else None
+        )
+        hand_center_xy = (
+            [float(hand_center[0]), float(hand_center[1])]
+            if hand_center is not None and len(hand_center) >= 2
+            else None
+        )
         collected.append(
             {
                 "frame_index": int(frame.frame_index),
@@ -617,6 +636,8 @@ def collect_first_n_valid_prompt_frames(
                 "source": source_alias,
                 "handedness": getattr(frame, "handedness", None),
                 "normalized_bbox": _frame_normalized_bbox(frame),
+                "wrist_xy": wrist_xy,
+                "hand_center_xy": hand_center_xy,
             }
         )
         if len(collected) >= int(max_frames):
@@ -895,165 +916,134 @@ def _find_prompt_candidate_at_or_after_frame(
     return None
 
 
-def _build_local_box_around_point(
-    *,
-    point_xy: Sequence[float],
-    image_width: int,
-    image_height: int,
-    normalized_bbox: Optional[Tuple[float, float, float, float]],
-    min_side_px: int,
-    max_side_ratio: float,
-    from_hand_ratio: float,
-    default_side_ratio: float,
-) -> Tuple[List[float], Dict[str, Any]]:
-    """Build a small local box centered on the action point."""
-    px = float(point_xy[0])
-    py = float(point_xy[1])
-    short_side = float(min(image_width, image_height))
-    max_side_px = max(float(min_side_px), float(max_side_ratio) * short_side)
-    default_side_px = max(float(min_side_px), float(default_side_ratio) * short_side)
+def _collect_mediapipe_geometry(
+    prompt_frames: Sequence[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+    """Collect normalized MediaPipe geometry used to derive a local SAM ROI."""
+    anchor_x = [float(f["normalized_xy"][0]) for f in prompt_frames]
+    anchor_y = [float(f["normalized_xy"][1]) for f in prompt_frames]
+    wrist_x = [float(f["wrist_xy"][0]) for f in prompt_frames if f.get("wrist_xy")]
+    wrist_y = [float(f["wrist_xy"][1]) for f in prompt_frames if f.get("wrist_xy")]
+    center_x = [float(f["hand_center_xy"][0]) for f in prompt_frames if f.get("hand_center_xy")]
+    center_y = [float(f["hand_center_xy"][1]) for f in prompt_frames if f.get("hand_center_xy")]
+    bboxes_norm = [f["normalized_bbox"] for f in prompt_frames if f.get("normalized_bbox")]
 
-    hand_bbox_dims: Optional[Tuple[float, float]] = None
-    if normalized_bbox is not None:
-        x_min_n, y_min_n, x_max_n, y_max_n = (float(v) for v in normalized_bbox)
-        bw_px = max(0.0, (x_max_n - x_min_n) * float(image_width))
-        bh_px = max(0.0, (y_max_n - y_min_n) * float(image_height))
-        if bw_px > 0.0 and bh_px > 0.0:
-            hand_bbox_dims = (bw_px, bh_px)
-
-    if hand_bbox_dims is not None:
-        local_side_px = float(from_hand_ratio) * min(hand_bbox_dims)
-        side_source = "hand_bbox_scaled"
-    else:
-        local_side_px = default_side_px
-        side_source = "default_ratio"
-
-    local_side_px = max(float(min_side_px), min(float(max_side_px), float(local_side_px)))
-    half = local_side_px * 0.5
-
-    x_min = max(0.0, px - half)
-    y_min = max(0.0, py - half)
-    x_max = min(float(image_width - 1), px + half)
-    y_max = min(float(image_height - 1), py + half)
-
-    if x_max - x_min < local_side_px:
-        if x_min <= 0.0:
-            x_max = min(float(image_width - 1), x_min + local_side_px)
-        elif x_max >= float(image_width - 1):
-            x_min = max(0.0, x_max - local_side_px)
-    if y_max - y_min < local_side_px:
-        if y_min <= 0.0:
-            y_max = min(float(image_height - 1), y_min + local_side_px)
-        elif y_max >= float(image_height - 1):
-            y_min = max(0.0, y_max - local_side_px)
-
-    diagnostics = {
-        "local_box_side_px": float(local_side_px),
-        "local_box_min_side_px": int(min_side_px),
-        "local_box_max_side_px": float(max_side_px),
-        "local_box_side_source": side_source,
-        "hand_bbox_dims_px": (
-            [float(hand_bbox_dims[0]), float(hand_bbox_dims[1])]
-            if hand_bbox_dims is not None
+    return {
+        "anchor_xy": [float(np.mean(anchor_x)), float(np.mean(anchor_y))],
+        "wrist_xy": (
+            [float(np.mean(wrist_x)), float(np.mean(wrist_y))]
+            if wrist_x and wrist_y
             else None
         ),
+        "hand_center_xy": (
+            [float(np.mean(center_x)), float(np.mean(center_y))]
+            if center_x and center_y
+            else None
+        ),
+        "bboxes_norm": bboxes_norm,
     }
-    return [x_min, y_min, x_max, y_max], diagnostics
 
 
-def _aggregate_box_and_point(
-    prompt_frames: Sequence[Dict[str, Any]],
+def _derive_local_sam_roi_from_landmarks(
     *,
+    geometry: Dict[str, Any],
     image_width: int,
     image_height: int,
-    padding_ratio: float = SAM2_PROMPT_BOX_PADDING_RATIO,
     point_inside_box_margin_px: float = SAM2_PROMPT_POINT_INSIDE_BOX_MARGIN_PX,
 ) -> Dict[str, Any]:
-    """Average the anchor point and union the hand bboxes across frames.
+    """Derive a smaller learner-local SAM ROI from MediaPipe geometry."""
+    anchor_nx, anchor_ny = (float(v) for v in geometry["anchor_xy"])
+    hand_center_xy = geometry.get("hand_center_xy")
+    wrist_xy = geometry.get("wrist_xy")
+    bboxes_norm = geometry.get("bboxes_norm") or []
 
-    The box is padded by ``padding_ratio`` of its width/height on every
-    side and then clamped to the image bounds so SAM 2 never sees a
-    rectangle that spills outside the frame. When the averaged anchor
-    point ends up outside the final padded box (can happen when the
-    fingertip leads the hand-bbox tracker by a frame) we re-anchor the
-    point to the box center to guarantee ``point inside box`` — that's
-    the configuration SAM 2 handles best.
-    """
-    xs_norm = [float(f["normalized_xy"][0]) for f in prompt_frames]
-    ys_norm = [float(f["normalized_xy"][1]) for f in prompt_frames]
-    avg_nx = float(np.mean(xs_norm))
-    avg_ny = float(np.mean(ys_norm))
-    px, py = normalized_to_pixel_coords(avg_nx, avg_ny, image_width, image_height)
+    # Center local ROI at a geometric blend of action anchor and hand center.
+    center_nx, center_ny = anchor_nx, anchor_ny
+    if hand_center_xy is not None:
+        center_nx = 0.65 * anchor_nx + 0.35 * float(hand_center_xy[0])
+        center_ny = 0.65 * anchor_ny + 0.35 * float(hand_center_xy[1])
+    if wrist_xy is not None:
+        # Keep ROI on the action side of the hand by biasing away from wrist.
+        center_nx = center_nx + 0.12 * (center_nx - float(wrist_xy[0]))
+        center_ny = center_ny + 0.12 * (center_ny - float(wrist_xy[1]))
 
-    bboxes_norm = [f["normalized_bbox"] for f in prompt_frames if f.get("normalized_bbox")]
-    box_pixels: Optional[List[float]] = None
-    bbox_source: Optional[str] = None
-    point_reanchored_to_box_center: bool = False
+    center_nx = max(0.0, min(1.0, center_nx))
+    center_ny = max(0.0, min(1.0, center_ny))
+    center_px, center_py = normalized_to_pixel_coords(
+        center_nx, center_ny, image_width, image_height
+    )
+
+    short_side = float(min(image_width, image_height))
+    min_side_px = max(16.0, float(SAM2_LOCAL_ROI_MIN_SIDE_RATIO) * short_side)
+    max_side_px = max(min_side_px, float(SAM2_LOCAL_ROI_MAX_SIDE_RATIO) * short_side)
+    local_side_px = min_side_px
     if bboxes_norm:
         x_min_n = float(min(b[0] for b in bboxes_norm))
         y_min_n = float(min(b[1] for b in bboxes_norm))
         x_max_n = float(max(b[2] for b in bboxes_norm))
         y_max_n = float(max(b[3] for b in bboxes_norm))
-
-        bw = max(0.0, x_max_n - x_min_n)
-        bh = max(0.0, y_max_n - y_min_n)
-        pad_x = bw * float(padding_ratio)
-        pad_y = bh * float(padding_ratio)
-
-        x_min_n = max(0.0, x_min_n - pad_x)
-        y_min_n = max(0.0, y_min_n - pad_y)
-        x_max_n = min(1.0, x_max_n + pad_x)
-        y_max_n = min(1.0, y_max_n + pad_y)
-
-        x_min_px, y_min_px = normalized_to_pixel_coords(
-            x_min_n, y_min_n, image_width, image_height
+        hand_w_px = max(0.0, (x_max_n - x_min_n) * float(image_width))
+        hand_h_px = max(0.0, (y_max_n - y_min_n) * float(image_height))
+        local_side_px = float(SAM2_LOCAL_ROI_SCALE_RATIO) * max(
+            min(hand_w_px, hand_h_px), min_side_px
         )
-        x_max_px, y_max_px = normalized_to_pixel_coords(
-            x_max_n, y_max_n, image_width, image_height
-        )
+    local_side_px = max(min_side_px, min(max_side_px, local_side_px))
+    half = 0.5 * local_side_px
 
-        # Extra safety: clamp to the valid pixel range and ensure width/height > 0.
-        x_min_px = max(0.0, min(float(image_width - 1), x_min_px))
-        y_min_px = max(0.0, min(float(image_height - 1), y_min_px))
-        x_max_px = max(0.0, min(float(image_width - 1), x_max_px))
-        y_max_px = max(0.0, min(float(image_height - 1), y_max_px))
+    x_min_px = max(0.0, center_px - half)
+    y_min_px = max(0.0, center_py - half)
+    x_max_px = min(float(image_width - 1), center_px + half)
+    y_max_px = min(float(image_height - 1), center_py + half)
+    if x_max_px <= x_min_px:
+        x_max_px = min(float(image_width - 1), x_min_px + 1.0)
+    if y_max_px <= y_min_px:
+        y_max_px = min(float(image_height - 1), y_min_px + 1.0)
 
-        if x_max_px > x_min_px and y_max_px > y_min_px:
-            box_pixels = [
-                float(x_min_px),
-                float(y_min_px),
-                float(x_max_px),
-                float(y_max_px),
-            ]
-            bbox_source = "mediapipe_hand_bbox"
-
-            # Guarantee the anchor lies inside the padded box. If not,
-            # re-anchor to the box center — SAM 2 treats ``point+box``
-            # as "find the object at this point INSIDE this box" so a
-            # point outside the box confuses the predictor.
-            margin = float(point_inside_box_margin_px)
-            inside_x = (x_min_px + margin) <= px <= (x_max_px - margin)
-            inside_y = (y_min_px + margin) <= py <= (y_max_px - margin)
-            if not (inside_x and inside_y):
-                px = (x_min_px + x_max_px) * 0.5
-                py = (y_min_px + y_max_px) * 0.5
-                avg_nx = (x_min_n + x_max_n) * 0.5
-                avg_ny = (y_min_n + y_max_n) * 0.5
-                point_reanchored_to_box_center = True
+    # Keep prompt point inside the local ROI.
+    px, py = center_px, center_py
+    margin = float(point_inside_box_margin_px)
+    px = min(max(px, x_min_px + margin), x_max_px - margin)
+    py = min(max(py, y_min_px + margin), y_max_px - margin)
 
     return {
         "point_xy": [float(px), float(py)],
-        "point_normalized_xy": [avg_nx, avg_ny],
-        "box_xyxy": box_pixels,
-        "box_source": bbox_source,
-        "point_reanchored_to_box_center": point_reanchored_to_box_center,
+        "point_normalized_xy": [float(center_nx), float(center_ny)],
+        "box_xyxy": [float(x_min_px), float(y_min_px), float(x_max_px), float(y_max_px)],
+        "box_source": "mediapipe_local_roi",
+        "point_reanchored_to_box_center": False,
+        "local_roi_side_px": float(local_side_px),
     }
+
+
+def _build_negative_prompt_points(
+    *,
+    box_xyxy: Optional[Sequence[float]],
+    image_width: int,
+    image_height: int,
+) -> List[List[float]]:
+    """Build optional negative points outside the active hand/tool box."""
+    if box_xyxy is None:
+        return []
+    x_min, y_min, x_max, y_max = (float(v) for v in box_xyxy)
+    pad_x = max(8.0, 0.04 * float(image_width))
+    pad_y = max(8.0, 0.04 * float(image_height))
+    candidates = [
+        [x_min - pad_x, y_min - pad_y],  # background/table corner
+        [x_max + pad_x, y_min - pad_y],  # likely paper / cutting line side
+        [x_min - pad_x, y_max + pad_y],  # lower background region
+    ]
+    points: List[List[float]] = []
+    for x, y in candidates:
+        px = max(0.0, min(float(image_width - 1), float(x)))
+        py = max(0.0, min(float(image_height - 1), float(y)))
+        points.append([px, py])
+    return points
 
 
 def build_sam2_auto_prompt(
     mediapipe_features_path: str | Path,
     *,
-    preferred_landmark: str = LANDMARK_ALIAS_INDEX_TIP,
+    preferred_landmark: str = LANDMARK_ALIAS_HAND_CENTER,
     fallback_order: Sequence[str] = DEFAULT_LANDMARK_FALLBACK_ORDER,
     start_frame_index: int = 0,
     image_width: Optional[int] = None,
@@ -1067,18 +1057,16 @@ def build_sam2_auto_prompt(
 ) -> Dict[str, Any]:
     """Automatically derive a SAM 2 prompt from a MediaPipe features.json.
 
-    Selection logic:
+    Learner-local ROI logic:
 
     1. Collect a pool of up to ``candidate_pool_size`` valid MediaPipe
        frames starting from ``start_frame_index``.
     2. Score every candidate with simple heuristics (bbox area not too
        tiny / not too huge, bbox away from image borders, anchor point
        inside bbox, preferred landmark rather than a fallback).
-    3. Slide an ``average_frame_count``-wide window over the scored pool
-       and pick the window with the best combined score + stability.
-    4. Average the anchor point and union the hand bboxes across the
-       chosen window (see ``_aggregate_box_and_point``) — the box also
-       gets padded by ``box_padding_ratio`` and clamped to the frame.
+    3. Build local geometric context from landmarks/hand boxes.
+    4. Derive a smaller SAM ROI from that context (see
+       ``_derive_local_sam_roi_from_landmarks``), then clamp to frame bounds.
     """
     path = Path(mediapipe_features_path)
     features_document = load_mediapipe_features(path)
@@ -1116,14 +1104,12 @@ def build_sam2_auto_prompt(
             f"in features.json at {path}."
         )
 
-    # Restore the original behavior used by the known-good learner run:
-    # initialize on the first valid detected frame.
     selection = chosen_window[0]
-    aggregate = _aggregate_box_and_point(
-        chosen_window,
+    mediapipe_geometry = _collect_mediapipe_geometry(chosen_window)
+    aggregate = _derive_local_sam_roi_from_landmarks(
+        geometry=mediapipe_geometry,
         image_width=effective_width,
         image_height=effective_height,
-        padding_ratio=box_padding_ratio,
     )
 
     used_fallback = selection["source"] != preferred_landmark
@@ -1148,8 +1134,15 @@ def build_sam2_auto_prompt(
         "bbox_area_ratio": bbox_area_ratio,
         "bbox_too_large": bbox_too_large,
         "bbox_drifting_background": None,
-        "point_near_action_zone": bool(selection.get("source") == LANDMARK_ALIAS_INDEX_TIP),
+        "point_inside_local_region": bool(
+            selection.get("source") in {LANDMARK_ALIAS_HAND_CENTER, LANDMARK_ALIAS_INDEX_TIP}
+        ),
     }
+    negative_points_xy = _build_negative_prompt_points(
+        box_xyxy=box_xyxy,
+        image_width=effective_width,
+        image_height=effective_height,
+    )
 
     scored_frame_debug = [
         {
@@ -1197,8 +1190,9 @@ def build_sam2_auto_prompt(
             "selected_reasons": list(selection.get("score", {}).get("reasons", [])),
         },
         "prompt_validation": prompt_validation,
-        "hand_bbox_xyxy_px": None,
-        "local_box_diagnostics": None,
+        "sam_roi_bbox_xyxy_px": box_xyxy,
+        "local_roi_side_px": aggregate.get("local_roi_side_px"),
+        "negative_points_xy": negative_points_xy,
         "scored_window_frames": scored_frame_debug,
     }
 
@@ -1208,7 +1202,7 @@ def build_init_prompt_from_mediapipe(
     *,
     image_width: Optional[int] = None,
     image_height: Optional[int] = None,
-    preferred_landmark: str = LANDMARK_ALIAS_INDEX_TIP,
+    preferred_landmark: str = LANDMARK_ALIAS_HAND_CENTER,
     fallback_order: Sequence[str] = DEFAULT_LANDMARK_FALLBACK_ORDER,
     start_frame_index: int = 0,
     target_object_id: int = SAM2_DEFAULT_TARGET_OBJECT_ID,
@@ -1218,11 +1212,8 @@ def build_init_prompt_from_mediapipe(
 ) -> SAM2InitPrompt:
     """Build a ``SAM2InitPrompt`` from a MediaPipe features.json.
 
-    Prefers a box prompt (with the averaged fingertip as a positive
-    disambiguation point) when MediaPipe provided usable hand bounding
-    boxes; otherwise falls back to a point-only prompt. The chosen frame
-    + point + box are logged at INFO level so operators can diff the
-    expert and learner prompts directly from ``backend.log``.
+    Builds a learner-local ROI prompt (smaller than full-hand coverage)
+    with one positive point and optional negative disambiguation points.
     """
     auto = build_sam2_auto_prompt(
         mediapipe_features_path,
@@ -1259,19 +1250,27 @@ def build_init_prompt_from_mediapipe(
         ),
         "selection_diagnostics": auto.get("selection_diagnostics"),
         "prompt_validation": auto.get("prompt_validation"),
-        "local_box_diagnostics": auto.get("local_box_diagnostics"),
-        "hand_bbox_xyxy_px": auto.get("hand_bbox_xyxy_px"),
+        "sam_roi_bbox_xyxy_px": auto.get("sam_roi_bbox_xyxy_px"),
+        "local_roi_side_px": auto.get("local_roi_side_px"),
+        "negative_points_xy": auto.get("negative_points_xy"),
     }
     logger.info("SAM2 auto-init prompt resolved: %s", log_payload)
 
     if box_xyxy is not None:
         x_min, y_min, x_max, y_max = (float(v) for v in box_xyxy)
+        all_points: List[SAM2InitPoint] = [init_point]
+        for neg_xy in auto.get("negative_points_xy") or []:
+            all_points.append(
+                SAM2InitPoint(x=float(neg_xy[0]), y=float(neg_xy[1]), label=0)
+            )
         return SAM2InitPrompt(
             type=SAM2_PROMPT_TYPE_BOX,
             source=SAM2_PROMPT_SOURCE_MEDIAPIPE,
             frame_index=int(auto["frame_index"]),
             target_object_id=int(target_object_id),
+            object_type="learner_local_region",
             point=init_point,
+            points=all_points,
             box=SAM2InitBox(x_min=x_min, y_min=y_min, x_max=x_max, y_max=y_max),
         )
 
@@ -1280,7 +1279,9 @@ def build_init_prompt_from_mediapipe(
         source=SAM2_PROMPT_SOURCE_MEDIAPIPE,
         frame_index=int(auto["frame_index"]),
         target_object_id=int(target_object_id),
+        object_type="learner_local_region",
         point=init_point,
+        points=[init_point],
     )
 
 
@@ -1291,18 +1292,68 @@ def build_manual_point_prompt(
     y_px: float,
     target_object_id: int = SAM2_DEFAULT_TARGET_OBJECT_ID,
 ) -> SAM2InitPrompt:
-    """Build a prompt from raw pixel coordinates (debug / scripts only).
+    """Build a manual learner-local-region prompt from a click (debug only).
 
     This intentionally exists only for offline experiments; the
     production learner flow must NEVER call this path. Runtime prompts
     come from ``build_init_prompt_from_mediapipe``.
+
+    Manual clicks are interpreted as learner-local ROI seeds.
     """
     return SAM2InitPrompt(
-        type=SAM2_PROMPT_TYPE_POINT,
+        type=SAM2_PROMPT_TYPE_BOX,
         source="manual",
         frame_index=int(frame_index),
         target_object_id=int(target_object_id),
+        object_type="learner_local_region",
         point=SAM2InitPoint(x=float(x_px), y=float(y_px), label=1),
+        points=[SAM2InitPoint(x=float(x_px), y=float(y_px), label=1)],
+        box=SAM2InitBox(
+            x_min=max(0.0, float(x_px) - 80.0),
+            y_min=max(0.0, float(y_px) - 80.0),
+            x_max=float(x_px) + 80.0,
+            y_max=float(y_px) + 80.0,
+        ),
+    )
+
+
+def build_manual_init_prompt(
+    *,
+    frame_index: int,
+    box_xyxy: Optional[Sequence[float]],
+    positive_points: Sequence[Sequence[float]],
+    negative_points: Optional[Sequence[Sequence[float]]] = None,
+    target_object_id: int = SAM2_DEFAULT_TARGET_OBJECT_ID,
+) -> SAM2InitPrompt:
+    """Build a one-time manual SAM2 initializer (learner-side frame 0)."""
+    points: List[SAM2InitPoint] = []
+    for p in positive_points:
+        if p is None or len(p) < 2:
+            continue
+        points.append(SAM2InitPoint(x=float(p[0]), y=float(p[1]), label=1))
+    for p in negative_points or []:
+        if p is None or len(p) < 2:
+            continue
+        points.append(SAM2InitPoint(x=float(p[0]), y=float(p[1]), label=0))
+    if not points and box_xyxy is None:
+        raise SAM2InitError("Manual init prompt requires at least one point or a box.")
+
+    box_model: Optional[SAM2InitBox] = None
+    if box_xyxy is not None and len(box_xyxy) >= 4:
+        x1, y1, x2, y2 = (float(v) for v in box_xyxy[:4])
+        box_model = SAM2InitBox(x_min=x1, y_min=y1, x_max=x2, y_max=y2)
+
+    primary_point = points[0] if points else None
+    prompt_type = SAM2_PROMPT_TYPE_BOX if box_model is not None else SAM2_PROMPT_TYPE_POINT
+    return SAM2InitPrompt(
+        type=prompt_type,
+        source="manual",
+        frame_index=int(frame_index),
+        target_object_id=int(target_object_id),
+        object_type="learner_local_region",
+        point=primary_point,
+        points=points if points else None,
+        box=box_model,
     )
 
 
@@ -1327,7 +1378,12 @@ def _prompt_tensors(
     """
     torch = _import_torch()
 
-    has_point = prompt.point is not None
+    prompt_points: List[SAM2InitPoint] = []
+    if prompt.points:
+        prompt_points.extend(list(prompt.points))
+    elif prompt.point is not None:
+        prompt_points.append(prompt.point)
+    has_point = len(prompt_points) > 0
     has_box = prompt.box is not None
 
     if not has_point and not has_box:
@@ -1340,9 +1396,8 @@ def _prompt_tensors(
     box_tensor: Optional[Any] = None
 
     if has_point:
-        point = prompt.point
-        xy = [[float(point.x), float(point.y)]]
-        labels = [int(point.label)]
+        xy = [[float(p.x), float(p.y)] for p in prompt_points]
+        labels = [int(p.label) for p in prompt_points]
         if device == "cuda":
             points_tensor = torch.tensor(xy, dtype=torch.float32, device=device)
             labels_tensor = torch.tensor(labels, dtype=torch.int32, device=device)
@@ -1487,6 +1542,131 @@ def _run_predictor(
 # Output assembly
 # ---------------------------------------------------------------------------
 
+def _connected_components(mask: np.ndarray) -> List[np.ndarray]:
+    """Return binary connected components from a mask."""
+    try:
+        import cv2
+    except Exception:  # noqa: BLE001
+        return [np.asarray(mask).astype(np.uint8)]
+    working = np.asarray(mask).astype(np.uint8)
+    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(working, connectivity=8)
+    components: List[np.ndarray] = []
+    for label_id in range(1, int(n_labels)):
+        area = int(stats[label_id, cv2.CC_STAT_AREA])
+        if area <= 0:
+            continue
+        components.append((labels == label_id).astype(np.uint8))
+    return components
+
+
+def _smooth_value(history: Sequence[float], window: int) -> Optional[float]:
+    if not history:
+        return None
+    tail = list(history[-max(1, int(window)):])
+    return float(np.mean(np.asarray(tail, dtype=np.float64)))
+
+
+def _stabilize_masks_temporally(
+    *,
+    saved_paths: Sequence[Path],
+    masks_by_local_frame: Dict[int, np.ndarray],
+) -> Tuple[Dict[int, np.ndarray], Dict[int, str]]:
+    """Stabilize SAM2 masks around a coherent learner-local ROI."""
+    stable_masks: Dict[int, np.ndarray] = {}
+    quality_by_local_frame: Dict[int, str] = {}
+
+    if not saved_paths:
+        return stable_masks, quality_by_local_frame
+
+    # We use the first decoded frame for dimensions, then derive adaptive thresholds.
+    try:
+        import cv2
+        first = cv2.imread(str(saved_paths[0]), cv2.IMREAD_GRAYSCALE)
+        h, w = (int(first.shape[0]), int(first.shape[1])) if first is not None else (720, 1280)
+    except Exception:  # noqa: BLE001
+        h, w = 720, 1280
+
+    image_area = max(1.0, float(h * w))
+    min_component_area = max(32, int(image_area * float(SAM2_TEMPORAL_MIN_COMPONENT_AREA_RATIO)))
+    diag = float((w * w + h * h) ** 0.5)
+    max_jump_px = float(SAM2_TEMPORAL_MAX_CENTROID_JUMP_RATIO) * diag
+
+    prev_centroid: Optional[Tuple[float, float]] = None
+    prev_mask: Optional[np.ndarray] = None
+    area_history: List[float] = []
+    centroid_x_history: List[float] = []
+    centroid_y_history: List[float] = []
+
+    for local_idx in range(len(saved_paths)):
+        raw_mask = masks_by_local_frame.get(local_idx)
+        if raw_mask is None or not bool(np.asarray(raw_mask).astype(bool).any()):
+            quality_by_local_frame[local_idx] = "missing"
+            continue
+
+        components = _connected_components(raw_mask)
+        components = [c for c in components if int(mask_area(c)) >= min_component_area]
+        if not components:
+            quality_by_local_frame[local_idx] = "missing"
+            continue
+
+        selected = max(components, key=lambda c: int(mask_area(c)))
+        if prev_centroid is not None and len(components) > 1:
+            ranked: List[Tuple[float, np.ndarray]] = []
+            for comp in components:
+                cxy = mask_centroid(comp)
+                if cxy is None:
+                    continue
+                dist = float(np.hypot(float(cxy[0]) - prev_centroid[0], float(cxy[1]) - prev_centroid[1]))
+                ranked.append((dist, comp))
+            if ranked:
+                ranked.sort(key=lambda item: item[0])
+                selected = ranked[0][1]
+
+        selected_centroid = mask_centroid(selected)
+        selected_area = mask_area(selected)
+        if selected_centroid is None:
+            quality_by_local_frame[local_idx] = "missing"
+            continue
+
+        unstable_jump = False
+        if prev_centroid is not None:
+            jump = float(
+                np.hypot(
+                    float(selected_centroid[0]) - prev_centroid[0],
+                    float(selected_centroid[1]) - prev_centroid[1],
+                )
+            )
+            unstable_jump = jump > max_jump_px
+
+        if unstable_jump and prev_mask is not None:
+            stable_masks[local_idx] = prev_mask.copy()
+            quality_by_local_frame[local_idx] = "reused_previous"
+            reused_centroid = mask_centroid(prev_mask)
+            reused_area = mask_area(prev_mask)
+            if reused_centroid is not None:
+                centroid_x_history.append(float(reused_centroid[0]))
+                centroid_y_history.append(float(reused_centroid[1]))
+            area_history.append(float(reused_area))
+            continue
+
+        quality_by_local_frame[local_idx] = "unstable" if unstable_jump else "ok"
+        centroid_x_history.append(float(selected_centroid[0]))
+        centroid_y_history.append(float(selected_centroid[1]))
+        area_history.append(float(selected_area))
+
+        smooth_window = int(SAM2_TEMPORAL_SMOOTHING_WINDOW)
+        smooth_cx = _smooth_value(centroid_x_history, smooth_window)
+        smooth_cy = _smooth_value(centroid_y_history, smooth_window)
+        if smooth_cx is not None and smooth_cy is not None:
+            prev_centroid = (smooth_cx, smooth_cy)
+        else:
+            prev_centroid = (float(selected_centroid[0]), float(selected_centroid[1]))
+
+        prev_mask = np.asarray(selected).astype(np.uint8)
+        stable_masks[local_idx] = prev_mask
+
+    return stable_masks, quality_by_local_frame
+
 def _build_detections_and_frame_results(
     *,
     saved_paths: List[Path],
@@ -1500,12 +1680,24 @@ def _build_detections_and_frame_results(
     """Assemble per-frame SAM 2 records and matching lightweight drawing data."""
     frame_records: List[SAM2FrameMask] = []
     drawing_records: List[dict] = []
+    stable_masks, quality_by_local_frame = _stabilize_masks_temporally(
+        saved_paths=saved_paths,
+        masks_by_local_frame=masks_by_local_frame,
+    )
+
+    centroid_x_history: List[float] = []
+    centroid_y_history: List[float] = []
+    area_history: List[float] = []
+    bbox_x1_history: List[float] = []
+    bbox_y1_history: List[float] = []
+    bbox_x2_history: List[float] = []
+    bbox_y2_history: List[float] = []
 
     for local_idx, _frame_path in enumerate(saved_paths):
         absolute_frame_index = saved_absolute_frame_indices[local_idx]
         timestamp_sec = absolute_frame_index / fps if fps > 0 else None
 
-        mask = masks_by_local_frame.get(local_idx)
+        mask = stable_masks.get(local_idx)
         has_mask = mask is not None and bool(np.asarray(mask).astype(bool).any())
 
         area_value: Optional[int] = None
@@ -1513,15 +1705,45 @@ def _build_detections_and_frame_results(
         bbox_model: Optional[SAM2BoundingBox] = None
         mask_path_str: Optional[str] = None
         temporal_source = source_by_local_frame.get(local_idx, "none")
+        quality_flag = quality_by_local_frame.get(local_idx, "missing")
 
         if has_mask and mask is not None:
             area_value = mask_area(mask)
             centroid = mask_centroid(mask)
             if centroid is not None:
-                centroid_value = [float(centroid[0]), float(centroid[1])]
+                centroid_x_history.append(float(centroid[0]))
+                centroid_y_history.append(float(centroid[1]))
+                smooth_window = int(SAM2_TEMPORAL_SMOOTHING_WINDOW)
+                smooth_cx = _smooth_value(centroid_x_history, smooth_window)
+                smooth_cy = _smooth_value(centroid_y_history, smooth_window)
+                if smooth_cx is not None and smooth_cy is not None:
+                    centroid_value = [smooth_cx, smooth_cy]
+                else:
+                    centroid_value = [float(centroid[0]), float(centroid[1])]
+            if area_value is not None:
+                area_history.append(float(area_value))
+                smooth_area = _smooth_value(area_history, int(SAM2_TEMPORAL_SMOOTHING_WINDOW))
+                if smooth_area is not None:
+                    area_value = int(round(smooth_area))
             bbox_tuple = mask_bbox(mask)
             if bbox_tuple is not None:
                 x_min, y_min, x_max, y_max = bbox_tuple
+                bbox_x1_history.append(float(x_min))
+                bbox_y1_history.append(float(y_min))
+                bbox_x2_history.append(float(x_max))
+                bbox_y2_history.append(float(y_max))
+                smooth_window = int(SAM2_TEMPORAL_SMOOTHING_WINDOW)
+                sx1 = _smooth_value(bbox_x1_history, smooth_window)
+                sy1 = _smooth_value(bbox_y1_history, smooth_window)
+                sx2 = _smooth_value(bbox_x2_history, smooth_window)
+                sy2 = _smooth_value(bbox_y2_history, smooth_window)
+                if sx1 is not None and sy1 is not None and sx2 is not None and sy2 is not None:
+                    x_min, y_min, x_max, y_max = (
+                        int(round(sx1)),
+                        int(round(sy1)),
+                        int(round(sx2)),
+                        int(round(sy2)),
+                    )
                 bbox_model = SAM2BoundingBox(
                     x_min=x_min,
                     y_min=y_min,
@@ -1549,6 +1771,8 @@ def _build_detections_and_frame_results(
                 mask_bbox=bbox_model,
                 mask_path=mask_path_str,
                 temporal_source=temporal_source if has_mask else "none",
+                quality_flag=quality_flag if has_mask else "missing",
+                status=quality_flag if has_mask else "missing",
             )
         )
         drawing_records.append(
@@ -1556,6 +1780,9 @@ def _build_detections_and_frame_results(
                 "local_idx": local_idx,
                 "has_mask": has_mask,
                 "mask": mask if has_mask else None,
+                "bbox": bbox_model,
+                "centroid_xy": centroid_value,
+                "quality_flag": quality_flag if has_mask else "missing",
             }
         )
 
@@ -1641,12 +1868,17 @@ def _save_init_prompt_debug_image(
                 thickness=2,
             )
 
-    if prompt.point is not None:
-        px = max(0, min(image_width - 1, int(round(float(prompt.point.x)))))
-        py = max(0, min(image_height - 1, int(round(float(prompt.point.y)))))
-        # Outer black ring then inner green dot for visibility on any bg.
+    points_to_draw: List[SAM2InitPoint] = []
+    if prompt.points:
+        points_to_draw.extend(prompt.points)
+    elif prompt.point is not None:
+        points_to_draw.append(prompt.point)
+    for point in points_to_draw:
+        px = max(0, min(image_width - 1, int(round(float(point.x)))))
+        py = max(0, min(image_height - 1, int(round(float(point.y)))))
+        color = (0, 255, 0) if int(point.label) == 1 else (0, 0, 255)
         cv2.circle(annotated, (px, py), radius=8, color=(0, 0, 0), thickness=2)
-        cv2.circle(annotated, (px, py), radius=5, color=(0, 255, 0), thickness=-1)
+        cv2.circle(annotated, (px, py), radius=5, color=color, thickness=-1)
 
     if label:
         try:
@@ -1752,7 +1984,7 @@ def _render_annotated_video(
     fps: float,
     overlay_folder: Path,
 ) -> Optional[Path]:
-    """Render a simple green-mask overlay video (best effort)."""
+    """Render learner-local-region overlay with bbox + centroid (best effort)."""
     import cv2  # local import so unit tests can skip this path
 
     ensure_clean_dir(overlay_folder)
@@ -1766,6 +1998,31 @@ def _render_annotated_video(
         info = drawing_records[local_idx] if local_idx < len(drawing_records) else None
         if info is not None and info["has_mask"] and info["mask"] is not None:
             overlay = mask_to_overlay(frame, info["mask"])
+            bbox = info.get("bbox")
+            if bbox is not None:
+                cv2.rectangle(
+                    overlay,
+                    (int(bbox.x_min), int(bbox.y_min)),
+                    (int(bbox.x_max), int(bbox.y_max)),
+                    (255, 255, 0),
+                    2,
+                )
+            centroid_xy = info.get("centroid_xy")
+            if centroid_xy is not None and len(centroid_xy) == 2:
+                cx = int(round(float(centroid_xy[0])))
+                cy = int(round(float(centroid_xy[1])))
+                cv2.circle(overlay, (cx, cy), radius=5, color=(0, 255, 255), thickness=-1)
+            quality = str(info.get("quality_flag") or "ok")
+            cv2.putText(
+                overlay,
+                f"SAM2 Learner Local Region [{quality}]",
+                (12, 24),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
         else:
             overlay = frame
 

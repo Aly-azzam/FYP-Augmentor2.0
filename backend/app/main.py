@@ -8,6 +8,7 @@ from app.core.config import settings
 from app.core.database import get_db
 from app.api.routes import courses, chapters, uploads, evaluations, history, progress
 from app.api.routes import expert_mediapipe, expert_sam2, inspection
+from app.api import sam2_yolo
 from app.api.mediapipe import router as mediapipe_router
 from app.api.sam2 import router as sam2_router
 from fastapi import Depends
@@ -44,6 +45,7 @@ app.include_router(history.router)
 app.include_router(progress.router)
 app.include_router(mediapipe_router)
 app.include_router(sam2_router)
+app.include_router(sam2_yolo.router)
 app.include_router(expert_mediapipe.router)
 app.include_router(expert_sam2.router)
 app.include_router(inspection.router)

@@ -10,4 +10,10 @@ python-dotenv
 pytest
 numpy
 opencv-python
+inference-sdk
+torch
+ultralytics
+hydra-core
+omegaconf
 mediapipe
+imageio-ffmpeg

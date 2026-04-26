@@ -20,6 +20,7 @@ from app.services.sam2.sam2_service import (
     SAM2InitError,
     SAM2RunArtifacts,
     build_init_prompt_from_mediapipe,
+    build_manual_init_prompt,
     build_manual_point_prompt,
     build_sam2_auto_prompt,
     collect_first_n_valid_prompt_frames,
@@ -37,6 +38,11 @@ from app.services.sam2.sam2_service import (
     run_sam2_pipeline,
     validate_sam2_assets,
 )
+from app.services.sam2.tip_tracking_service import (
+    SAM2TipTrackingArtifacts,
+    SAM2TipTrackingError,
+    track_scissor_tip_in_sam_roi,
+)
 
 __all__ = [
     "SAM2ContractArtifacts",
@@ -48,6 +54,7 @@ __all__ = [
     "SAM2PipelineError",
     "SAM2RunArtifacts",
     "build_init_prompt_from_mediapipe",
+    "build_manual_init_prompt",
     "build_manual_point_prompt",
     "build_sam2_auto_prompt",
     "build_sam2_raw_document",
@@ -71,5 +78,8 @@ __all__ = [
     "resolve_video_path",
     "run_sam2_from_mediapipe_prompt",
     "run_sam2_pipeline",
+    "SAM2TipTrackingArtifacts",
+    "SAM2TipTrackingError",
+    "track_scissor_tip_in_sam_roi",
     "validate_sam2_assets",
 ]

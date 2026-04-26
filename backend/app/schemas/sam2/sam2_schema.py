@@ -16,7 +16,7 @@ Scope restrictions (explicitly out of scope for SAM 2):
 
 SAM 2 is strictly limited to:
 
-    * hand mask
+    * learner-local region mask
     * ROI bounding box
     * mask centroid
     * mask area
@@ -40,6 +40,12 @@ from pydantic import BaseModel, Field
 
 PromptType = Literal["point", "box"]
 PromptSource = Literal["mediapipe", "manual"]
+SAM2ObjectType = Literal[
+    "active_hand_region",
+    "hand_tool_region",
+    "learner_local_region",
+    "sam_roi_local_region",
+]
 
 
 class SAM2InitPoint(BaseModel):
@@ -85,7 +91,18 @@ class SAM2InitPrompt(BaseModel):
         default=1,
         description="SAM 2 object id to attach to this prompt.",
     )
+    object_type: SAM2ObjectType = Field(
+        default="learner_local_region",
+        description="Semantic object represented by this prompt.",
+    )
     point: Optional[SAM2InitPoint] = None
+    points: Optional[List[SAM2InitPoint]] = Field(
+        default=None,
+        description=(
+            "Optional multi-point prompt list (first point should be positive, "
+            "later points can be negative disambiguation cues)."
+        ),
+    )
     box: Optional[SAM2InitBox] = None
 
 
@@ -142,6 +159,14 @@ class SAM2FrameMask(BaseModel):
             "Where the mask for this frame came from: the user prompt, "
             "forward propagation, backward propagation, or none."
         ),
+    )
+    quality_flag: Literal["ok", "unstable", "reused_previous", "missing"] = Field(
+        default="ok",
+        description="Lightweight temporal-stability quality marker for this frame.",
+    )
+    status: Literal["ok", "unstable", "reused_previous", "missing"] = Field(
+        default="ok",
+        description="Alias of quality_flag for learner-region consumers.",
     )
 
 

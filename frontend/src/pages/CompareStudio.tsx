@@ -28,7 +28,7 @@ import {
   Sparkles,
   Activity,
   Loader2,
-  Scissors,
+  Hand,
 } from 'lucide-react';
 import {
   Tabs,
@@ -89,11 +89,28 @@ const COLOR_SWATCHES = [
 
 const PLAYBACK_RATES = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 2];
 
+const toPlayableStorageUrl = (url?: string | null, path?: string | null) => {
+  const candidate = url || path;
+  if (!candidate) return null;
+  const normalized = candidate.replace(/\\/g, '/');
+  if (normalized.startsWith('http://') || normalized.startsWith('https://') || normalized.startsWith('/storage/')) {
+    return normalized;
+  }
+  if (normalized.startsWith('storage/')) {
+    return `/${normalized}`;
+  }
+  const storageIndex = normalized.toLowerCase().lastIndexOf('/storage/');
+  if (storageIndex >= 0) {
+    return normalized.slice(storageIndex);
+  }
+  return normalized;
+};
+
 // ── MediaPipe integration ──────────────────────────────────────────────────
 
 interface MediaPipeRunSummary {
   run_id: string;
-  source_video_path: string;
+  source_video_path?: string;
   fps: number;
   frame_count: number;
   width: number;
@@ -120,6 +137,8 @@ interface MediaPipeRunResult {
 }
 
 type InspectionModel = 'mediapipe' | 'sam2' | 'optical_flow';
+
+const DEFAULT_SAM2_YOLO_EXPERT_CODE = 'expert_cutting_01';
 
 interface Sam2LearnerMediaPipeInfo {
   run_id: string;
@@ -177,20 +196,61 @@ interface Sam2LearnerSummary {
 
 interface Sam2LearnerResult {
   run_id: string;
-  run_folder: string;
+  run_folder?: string;
+  run_dir?: string;
+  status?: string;
+  failure_reason?: string;
+  model?: string;
   raw_json_path: string;
+  raw_json_url?: string | null;
+  metrics_json_path?: string;
+  metrics_json_url?: string | null;
   summary_json_path: string;
-  metadata_json_path: string;
-  annotated_video_path: string | null;
-  annotated_video_url: string | null;
+  summary_json_url?: string | null;
+  metadata_json_path?: string;
+  annotated_video_path?: string | null;
+  annotated_video_url?: string | null;
+  overlay_video_path?: string | null;
+  overlay_video_url?: string | null;
   source_video_path: string;
-  initialization_debug_image_path: string | null;
-  initialization_debug_image_url: string | null;
+  video_path?: string;
+  initialization_debug_image_path?: string | null;
+  initialization_debug_image_url?: string | null;
+  tip_initialization_json_path?: string | null;
+  tip_initialization_json_url?: string | null;
+  tip_tracking_json_path?: string | null;
+  tip_tracking_json_url?: string | null;
+  tip_annotated_video_path?: string | null;
+  tip_annotated_video_url?: string | null;
+  manual_init_prompt_path?: string | null;
+  manual_init_prompt_url?: string | null;
   device: string;
   frame_stride: number;
-  metadata: Sam2LearnerMetadata;
-  summary: Sam2LearnerSummary;
-  raw_preview: unknown | null;
+  original_frame_count?: number | null;
+  expected_strided_frames?: number | null;
+  max_processed_frames?: number | null;
+  processed_frames?: number;
+  successful_masks?: number;
+  failure_frames?: number[];
+  prompt_source?: string;
+  main_tracked_feature?: string;
+  trajectory_stability_score?: number;
+  horizontal_drift_range?: number;
+  region_stability_score?: number;
+  tracking_quality_note?: string;
+  expert_reference_available?: boolean;
+  expert_code?: string | null;
+  expert_warning?: string;
+  expert_raw_json_path?: string | null;
+  expert_metrics_json_path?: string | null;
+  metadata?: Sam2LearnerMetadata;
+  summary?: Sam2LearnerSummary;
+  trajectory_metrics?: unknown;
+  region_metrics?: unknown;
+  quality_flags?: unknown;
+  raw_preview?: unknown | null;
+  tip_tracking_preview?: unknown | null;
+  manual_init_prompt_preview?: unknown | null;
   mediapipe?: Sam2LearnerMediaPipeInfo | null;
   warnings: string[];
 }
@@ -225,6 +285,11 @@ function prettyJson(value: unknown): string {
   } catch {
     return String(value);
   }
+}
+
+function formatMetricValue(value: unknown): string {
+  if (typeof value !== 'number' || Number.isNaN(value)) return 'n/a';
+  return Number.isInteger(value) ? String(value) : value.toFixed(3);
 }
 
 const TOUR_STEPS = [
@@ -332,16 +397,34 @@ export default function CompareStudio() {
   const [selectedExpertVideoId, setSelectedExpertVideoId] = useState<string | null>(null);
   const [inspectionModel, setInspectionModel] = useState<InspectionModel>('mediapipe');
   // Learner overlay: show the raw uploaded video, the MediaPipe annotated
-  // output, or the SAM 2 annotated output (Compare Studio is learner-focused).
+  // output, or the YOLO+SAM2 scissors overlay (Compare Studio is learner-focused).
   const [learnerOverlay, setLearnerOverlay] = useState<'none' | 'mediapipe' | 'sam2'>('none');
 
-  // SAM2 learner (Compare Studio) integration state. This is the
-  // learner-focused SAM2 flow: upload -> MediaPipe -> SAM2 -> annotated.
+  // YOLO+SAM2 learner scissors tracking state.
   const [sam2LearnerRun, setSam2LearnerRun] = useState<Sam2LearnerResult | null>(null);
   const [isSam2LearnerProcessing, setIsSam2LearnerProcessing] = useState(false);
   const [sam2LearnerError, setSam2LearnerError] = useState<string | null>(null);
+  const [sam2OverlayVideoError, setSam2OverlayVideoError] = useState<string | null>(null);
   const [sam2LearnerVideoVersion, setSam2LearnerVideoVersion] = useState(0);
   const [showSam2RawPreview, setShowSam2RawPreview] = useState(false);
+  const [isTipTracking, setIsTipTracking] = useState(false);
+  const [tipTrackingError, setTipTrackingError] = useState<string | null>(null);
+  const [isSelectingTip, setIsSelectingTip] = useState(false);
+  const [isManualSamInitMode, setIsManualSamInitMode] = useState(false);
+  const [manualSamPointMode, setManualSamPointMode] = useState<'positive' | 'negative'>('positive');
+  const [manualSamPrompt, setManualSamPrompt] = useState<{
+    frame_index: number;
+    box: [number, number, number, number] | null;
+    positive_points: [number, number][];
+    negative_points: [number, number][];
+  }>({
+    frame_index: 0,
+    box: null,
+    positive_points: [],
+    negative_points: [],
+  });
+  const [manualSamDraftBox, setManualSamDraftBox] = useState<[number, number, number, number] | null>(null);
+  const manualSamDragStartRef = useRef<[number, number] | null>(null);
 
   // ── Refs ──────────────────────────────────────────────────────────────────
 
@@ -558,6 +641,16 @@ export default function CompareStudio() {
         setSam2LearnerRun(null);
         setSam2LearnerError(null);
         setSam2LearnerVideoVersion(0);
+        setTipTrackingError(null);
+        setIsSelectingTip(false);
+        setIsManualSamInitMode(false);
+        setManualSamPrompt({
+          frame_index: 0,
+          box: null,
+          positive_points: [],
+          negative_points: [],
+        });
+        setManualSamDraftBox(null);
         setLearnerOverlay('none');
         resetEvaluation();
         toast.success('Practice video ready');
@@ -660,8 +753,23 @@ export default function CompareStudio() {
     setMediapipeError(null);
 
     try {
+      if (!manualSamPrompt.box && manualSamPrompt.positive_points.length === 0) {
+        throw new Error('Add a manual SAM2 init box or at least one positive point on frame 0.');
+      }
       const formData = new FormData();
       formData.append('file', userVideo);
+      formData.append('manual_init_sam', 'true');
+      formData.append('auto_local_roi_sam', 'false');
+      formData.append(
+        'manual_prompt_json',
+        JSON.stringify({
+          frame_index: 0,
+          init_mode: 'manual',
+          box: manualSamPrompt.box,
+          positive_points: manualSamPrompt.positive_points,
+          negative_points: manualSamPrompt.negative_points,
+        }),
+      );
 
       const response = await fetch('/api/mediapipe/process-upload', {
         method: 'POST',
@@ -700,14 +808,12 @@ export default function CompareStudio() {
     } finally {
       setIsMediapipeProcessing(false);
     }
-  }, [userVideo]);
+  }, [userVideo, manualSamPrompt]);
 
-  // ── SAM 2 learner run (Compare Studio pipeline) ───────────────────────────
+  // ── YOLO+SAM2 scissors learner run ───────────────────────────────────────
   //
-  // Triggered by the "Run SAM2" button. The backend endpoint runs
-  // MediaPipe first and then SAM 2 on the same learner video, so a
-  // single click gives us the complete pipeline output (annotated video,
-  // metadata/summary, and the initialization debug image).
+  // Triggered by the "Run YOLO+SAM2" button. This posts the uploaded learner
+  // video directly to the YOLO+SAM2 backend; it does not call MediaPipe.
   const runSam2Learner = useCallback(async () => {
     if (!userVideo) {
       toast.error('Upload a practice video first');
@@ -716,12 +822,19 @@ export default function CompareStudio() {
 
     setIsSam2LearnerProcessing(true);
     setSam2LearnerError(null);
+    setSam2OverlayVideoError(null);
+    setTipTrackingError(null);
+    setIsSelectingTip(false);
+    setIsManualSamInitMode(false);
 
     try {
       const formData = new FormData();
       formData.append('file', userVideo);
+      formData.append('expert_code', DEFAULT_SAM2_YOLO_EXPERT_CODE);
+      formData.append('stride', '5');
+      formData.append('tracking_point_type', 'bbox_center');
 
-      const response = await fetch('/api/sam2/process-upload', {
+      const response = await fetch('/api/sam2-yolo/run-learner', {
         method: 'POST',
         body: formData,
       });
@@ -735,67 +848,30 @@ export default function CompareStudio() {
 
       if (!response.ok) {
         const detail = payload?.detail;
-        let message: string;
-        if (detail && typeof detail === 'object') {
-          if (detail.error_type === 'SAM2AssetsMissingError') {
-            message =
-              'SAM2 model assets are missing. Backend SAM2 processing cannot run yet.';
-          } else if (detail.stage === 'mediapipe') {
-            message = `MediaPipe step failed: ${detail.message ?? 'unknown error'}`;
-          } else if (typeof detail.message === 'string') {
-            message = detail.message;
-          } else {
-            message = `SAM2 failed with status ${response.status}`;
-          }
-        } else if (typeof detail === 'string') {
-          message = detail;
-        } else {
-          message = `SAM2 failed with status ${response.status}`;
-        }
+        const message =
+          (detail && typeof detail === 'object' && detail.message) ||
+          (typeof detail === 'string' ? detail : null) ||
+          payload?.failure_reason ||
+          `YOLO+SAM2 failed with status ${response.status}`;
         throw new Error(message);
       }
 
       const result = payload as Sam2LearnerResult;
       setSam2LearnerRun(result);
       setSam2LearnerVideoVersion(Date.now());
-      if (result.mediapipe?.annotated_video_url) {
-        setMediapipeRun({
-          run_id: result.mediapipe.run_id,
-          run_folder: result.mediapipe.run_folder,
-          detections_json_path: '',
-          features_json_path: result.mediapipe.features_json_path,
-          metadata_json_path: result.mediapipe.metadata_json_path,
-          annotated_video_path: result.mediapipe.annotated_video_path,
-          annotated_video_url: result.mediapipe.annotated_video_url,
-          summary: {
-            run_id: result.mediapipe.run_id,
-            source_video_path: result.source_video_path,
-            fps: result.metadata.fps,
-            frame_count: result.metadata.frame_count,
-            width: result.metadata.width,
-            height: result.metadata.height,
-            created_at: result.metadata.created_at,
-            selected_hand_policy: 'prefer_right_else_first',
-            total_frames: result.mediapipe.total_frames,
-            frames_with_detection: result.mediapipe.frames_with_detection,
-            detection_rate: result.mediapipe.detection_rate,
-            right_hand_selected_count: 0,
-            left_hand_selected_count: 0,
-          },
-        });
-        setMediapipeVideoVersion(Date.now());
+      if (result.status === 'failed') {
+        throw new Error(result.failure_reason || 'YOLO+SAM2 scissors tracking failed.');
       }
-      if (result.annotated_video_url) {
+      if (toPlayableStorageUrl(result.overlay_video_url, result.overlay_video_path) || result.annotated_video_url) {
         setLearnerOverlay('sam2');
       }
 
-      const maskedPct = Math.round((result.summary.detection_rate || 0) * 100);
       toast.success(
-        `SAM2 ready — ${result.device.toUpperCase()} • stride ${result.frame_stride} • ${maskedPct}% frames with mask`,
+        `YOLO+SAM2 ready — ${result.device.toUpperCase()} • stride ${result.frame_stride}`,
       );
     } catch (error) {
       const message =
-        error instanceof Error ? error.message : 'SAM2 pipeline failed.';
+        error instanceof Error ? error.message : 'YOLO+SAM2 scissors tracking failed.';
       setSam2LearnerError(message);
       toast.error(message);
     } finally {
@@ -803,20 +879,171 @@ export default function CompareStudio() {
     }
   }, [userVideo]);
 
-  // Compare Studio is learner-focused. The SAM 2 tab now shows the
-  // learner pipeline (MediaPipe -> SAM 2) run on the uploaded practice
-  // video; we intentionally do NOT surface the expert SAM 2 inspection
-  // payload here anymore.
+  const runTipTracking = useCallback(
+    async (tipX: number, tipY: number) => {
+      if (!sam2LearnerRun) return;
+      setIsTipTracking(true);
+      setTipTrackingError(null);
+      try {
+        const response = await fetch(
+          `/api/sam2/track-tip/${encodeURIComponent(sam2LearnerRun.run_id)}`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              frame_index: 0,
+              tip_point: [tipX, tipY],
+            }),
+          },
+        );
+        let payload: any = null;
+        try {
+          payload = await response.json();
+        } catch {
+          payload = null;
+        }
+        if (!response.ok) {
+          throw new Error(
+            payload?.detail?.message ||
+              payload?.detail ||
+              `Tip tracking failed with status ${response.status}`,
+          );
+        }
+        const updated = payload as Sam2LearnerResult;
+        setSam2LearnerRun(updated);
+        setSam2LearnerVideoVersion(Date.now());
+        setLearnerOverlay('sam2');
+        setIsSelectingTip(false);
+        toast.success('Tracked scissor tip extracted');
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Tip tracking failed.';
+        setTipTrackingError(message);
+        toast.error(message);
+      } finally {
+        setIsTipTracking(false);
+      }
+    },
+    [sam2LearnerRun],
+  );
+
+  const handleLearnerTipClick = useCallback(
+    (event: React.MouseEvent<HTMLVideoElement>) => {
+      if (!isSelectingTip || !sam2LearnerRun || !learnerVideoRef.current) return;
+      const video = learnerVideoRef.current;
+      const rect = video.getBoundingClientRect();
+      const nx = (event.clientX - rect.left) / rect.width;
+      const ny = (event.clientY - rect.top) / rect.height;
+      const x = Math.max(0, Math.min(1, nx)) * (video.videoWidth || sam2LearnerRun.metadata?.width || 1);
+      const y = Math.max(0, Math.min(1, ny)) * (video.videoHeight || sam2LearnerRun.metadata?.height || 1);
+      void runTipTracking(x, y);
+    },
+    [isSelectingTip, sam2LearnerRun, runTipTracking],
+  );
+
+  const eventToVideoPixels = useCallback(
+    (event: React.MouseEvent<HTMLDivElement>): [number, number] | null => {
+      if (!learnerVideoRef.current) return null;
+      const video = learnerVideoRef.current;
+      const rect = video.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) return null;
+      const nx = (event.clientX - rect.left) / rect.width;
+      const ny = (event.clientY - rect.top) / rect.height;
+      const x = Math.max(0, Math.min(1, nx)) * (video.videoWidth || 1);
+      const y = Math.max(0, Math.min(1, ny)) * (video.videoHeight || 1);
+      return [x, y];
+    },
+    [],
+  );
+
+  const handleManualSamMouseDown = useCallback(
+    (event: React.MouseEvent<HTMLDivElement>) => {
+      if (!isManualSamInitMode) return;
+      const pt = eventToVideoPixels(event);
+      if (!pt) return;
+      manualSamDragStartRef.current = pt;
+      setManualSamDraftBox([pt[0], pt[1], pt[0], pt[1]]);
+    },
+    [isManualSamInitMode, eventToVideoPixels],
+  );
+
+  const handleManualSamMouseMove = useCallback(
+    (event: React.MouseEvent<HTMLDivElement>) => {
+      const start = manualSamDragStartRef.current;
+      if (!isManualSamInitMode || !start) return;
+      const pt = eventToVideoPixels(event);
+      if (!pt) return;
+      setManualSamDraftBox([start[0], start[1], pt[0], pt[1]]);
+    },
+    [isManualSamInitMode, eventToVideoPixels],
+  );
+
+  const handleManualSamMouseUp = useCallback(
+    (event: React.MouseEvent<HTMLDivElement>) => {
+      const start = manualSamDragStartRef.current;
+      manualSamDragStartRef.current = null;
+      if (!isManualSamInitMode || !start) return;
+      const pt = eventToVideoPixels(event);
+      if (!pt) return;
+      const dx = pt[0] - start[0];
+      const dy = pt[1] - start[1];
+      const dist = Math.hypot(dx, dy);
+      if (dist > 10) {
+        const box: [number, number, number, number] = [
+          Math.min(start[0], pt[0]),
+          Math.min(start[1], pt[1]),
+          Math.max(start[0], pt[0]),
+          Math.max(start[1], pt[1]),
+        ];
+        setManualSamPrompt((prev) => ({ ...prev, box }));
+      } else {
+        setManualSamPrompt((prev) => {
+          if (manualSamPointMode === 'negative') {
+            return {
+              ...prev,
+              negative_points: [...prev.negative_points, [pt[0], pt[1]]],
+            };
+          }
+          return {
+            ...prev,
+            positive_points: [...prev.positive_points, [pt[0], pt[1]]],
+          };
+        });
+      }
+      setManualSamDraftBox(null);
+    },
+    [isManualSamInitMode, eventToVideoPixels, manualSamPointMode],
+  );
+
+  // Compare Studio is learner-focused. The YOLO+SAM2 tab runs only on the
+  // uploaded learner video and reuses precomputed expert artifacts by path.
 
   const mediapipeAnnotatedSource =
     mediapipeRun?.annotated_video_url && mediapipeVideoVersion > 0
       ? `${mediapipeRun.annotated_video_url}${mediapipeRun.annotated_video_url.includes('?') ? '&' : '?'}v=${mediapipeVideoVersion}`
       : mediapipeRun?.annotated_video_url ?? null;
 
+  const sam2OverlayBaseUrl = toPlayableStorageUrl(
+    sam2LearnerRun?.overlay_video_url,
+    sam2LearnerRun?.overlay_video_path,
+  );
+
   const sam2AnnotatedSource =
-    sam2LearnerRun?.annotated_video_url && sam2LearnerVideoVersion > 0
-      ? `${sam2LearnerRun.annotated_video_url}${sam2LearnerRun.annotated_video_url.includes('?') ? '&' : '?'}v=${sam2LearnerVideoVersion}`
-      : sam2LearnerRun?.annotated_video_url ?? null;
+    (() => {
+      const baseUrl =
+        sam2OverlayBaseUrl ||
+        sam2LearnerRun?.tip_annotated_video_url ||
+        sam2LearnerRun?.annotated_video_url ||
+        null;
+      if (!baseUrl) return null;
+      if (sam2LearnerVideoVersion > 0) {
+        return `${baseUrl}${baseUrl.includes('?') ? '&' : '?'}v=${sam2LearnerVideoVersion}`;
+      }
+      return baseUrl;
+    })();
+
+  useEffect(() => {
+    setSam2OverlayVideoError(null);
+  }, [sam2AnnotatedSource]);
 
   const learnerVideoSource = (() => {
     if (learnerOverlay === 'mediapipe' && mediapipeAnnotatedSource) {
@@ -827,6 +1054,10 @@ export default function CompareStudio() {
     }
     return userVideoUrl;
   })();
+  const learnerVideoPixelWidth =
+    learnerVideoRef.current?.videoWidth || sam2LearnerRun?.metadata?.width || 1;
+  const learnerVideoPixelHeight =
+    learnerVideoRef.current?.videoHeight || sam2LearnerRun?.metadata?.height || 1;
 
   // ── Video helpers ────────────────────────────────────────────────────────
 
@@ -1112,7 +1343,9 @@ export default function CompareStudio() {
             </span>
             {userVideoUrl ? (
               <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)', flexWrap: 'wrap' }}>
-                {(mediapipeRun?.annotated_video_url || sam2LearnerRun?.annotated_video_url) && (
+                {(mediapipeRun?.annotated_video_url ||
+                  sam2OverlayBaseUrl ||
+                  sam2LearnerRun?.annotated_video_url) && (
                   <div
                     role="tablist"
                     aria-label="Learner video source"
@@ -1146,7 +1379,7 @@ export default function CompareStudio() {
                         MediaPipe
                       </button>
                     )}
-                    {sam2LearnerRun?.annotated_video_url && (
+                    {(sam2OverlayBaseUrl || sam2LearnerRun?.annotated_video_url) && (
                       <button
                         type="button"
                         role="tab"
@@ -1155,8 +1388,8 @@ export default function CompareStudio() {
                         style={{ borderRadius: 0, fontSize: '0.75rem', padding: 'var(--space-xs) var(--space-sm)' }}
                         onClick={() => setLearnerOverlay('sam2')}
                       >
-                        <Scissors size={12} style={{ marginRight: 4 }} />
-                        SAM2
+                        <Hand size={12} style={{ marginRight: 4 }} />
+                        YOLO+SAM2 Scissors
                       </button>
                     )}
                   </div>
@@ -1206,6 +1439,8 @@ export default function CompareStudio() {
                   key={learnerVideoSource ?? userVideoUrl}
                   ref={learnerVideoRef}
                   src={learnerVideoSource ?? undefined}
+                  controls={learnerOverlay === 'sam2'}
+                  onClick={handleLearnerTipClick}
                   onTimeUpdate={() => {
                     if (learnerVideoRef.current)
                       setLearnerCurrentTime(learnerVideoRef.current.currentTime);
@@ -1214,7 +1449,89 @@ export default function CompareStudio() {
                     if (learnerVideoRef.current)
                       setLearnerDuration(learnerVideoRef.current.duration);
                   }}
+                  onError={() => {
+                    if (learnerOverlay === 'sam2') {
+                      console.error('YOLO+SAM2 overlay video failed to load:', learnerVideoSource);
+                      setSam2OverlayVideoError('YOLO+SAM2 overlay video could not be loaded.');
+                    }
+                  }}
+                  style={{ cursor: isSelectingTip ? 'crosshair' : 'default' }}
                 />
+                {(isManualSamInitMode ||
+                  ((manualSamPrompt.box ||
+                    manualSamPrompt.positive_points.length > 0 ||
+                    manualSamPrompt.negative_points.length > 0) &&
+                    learnerCurrentTime <= 0.08)) && (
+                  <div
+                    style={{
+                      position: 'absolute',
+                      inset: 0,
+                      cursor: isManualSamInitMode ? 'crosshair' : 'default',
+                    }}
+                    onMouseDown={handleManualSamMouseDown}
+                    onMouseMove={handleManualSamMouseMove}
+                    onMouseUp={handleManualSamMouseUp}
+                  >
+                    {manualSamPrompt.box && (
+                      <div
+                        style={{
+                          position: 'absolute',
+                          left: `${(manualSamPrompt.box[0] / learnerVideoPixelWidth) * 100}%`,
+                          top: `${(manualSamPrompt.box[1] / learnerVideoPixelHeight) * 100}%`,
+                          width: `${((manualSamPrompt.box[2] - manualSamPrompt.box[0]) / learnerVideoPixelWidth) * 100}%`,
+                          height: `${((manualSamPrompt.box[3] - manualSamPrompt.box[1]) / learnerVideoPixelHeight) * 100}%`,
+                          border: '2px solid #F59E0B',
+                          background: 'rgba(245,158,11,0.12)',
+                        }}
+                      />
+                    )}
+                    {manualSamDraftBox && (
+                      <div
+                        style={{
+                          position: 'absolute',
+                          left: `${(Math.min(manualSamDraftBox[0], manualSamDraftBox[2]) / learnerVideoPixelWidth) * 100}%`,
+                          top: `${(Math.min(manualSamDraftBox[1], manualSamDraftBox[3]) / learnerVideoPixelHeight) * 100}%`,
+                          width: `${(Math.abs(manualSamDraftBox[2] - manualSamDraftBox[0]) / learnerVideoPixelWidth) * 100}%`,
+                          height: `${(Math.abs(manualSamDraftBox[3] - manualSamDraftBox[1]) / learnerVideoPixelHeight) * 100}%`,
+                          border: '2px dashed #FBBF24',
+                          background: 'rgba(251,191,36,0.08)',
+                        }}
+                      />
+                    )}
+                    {manualSamPrompt.positive_points.map((pt, idx) => (
+                      <div
+                        key={`sam-pos-${idx}`}
+                        style={{
+                          position: 'absolute',
+                          left: `${(pt[0] / learnerVideoPixelWidth) * 100}%`,
+                          top: `${(pt[1] / learnerVideoPixelHeight) * 100}%`,
+                          width: 10,
+                          height: 10,
+                          borderRadius: '50%',
+                          background: '#22c55e',
+                          transform: 'translate(-50%, -50%)',
+                          border: '1px solid #000',
+                        }}
+                      />
+                    ))}
+                    {manualSamPrompt.negative_points.map((pt, idx) => (
+                      <div
+                        key={`sam-neg-${idx}`}
+                        style={{
+                          position: 'absolute',
+                          left: `${(pt[0] / learnerVideoPixelWidth) * 100}%`,
+                          top: `${(pt[1] / learnerVideoPixelHeight) * 100}%`,
+                          width: 10,
+                          height: 10,
+                          borderRadius: '50%',
+                          background: '#ef4444',
+                          transform: 'translate(-50%, -50%)',
+                          border: '1px solid #000',
+                        }}
+                      />
+                    ))}
+                  </div>
+                )}
                 {learnerOverlay === 'mediapipe' && mediapipeRun?.annotated_video_url && (
                   <span
                     className="badge badge-blue"
@@ -1232,7 +1549,8 @@ export default function CompareStudio() {
                     MediaPipe
                   </span>
                 )}
-                {learnerOverlay === 'sam2' && sam2LearnerRun?.annotated_video_url && (
+                {learnerOverlay === 'sam2' &&
+                  (sam2OverlayBaseUrl || sam2LearnerRun?.annotated_video_url) && (
                   <span
                     className="badge badge-green"
                     style={{
@@ -1245,8 +1563,52 @@ export default function CompareStudio() {
                       fontSize: '0.65rem',
                     }}
                   >
-                    <Scissors size={10} />
-                    SAM2
+                    <Hand size={10} />
+                    YOLO+SAM2 Scissors
+                  </span>
+                )}
+                {learnerOverlay === 'sam2' && sam2OverlayVideoError && (
+                  <div
+                    className="glass"
+                    style={{
+                      position: 'absolute',
+                      left: '50%',
+                      bottom: 12,
+                      transform: 'translateX(-50%)',
+                      padding: 'var(--space-xs) var(--space-sm)',
+                      color: 'var(--accent-danger)',
+                      fontSize: '0.75rem',
+                      maxWidth: '90%',
+                      textAlign: 'center',
+                    }}
+                  >
+                    {sam2OverlayVideoError}
+                  </div>
+                )}
+                {isSelectingTip && (
+                  <span
+                    className="badge badge-blue"
+                    style={{
+                      position: 'absolute',
+                      top: 8,
+                      right: 8,
+                      fontSize: '0.65rem',
+                    }}
+                  >
+                    Click scissor tip on frame 0
+                  </span>
+                )}
+                {isManualSamInitMode && (
+                  <span
+                    className="badge badge-blue"
+                    style={{
+                      position: 'absolute',
+                      top: 32,
+                      right: 8,
+                      fontSize: '0.65rem',
+                    }}
+                  >
+                    SAM2 Manual Init (frame 0)
                   </span>
                 )}
               </div>
@@ -1776,7 +2138,7 @@ export default function CompareStudio() {
                 <Tabs value={inspectionModel} onValueChange={(v) => setInspectionModel(v as InspectionModel)}>
                   <TabsList>
                     <TabsTrigger value="mediapipe">MediaPipe</TabsTrigger>
-                    <TabsTrigger value="sam2">SAM2</TabsTrigger>
+                    <TabsTrigger value="sam2">YOLO+SAM2 Scissors</TabsTrigger>
                     <TabsTrigger value="optical_flow">Optical Flow</TabsTrigger>
                   </TabsList>
 
@@ -2057,21 +2419,17 @@ export default function CompareStudio() {
                           gap: 'var(--space-sm)',
                         }}
                       >
-                        <Scissors size={18} style={{ color: 'var(--accent-primary)' }} />
+                        <Hand size={18} style={{ color: 'var(--accent-primary)' }} />
                         <span className="text-small" style={{ fontWeight: 600 }}>
-                          Hand Segmentation (SAM2)
+                          Scissors Tracking (YOLO+SAM2)
                         </span>
                       </div>
                       <p
                         className="text-small"
                         style={{ color: 'var(--text-muted)', margin: 0 }}
                       >
-                        Run the MediaPipe -&gt; SAM2 pipeline on your practice
-                        video. MediaPipe builds the initialization prompt
-                        automatically; SAM2 then segments the hand and writes
-                        the annotated video, masks and summary. Toggle
-                        between Original / MediaPipe / SAM2 above the learner
-                        video to compare outputs.
+                        Run YOLO to detect the scissors, then use SAM2 to track
+                        the scissors trajectory and region across the learner video.
                       </p>
 
                       <button
@@ -2092,12 +2450,12 @@ export default function CompareStudio() {
                               size={14}
                               style={{ animation: 'spin 1s linear infinite' }}
                             />
-                            Processing (MediaPipe -&gt; SAM2)...
+                            Running YOLO+SAM2 scissors tracking...
                           </>
                         ) : (
                           <>
-                            <Scissors size={14} />
-                            {sam2LearnerRun ? 'Run Again' : 'Run SAM2'}
+                            <Hand size={14} />
+                            {sam2LearnerRun ? 'Run YOLO+SAM2 Again' : 'Run YOLO+SAM2'}
                           </>
                         )}
                       </button>
@@ -2111,7 +2469,7 @@ export default function CompareStudio() {
                             margin: 0,
                           }}
                         >
-                          Upload a practice video to enable SAM2.
+                          Upload a practice video to enable YOLO+SAM2 scissors tracking.
                         </p>
                       )}
 
@@ -2147,16 +2505,13 @@ export default function CompareStudio() {
                                 className="stat-value"
                                 style={{ fontSize: '1.25rem' }}
                               >
-                                {Math.round(
-                                  (sam2LearnerRun.summary.detection_rate || 0) * 100,
-                                )}
-                                %
+                                {sam2LearnerRun.processed_frames ?? 0}
                               </div>
                               <div
                                 className="stat-label"
                                 style={{ fontSize: '0.7rem' }}
                               >
-                                Frames with mask
+                                Processed frames
                               </div>
                             </div>
                             <div
@@ -2167,14 +2522,13 @@ export default function CompareStudio() {
                                 className="stat-value"
                                 style={{ fontSize: '1.25rem' }}
                               >
-                                {sam2LearnerRun.summary.frames_with_mask}/
-                                {sam2LearnerRun.summary.total_frames}
+                                {sam2LearnerRun.successful_masks ?? 0}
                               </div>
                               <div
                                 className="stat-label"
                                 style={{ fontSize: '0.7rem' }}
                               >
-                                Masked / total
+                                Successful masks
                               </div>
                             </div>
                             <div
@@ -2192,9 +2546,6 @@ export default function CompareStudio() {
                                 style={{ fontSize: '0.7rem' }}
                               >
                                 Device
-                                {sam2LearnerRun.metadata.gpu_name
-                                  ? ` (${sam2LearnerRun.metadata.gpu_name})`
-                                  : ''}
                               </div>
                             </div>
                             <div
@@ -2237,14 +2588,26 @@ export default function CompareStudio() {
                               </code>
                             </span>
                             <span>
-                              <strong>fps:</strong>{' '}
-                              {sam2LearnerRun.metadata.fps.toFixed(2)} •{' '}
-                              <strong>frames:</strong>{' '}
-                              {sam2LearnerRun.metadata.frame_count} •{' '}
-                              <strong>size:</strong>{' '}
-                              {sam2LearnerRun.metadata.width}×
-                              {sam2LearnerRun.metadata.height}
+                              <strong>main_tracked_feature:</strong>{' '}
+                              {sam2LearnerRun.main_tracked_feature || 'bbox_center_trajectory'}
                             </span>
+                            <span>
+                              <strong>trajectory_stability_score:</strong>{' '}
+                              {formatMetricValue(sam2LearnerRun.trajectory_stability_score)} •{' '}
+                              <strong>horizontal_drift_range:</strong>{' '}
+                              {formatMetricValue(sam2LearnerRun.horizontal_drift_range)} •{' '}
+                              <strong>region_stability_score:</strong>{' '}
+                              {formatMetricValue(sam2LearnerRun.region_stability_score)}
+                            </span>
+                            <span>
+                              {sam2LearnerRun.expert_reference_available
+                                ? 'Expert reference found'
+                                : 'Expert reference not found. Run expert preprocessing first.'}
+                              {sam2LearnerRun.expert_warning ? ` ${sam2LearnerRun.expert_warning}` : ''}
+                            </span>
+                            {sam2LearnerRun.tracking_quality_note && (
+                              <span>{sam2LearnerRun.tracking_quality_note}</span>
+                            )}
                           </div>
 
                           {sam2LearnerRun.initialization_debug_image_url && (
@@ -2283,8 +2646,7 @@ export default function CompareStudio() {
                                   fontSize: '0.7rem',
                                 }}
                               >
-                                Point + bounding box used to initialize SAM2
-                                on the first valid MediaPipe frame.
+                                YOLO scissors bbox and bbox-center positive point used to initialize SAM2.
                               </span>
                             </div>
                           )}
@@ -2296,21 +2658,21 @@ export default function CompareStudio() {
                               gap: 'var(--space-xs)',
                             }}
                           >
-                            {sam2LearnerRun.annotated_video_url && (
+                            {(sam2OverlayBaseUrl || sam2LearnerRun.annotated_video_url) && (
                               <a
                                 className="btn btn-secondary"
                                 style={{ fontSize: '0.75rem', flex: 1 }}
-                                href={sam2LearnerRun.annotated_video_url}
+                                href={sam2OverlayBaseUrl || sam2LearnerRun.annotated_video_url || undefined}
                                 target="_blank"
                                 rel="noreferrer"
                               >
-                                Open annotated.mp4
+                                Open sam2_yolo_overlay.mp4
                               </a>
                             )}
                             <a
                               className="btn btn-ghost"
                               style={{ fontSize: '0.75rem', flex: 1 }}
-                              href={`/storage/sam2/runs/${encodeURIComponent(
+                              href={sam2LearnerRun.raw_json_url || `/storage/outputs/sam2_yolo/runs/${encodeURIComponent(
                                 sam2LearnerRun.run_id,
                               )}/raw.json`}
                               target="_blank"
@@ -2321,24 +2683,24 @@ export default function CompareStudio() {
                             <a
                               className="btn btn-ghost"
                               style={{ fontSize: '0.75rem', flex: 1 }}
-                              href={`/storage/sam2/runs/${encodeURIComponent(
+                              href={sam2LearnerRun.metrics_json_url || `/storage/outputs/sam2_yolo/runs/${encodeURIComponent(
+                                sam2LearnerRun.run_id,
+                              )}/metrics.json`}
+                              target="_blank"
+                              rel="noreferrer"
+                            >
+                              metrics.json
+                            </a>
+                            <a
+                              className="btn btn-ghost"
+                              style={{ fontSize: '0.75rem', flex: 1 }}
+                              href={sam2LearnerRun.summary_json_url || `/storage/outputs/sam2_yolo/runs/${encodeURIComponent(
                                 sam2LearnerRun.run_id,
                               )}/summary.json`}
                               target="_blank"
                               rel="noreferrer"
                             >
                               summary.json
-                            </a>
-                            <a
-                              className="btn btn-ghost"
-                              style={{ fontSize: '0.75rem', flex: 1 }}
-                              href={`/storage/sam2/runs/${encodeURIComponent(
-                                sam2LearnerRun.run_id,
-                              )}/metadata.json`}
-                              target="_blank"
-                              rel="noreferrer"
-                            >
-                              metadata.json
                             </a>
                           </div>
 
@@ -2348,7 +2710,7 @@ export default function CompareStudio() {
                                 className="text-small"
                                 style={{ fontWeight: 600 }}
                               >
-                                metadata.json
+                                metrics.json
                               </span>
                               <pre
                                 style={{
@@ -2361,7 +2723,11 @@ export default function CompareStudio() {
                                   fontSize: '0.7rem',
                                 }}
                               >
-                                {prettyJson(sam2LearnerRun.metadata)}
+                                {prettyJson({
+                                  trajectory_metrics: sam2LearnerRun.trajectory_metrics,
+                                  region_metrics: sam2LearnerRun.region_metrics,
+                                  quality_flags: sam2LearnerRun.quality_flags,
+                                })}
                               </pre>
                             </div>
                             <div>
@@ -2382,7 +2748,20 @@ export default function CompareStudio() {
                                   fontSize: '0.7rem',
                                 }}
                               >
-                                {prettyJson(sam2LearnerRun.summary)}
+                                {prettyJson({
+                                  status: sam2LearnerRun.status,
+                                  run_id: sam2LearnerRun.run_id,
+                                  device: sam2LearnerRun.device,
+                                  frame_stride: sam2LearnerRun.frame_stride,
+                                  processed_frames: sam2LearnerRun.processed_frames,
+                                  successful_masks: sam2LearnerRun.successful_masks,
+                                  failure_frames: sam2LearnerRun.failure_frames,
+                                  main_tracked_feature: sam2LearnerRun.main_tracked_feature,
+                                  trajectory_stability_score: sam2LearnerRun.trajectory_stability_score,
+                                  horizontal_drift_range: sam2LearnerRun.horizontal_drift_range,
+                                  region_stability_score: sam2LearnerRun.region_stability_score,
+                                  tracking_quality_note: sam2LearnerRun.tracking_quality_note,
+                                })}
                               </pre>
                             </div>
                             {Boolean(sam2LearnerRun.raw_preview) && (
@@ -2427,6 +2806,46 @@ export default function CompareStudio() {
                                     {prettyJson(sam2LearnerRun.raw_preview)}
                                   </pre>
                                 )}
+                              </div>
+                            )}
+                            {Boolean(sam2LearnerRun.tip_tracking_preview) && (
+                              <div>
+                                <span className="text-small" style={{ fontWeight: 600 }}>
+                                  tip_tracking_raw.json (preview)
+                                </span>
+                                <pre
+                                  style={{
+                                    marginTop: 4,
+                                    maxHeight: 180,
+                                    overflow: 'auto',
+                                    background: 'var(--bg-tertiary)',
+                                    borderRadius: 'var(--radius-sm)',
+                                    padding: 'var(--space-sm)',
+                                    fontSize: '0.7rem',
+                                  }}
+                                >
+                                  {prettyJson(sam2LearnerRun.tip_tracking_preview)}
+                                </pre>
+                              </div>
+                            )}
+                            {Boolean(sam2LearnerRun.manual_init_prompt_preview) && (
+                              <div>
+                                <span className="text-small" style={{ fontWeight: 600 }}>
+                                  manual_init_prompt.json (preview)
+                                </span>
+                                <pre
+                                  style={{
+                                    marginTop: 4,
+                                    maxHeight: 120,
+                                    overflow: 'auto',
+                                    background: 'var(--bg-tertiary)',
+                                    borderRadius: 'var(--radius-sm)',
+                                    padding: 'var(--space-sm)',
+                                    fontSize: '0.7rem',
+                                  }}
+                                >
+                                  {prettyJson(sam2LearnerRun.manual_init_prompt_preview)}
+                                </pre>
                               </div>
                             )}
                           </div>

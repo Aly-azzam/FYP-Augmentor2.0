@@ -25,6 +25,15 @@ class Settings(BaseSettings):
     HAND_DETECTION_MIN_PRESENCE_CONFIDENCE: float = 0.5
     HAND_LANDMARKER_MODEL_PATH: Path = Path(__file__).resolve().parents[2] / "models" / "hand_landmarker.task"
 
+    # YOLO + SAM2 scissors tracking
+    ROBOFLOW_API_KEY: str | None = None
+    ROBOFLOW_MODEL_ID: str = "scissors_ego_real/1"
+    ROBOFLOW_CONFIDENCE: float = 0.5
+    FRAME_STRIDE: int = 5
+    SAM2_MAX_PROCESSED_FRAMES: int | None = None
+    SAM2_YOLO_BBOX_SHRINK: float = 0.65
+    SAM2_RUN_MODE: str = "subprocess"
+
     # Pipeline timeouts (seconds)
     UPLOAD_VALIDATION_TIMEOUT: int = 30
     PERCEPTION_TIMEOUT: int = 120

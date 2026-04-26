@@ -22,3 +22,48 @@ backend/storage/mediapipe/**
 backend/storage/expert/**
 backend/storage/sam2/**
 backend/models/sam2/sam2_hiera_tiny.pt
+
+# Python virtual environments
+.venv/
+venv/
+**/.venv/
+**/venv/
+
+# Python cache/test cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Secrets / local env
+.env
+.env.*
+!.env.example
+
+# Frontend
+node_modules/
+dist/
+build/
+*.tsbuildinfo
+
+# Generated local storage
+backend/storage/uploads/**
+backend/storage/processed/**
+backend/storage/outputs/**
+backend/storage/mediapipe/**
+backend/storage/expert/**
+backend/storage/sam2/**
+!backend/storage/**/.gitkeep
+
+# Large model/checkpoint files
+backend/models/sam2/checkpoints/**
+backend/models/**/*.pt
+backend/models/**/*.pth
+backend/models/**/*.ckpt
+backend/models/**/*.safetensors
+
+# Logs / OS
+*.log
+.DS_Store
+Thumbs.db

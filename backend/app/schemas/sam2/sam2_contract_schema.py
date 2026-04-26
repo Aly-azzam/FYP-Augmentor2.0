@@ -13,7 +13,7 @@ Rationale for a separate, flatter contract:
     * simplicity — a single ``mask_bbox_xyxy: [x1, y1, x2, y2]`` list
       is easier to consume from JS / SQL than a typed bbox object.
     * scope discipline — no trajectory / velocity / angle fields: SAM 2
-      is strictly hand mask + ROI + centroid + area here.
+      is strictly learner-local mask + ROI + centroid + area here.
 
 All coordinates are in pixel space of the source video.
 """
@@ -34,6 +34,10 @@ class SAM2RawFrame(BaseModel):
 
     frame_index: int = Field(..., ge=0, description="Absolute frame index in the source video.")
     timestamp_sec: Optional[float] = Field(default=None, ge=0.0)
+    object: str = Field(
+        default="learner_local_region",
+        description="Tracked object label for this frame.",
+    )
 
     has_mask: bool = Field(..., description="True when SAM 2 produced a non-empty mask for this frame.")
     mask_bbox_xyxy: Optional[List[int]] = Field(
@@ -52,6 +56,33 @@ class SAM2RawFrame(BaseModel):
         default=None,
         ge=0,
         description="Number of foreground pixels in the mask, or null.",
+    )
+    quality_flag: str = Field(
+        default="ok",
+        description="Temporal stability status for this frame.",
+    )
+    status: str = Field(
+        default="ok",
+        description="Alias of quality_flag for learner-region status.",
+    )
+
+    # Preferred stable-region aliases (kept alongside legacy names).
+    bbox: Optional[List[int]] = Field(
+        default=None,
+        min_length=4,
+        max_length=4,
+        description="Alias of mask_bbox_xyxy for stable-region consumers.",
+    )
+    centroid: Optional[List[float]] = Field(
+        default=None,
+        min_length=2,
+        max_length=2,
+        description="Alias of mask_centroid_xy for stable-region consumers.",
+    )
+    area: Optional[int] = Field(
+        default=None,
+        ge=0,
+        description="Alias of mask_area_px for stable-region consumers.",
     )
 
 

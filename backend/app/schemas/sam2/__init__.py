@@ -23,6 +23,11 @@ from app.schemas.sam2.sam2_schema import (
     SAM2RunMeta,
     SAM2WorkingRegion,
 )
+from app.schemas.sam2.tip_tracking_schema import (
+    SAM2TipInitialization,
+    SAM2TipTrackingDocument,
+    SAM2TipTrackingFrame,
+)
 
 __all__ = [
     "SAM2AreaStats",
@@ -39,5 +44,8 @@ __all__ = [
     "SAM2RunMeta",
     "SAM2SummaryDocument",
     "SAM2SummaryWorkingRegion",
+    "SAM2TipInitialization",
+    "SAM2TipTrackingDocument",
+    "SAM2TipTrackingFrame",
     "SAM2WorkingRegion",
 ]

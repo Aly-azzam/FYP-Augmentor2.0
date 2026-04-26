@@ -65,7 +65,7 @@ from app.services.sam2.sam2_service import (
     build_sam2_auto_prompt,
     run_sam2_pipeline,
 )
-from app.utils.sam2.sam2_utils import LANDMARK_ALIAS_INDEX_TIP
+from app.utils.sam2.sam2_utils import LANDMARK_ALIAS_HAND_CENTER
 
 
 logger = logging.getLogger(__name__)
@@ -131,6 +131,7 @@ def build_sam2_raw_document(
                     if detection.timestamp_sec is not None
                     else None
                 ),
+                object="learner_local_region",
                 has_mask=bool(detection.has_mask),
                 mask_bbox_xyxy=_bbox_to_xyxy(detection.mask_bbox),
                 mask_centroid_xy=(
@@ -139,6 +140,19 @@ def build_sam2_raw_document(
                     else None
                 ),
                 mask_area_px=(
+                    int(detection.mask_area_px)
+                    if detection.mask_area_px is not None
+                    else None
+                ),
+                quality_flag=str(getattr(detection, "quality_flag", "ok")),
+                status=str(getattr(detection, "status", getattr(detection, "quality_flag", "ok"))),
+                bbox=_bbox_to_xyxy(detection.mask_bbox),
+                centroid=(
+                    [float(detection.mask_centroid_xy[0]), float(detection.mask_centroid_xy[1])]
+                    if detection.mask_centroid_xy is not None
+                    else None
+                ),
+                area=(
                     int(detection.mask_area_px)
                     if detection.mask_area_px is not None
                     else None
@@ -275,7 +289,7 @@ def run_sam2_from_mediapipe_prompt(
     output_dir: Optional[str | Path] = None,
     image_width: Optional[int] = None,
     image_height: Optional[int] = None,
-    preferred_landmark: str = LANDMARK_ALIAS_INDEX_TIP,
+    preferred_landmark: str = LANDMARK_ALIAS_HAND_CENTER,
     analysis_mode: str = SAM2_DEFAULT_ANALYSIS_MODE,
     max_seconds: float = SAM2_DEFAULT_MAX_SECONDS,
     frame_stride: int = SAM2_DEFAULT_FRAME_STRIDE,
@@ -347,8 +361,9 @@ def run_sam2_from_mediapipe_prompt(
         "image_width": int(auto_prompt["image_width"]),
         "image_height": int(auto_prompt["image_height"]),
         "prompt_validation": auto_prompt.get("prompt_validation"),
-        "local_box_diagnostics": auto_prompt.get("local_box_diagnostics"),
-        "hand_bbox_xyxy_px": auto_prompt.get("hand_bbox_xyxy_px"),
+        "negative_points_xy": auto_prompt.get("negative_points_xy"),
+        "sam_roi_bbox_xyxy_px": auto_prompt.get("sam_roi_bbox_xyxy_px"),
+        "local_roi_side_px": auto_prompt.get("local_roi_side_px"),
         "selection_diagnostics": auto_prompt.get("selection_diagnostics"),
     }
     logger.info("SAM2 prompt debug: %s", prompt_debug_payload)

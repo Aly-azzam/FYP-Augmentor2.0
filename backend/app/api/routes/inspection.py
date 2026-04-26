@@ -182,7 +182,7 @@ def list_models() -> InspectionOptionsResponse:
     return InspectionOptionsResponse(
         models=[
             InspectionModelOption(id="mediapipe", label="MediaPipe Hands", implemented=True),
-            InspectionModelOption(id="sam2", label="SAM 2 (hand segmentation)", implemented=True),
+            InspectionModelOption(id="sam2", label="SAM 2 (learner local ROI)", implemented=True),
             InspectionModelOption(
                 id="optical_flow",
                 label="Optical Flow (coming soon)",

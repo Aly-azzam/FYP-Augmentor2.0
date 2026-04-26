@@ -98,6 +98,10 @@ SAM2_SOURCE_FILENAME: str = "source.mp4"
 
 SAM2_DETECTIONS_FILENAME: str = "detections.json"
 SAM2_FEATURES_FILENAME: str = "features.json"
+SAM2_TIP_INIT_FILENAME: str = "tip_init.json"
+SAM2_TIP_TRACKING_FILENAME: str = "tip_tracking_raw.json"
+SAM2_TIP_ANNOTATED_FILENAME: str = "annotated_tip.mp4"
+SAM2_MANUAL_INIT_PROMPT_FILENAME: str = "manual_init_prompt.json"
 
 SAM2_MASKS_SUBDIR: str = "masks"
 SAM2_FRAMES_SUBDIR: str = "frames"
@@ -167,6 +171,16 @@ SAM2_PROMPT_BORDER_MARGIN_NORM: float = 0.01
 #: SAM 2 box remains hand-focused instead of capturing notebook / background.
 SAM2_PROMPT_BOX_PADDING_RATIO: float = 0.15
 
+#: Scale applied to the MediaPipe hand bbox to derive a local learner ROI
+#: for SAM2 (smaller than the full hand region).
+SAM2_LOCAL_ROI_SCALE_RATIO: float = 0.62
+
+#: Minimum side of the local ROI as a ratio of the short image side.
+SAM2_LOCAL_ROI_MIN_SIDE_RATIO: float = 0.10
+
+#: Maximum side of the local ROI as a ratio of the short image side.
+SAM2_LOCAL_ROI_MAX_SIDE_RATIO: float = 0.45
+
 #: When the anchor point falls outside the final padded bbox (can happen with
 #: a jumpy fingertip vs. a laggy hand bbox) we re-anchor it to the box center.
 #: This guarantees SAM 2 always sees ``point inside box``.
@@ -205,3 +219,31 @@ SAM2_WORKING_REGION_PADDING_PX: int = 20
 #: working region. 0.95 means "95th percentile of frame bboxes", which is
 #: robust to a handful of noisy outlier frames.
 SAM2_WORKING_REGION_BBOX_QUANTILE: float = 0.95
+
+
+# ---------------------------------------------------------------------------
+# Temporal stability defaults
+# ---------------------------------------------------------------------------
+
+#: Minimum connected-component area ratio (relative to full frame area)
+#: retained during temporal stabilization.
+SAM2_TEMPORAL_MIN_COMPONENT_AREA_RATIO: float = 0.0015
+
+#: Maximum centroid jump allowed (as a fraction of frame diagonal) before
+#: we mark a frame unstable and reuse the previous stable mask.
+SAM2_TEMPORAL_MAX_CENTROID_JUMP_RATIO: float = 0.22
+
+#: Moving-average window length for centroid/area smoothing.
+SAM2_TEMPORAL_SMOOTHING_WINDOW: int = 3
+
+
+# ---------------------------------------------------------------------------
+# Tip-tracking defaults (learner-side seed + constrained tracking)
+# ---------------------------------------------------------------------------
+
+SAM2_TIP_TEMPLATE_SIZE_PX: int = 32
+SAM2_TIP_ROI_MARGIN_PX: int = 24
+SAM2_TIP_MIN_CONFIDENCE: float = 0.35
+SAM2_TIP_MAX_JUMP_PX: float = 80.0
+SAM2_TIP_SMOOTHING_WINDOW: int = 3
+SAM2_TIP_REUSE_MAX_FRAMES: int = 3
