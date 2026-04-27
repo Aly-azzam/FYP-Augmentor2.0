@@ -127,8 +127,12 @@ def visualize_video_optical_flow_hsv(
             embed_roi_flow_in_canvas,
         )
 
+        effective_roi_padding_px = max(
+            int(config.roi_padding_px),
+            int(config.roi_enlarge_padding_px),
+        )
         roi_detector = HandROIDetector(
-            padding_px=config.roi_padding_px,
+            padding_px=effective_roi_padding_px,
             hand_preference=config.roi_hand_preference,
             lock_target=config.roi_lock_target,
             lock_max_missing_frames=config.roi_lock_max_missing_frames,

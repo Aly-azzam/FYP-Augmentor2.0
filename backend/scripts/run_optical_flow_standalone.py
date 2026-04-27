@@ -58,6 +58,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Padding in pixels around the detected hand ROI.",
     )
     parser.add_argument(
+        "--roi-enlarge-padding-px",
+        type=int,
+        default=50,
+        help="Minimum effective padding in pixels for the locked hand ROI.",
+    )
+    parser.add_argument(
         "--roi-hand-preference",
         choices=("right", "left", "largest", "first"),
         default="right",
@@ -65,9 +71,18 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--roi-lock-target",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Lock ROI onto the initially selected target hand.",
+        nargs="?",
+        const="right",
+        default="right",
+        choices=("right", "left", "largest", "first", "none"),
+        help="Lock ROI onto this target hand. Use without a value to lock right.",
+    )
+    parser.add_argument(
+        "--no-roi-lock-target",
+        dest="roi_lock_target",
+        action="store_const",
+        const="none",
+        help="Disable target locking.",
     )
     parser.add_argument(
         "--roi-lock-strict",
@@ -78,13 +93,13 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--roi-lock-max-missing-frames",
         type=int,
-        default=10,
+        default=5,
         help="Frames to reuse the locked ROI when the target is temporarily missing.",
     )
     parser.add_argument(
         "--roi-lock-max-center-distance-ratio",
         type=float,
-        default=0.35,
+        default=0.3,
         help="Maximum accepted locked-target center movement as a ratio of frame width.",
     )
     return parser
@@ -106,6 +121,7 @@ def main() -> None:
     farneback_config = FarnebackConfig(
         use_hand_roi=args.use_hand_roi,
         roi_padding_px=args.roi_padding_px,
+        roi_enlarge_padding_px=args.roi_enlarge_padding_px,
         roi_hand_preference=args.roi_hand_preference,
         roi_lock_target=args.roi_lock_target,
         roi_lock_strict=args.roi_lock_strict,

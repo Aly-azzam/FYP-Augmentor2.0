@@ -29,14 +29,16 @@ class FarnebackConfig:
     use_hand_roi: bool = False
     #: Padding added around the detected hand bounding box, in pixels.
     roi_padding_px: int = 40
+    #: Minimum effective ROI padding used for locked hand tracking.
+    roi_enlarge_padding_px: int = 50
     #: Which hand to track for ROI cropping: right, left, largest, or first.
     roi_hand_preference: str = "right"
-    #: Lock onto the initially selected ROI target and track by nearest center.
-    roi_lock_target: bool = True
+    #: Lock onto this target hand; use "right" to avoid switching to the left hand.
+    roi_lock_target: str | bool = "right"
     #: Number of frames to reuse locked ROI before strict/loose fallback logic.
-    roi_lock_max_missing_frames: int = 10
+    roi_lock_max_missing_frames: int = 5
     #: Maximum accepted center movement as a ratio of frame width.
-    roi_lock_max_center_distance_ratio: float = 0.35
+    roi_lock_max_center_distance_ratio: float = 0.3
     #: If True, never switch to another hand after lock is lost.
     roi_lock_strict: bool = True
 
@@ -158,8 +160,12 @@ def compute_video_optical_flow_features(
             embed_roi_flow_in_canvas,
         )
 
+        effective_roi_padding_px = max(
+            int(config.roi_padding_px),
+            int(config.roi_enlarge_padding_px),
+        )
         roi_detector = HandROIDetector(
-            padding_px=config.roi_padding_px,
+            padding_px=effective_roi_padding_px,
             hand_preference=config.roi_hand_preference,
             lock_target=config.roi_lock_target,
             lock_max_missing_frames=config.roi_lock_max_missing_frames,

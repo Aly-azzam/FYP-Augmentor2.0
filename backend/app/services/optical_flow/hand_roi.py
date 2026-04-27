@@ -19,6 +19,7 @@ except ImportError:
 ROIBox = Tuple[int, int, int, int]
 ROICenter = Tuple[float, float]
 ROIHandPreference = Literal["right", "left", "largest", "first"]
+ROILockTarget = Literal["right", "left", "largest", "first"]
 
 
 @dataclass
@@ -51,9 +52,9 @@ class HandROIDetector:
         padding_px: int = 40,
         hand_preference: ROIHandPreference = "right",
         max_missing_frames: int = 5,
-        lock_target: bool = True,
-        lock_max_missing_frames: int = 10,
-        lock_max_center_distance_ratio: float = 0.35,
+        lock_target: bool | str = "right",
+        lock_max_missing_frames: int = 5,
+        lock_max_center_distance_ratio: float = 0.3,
         lock_strict: bool = True,
     ) -> None:
         if not _MEDIAPIPE_AVAILABLE:
@@ -67,12 +68,16 @@ class HandROIDetector:
         self._previous_roi: ROIBox | None = None
         self._previous_label: str | None = None
         self._missing_preferred_frames = 0
-        self._lock_target = bool(lock_target)
+        self._lock_target, self._lock_target_hand = self._normalize_lock_target(
+            lock_target
+        )
         self.locked_roi: ROIBox | None = None
         self.locked_center: ROICenter | None = None
         self.locked_label: str | None = None
         self.frames_since_lock_seen = 0
+        self.frames_without_any_hand = 0
         self.max_lock_missing_frames = max(0, int(lock_max_missing_frames))
+        self.max_no_hand_fallback_frames = max(10, self.max_lock_missing_frames * 2)
         self._lock_max_center_distance_ratio = max(
             0.0,
             float(lock_max_center_distance_ratio),
@@ -109,6 +114,19 @@ class HandROIDetector:
                 "roi_hand_preference must be one of: right, left, largest, first."
             )
         return normalized  # type: ignore[return-value]
+
+    def _normalize_lock_target(self, value: bool | str) -> tuple[bool, ROILockTarget]:
+        if isinstance(value, bool):
+            return value, self._hand_preference
+
+        normalized = str(value or "right").strip().lower()
+        if normalized in {"false", "off", "none", "disabled"}:
+            return False, self._hand_preference
+        if normalized not in {"right", "left", "largest", "first"}:
+            raise ValueError(
+                "roi_lock_target must be one of: right, left, largest, first."
+            )
+        return True, normalized  # type: ignore[return-value]
 
     def _extract_tasks_label(self, results: object, hand_index: int) -> str | None:
         handedness_list = getattr(results, "handedness", None) or []
@@ -249,11 +267,41 @@ class HandROIDetector:
 
         return largest, "largest"
 
+    def _lock_target_candidates(
+        self,
+        hand_rois: list[_DetectedHandROI],
+    ) -> list[_DetectedHandROI]:
+        if not hand_rois:
+            return []
+
+        if self._lock_target_hand == "first":
+            return [hand_rois[0]]
+        if self._lock_target_hand == "largest":
+            return [max(hand_rois, key=lambda hand: hand.area)]
+
+        return [hand for hand in hand_rois if hand.label == self._lock_target_hand]
+
+    def _select_initial_locked_roi(
+        self,
+        hand_rois: list[_DetectedHandROI],
+    ) -> tuple[_DetectedHandROI | None, str | None]:
+        target_candidates = self._lock_target_candidates(hand_rois)
+        if target_candidates:
+            selected = max(target_candidates, key=lambda hand: hand.area)
+            return selected, self._lock_target_hand
+
+        # In strict mode, do not bootstrap the lock from the wrong hand.
+        if self._lock_strict and self._lock_target_hand in {"right", "left"}:
+            return None, None
+
+        return self._select_initial_hand_roi(hand_rois)
+
     def _update_lock(self, selected: _DetectedHandROI, label: str | None) -> None:
         self.locked_roi = selected.roi
         self.locked_center = selected.center
-        self.locked_label = label or selected.label or self._hand_preference
+        self.locked_label = label or selected.label or self._lock_target_hand
         self.frames_since_lock_seen = 0
+        self.frames_without_any_hand = 0
 
     def _select_locked_roi(
         self,
@@ -261,37 +309,58 @@ class HandROIDetector:
         frame_width: int,
     ) -> tuple[ROIBox | None, str | None, bool]:
         if self.locked_roi is None or self.locked_center is None:
-            selected, label = self._select_initial_hand_roi(hand_rois)
+            selected, label = self._select_initial_locked_roi(hand_rois)
             if selected is None:
                 return None, None, False
 
             self._update_lock(selected, label)
-            return selected.roi, f"{self.locked_label} locked", True
+            return selected.roi, self.locked_label, True
 
         if hand_rois:
+            self.frames_without_any_hand = 0
+            target_candidates = self._lock_target_candidates(hand_rois)
+            if not target_candidates:
+                self.frames_since_lock_seen += 1
+                if self._lock_strict:
+                    return self.locked_roi, "locked", False
+
+                if self.frames_since_lock_seen <= self.max_no_hand_fallback_frames:
+                    return self.locked_roi, "locked", False
+
+                selected, label = self._select_initial_hand_roi(hand_rois)
+                if selected is None:
+                    return self.locked_roi, "locked", False
+
+                self._update_lock(selected, label)
+                return selected.roi, self.locked_label, True
+
             closest = min(
-                hand_rois,
+                target_candidates,
                 key=lambda hand: self._center_distance(hand.center, self.locked_center),
             )
             max_distance = frame_width * self._lock_max_center_distance_ratio
             distance = self._center_distance(closest.center, self.locked_center)
             if distance <= max_distance:
                 self._update_lock(closest, self.locked_label)
-                return closest.roi, f"{self.locked_label} locked", True
+                return closest.roi, self.locked_label, True
 
+            self.frames_since_lock_seen += 1
+            return self.locked_roi, "locked", False
+
+        self.frames_without_any_hand += 1
         self.frames_since_lock_seen += 1
-        if self.frames_since_lock_seen <= self.max_lock_missing_frames:
-            return self.locked_roi, f"{self.locked_label or self._hand_preference} locked", False
+        if self.frames_without_any_hand <= self.max_no_hand_fallback_frames:
+            return self.locked_roi, "locked", False
 
         if self._lock_strict:
-            return self.locked_roi, "locked fallback", False
+            return None, None, False
 
         selected, label = self._select_initial_hand_roi(hand_rois)
         if selected is None:
             return None, None, False
 
         self._update_lock(selected, label)
-        return selected.roi, f"{self.locked_label} locked", True
+        return selected.roi, self.locked_label, True
 
     def _center_distance(self, center_a: ROICenter, center_b: ROICenter) -> float:
         ax, ay = center_a

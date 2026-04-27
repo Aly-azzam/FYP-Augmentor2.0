@@ -21,3 +21,4 @@ backend/storage/outputs/**
 backend/storage/mediapipe/**
 backend/storage/expert/**
 !**/.gitkeep
+backend/storage/learner/**
