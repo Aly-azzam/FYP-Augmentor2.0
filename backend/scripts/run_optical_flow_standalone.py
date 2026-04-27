@@ -14,6 +14,7 @@ if str(BACKEND_ROOT) not in sys.path:
 os.environ.setdefault("DATABASE_URL", "sqlite:///./augmentor.db")
 
 from app.services.optical_flow import (  # noqa: E402
+    FarnebackConfig,
     evaluate_optical_flow_summary,
     run_optical_flow_comparison,
 )
@@ -45,6 +46,47 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Also save HSV optical flow visualization videos.",
     )
+    parser.add_argument(
+        "--use-hand-roi",
+        action="store_true",
+        help="Run Farneback only inside detected MediaPipe hand ROIs when possible.",
+    )
+    parser.add_argument(
+        "--roi-padding-px",
+        type=int,
+        default=40,
+        help="Padding in pixels around the detected hand ROI.",
+    )
+    parser.add_argument(
+        "--roi-hand-preference",
+        choices=("right", "left", "largest", "first"),
+        default="right",
+        help="Which detected hand to track for ROI cropping.",
+    )
+    parser.add_argument(
+        "--roi-lock-target",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Lock ROI onto the initially selected target hand.",
+    )
+    parser.add_argument(
+        "--roi-lock-strict",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="When target lock is lost, avoid switching to another hand.",
+    )
+    parser.add_argument(
+        "--roi-lock-max-missing-frames",
+        type=int,
+        default=10,
+        help="Frames to reuse the locked ROI when the target is temporarily missing.",
+    )
+    parser.add_argument(
+        "--roi-lock-max-center-distance-ratio",
+        type=float,
+        default=0.35,
+        help="Maximum accepted locked-target center movement as a ratio of frame width.",
+    )
     return parser
 
 
@@ -61,10 +103,20 @@ def main() -> None:
 
     expert_video_path = _resolve_path(args.expert_video)
     learner_video_path = _resolve_path(args.learner_video)
+    farneback_config = FarnebackConfig(
+        use_hand_roi=args.use_hand_roi,
+        roi_padding_px=args.roi_padding_px,
+        roi_hand_preference=args.roi_hand_preference,
+        roi_lock_target=args.roi_lock_target,
+        roi_lock_strict=args.roi_lock_strict,
+        roi_lock_max_missing_frames=args.roi_lock_max_missing_frames,
+        roi_lock_max_center_distance_ratio=args.roi_lock_max_center_distance_ratio,
+    )
 
     raw_result, summary_result = run_optical_flow_comparison(
         expert_video_path=expert_video_path,
         learner_video_path=learner_video_path,
+        config=farneback_config,
     )
 
     evaluation = evaluate_optical_flow_summary(summary_result)
@@ -80,6 +132,7 @@ def main() -> None:
             learner_video_path=learner_video_path,
             output_dir=OUTPUT_DIR / "visualizations",
             run_id=raw_result.run.run_id,
+            config=farneback_config,
         )
 
     similarities = evaluation["similarities"]
@@ -87,6 +140,7 @@ def main() -> None:
 
     es = summary_result.expert_summary
     ls = summary_result.learner_summary
+    metrics = summary_result.comparison_metrics
 
     print(f"run_id:               {raw_result.run.run_id}")
     print(f"summary_json_path:    {summary_json_path}")
@@ -95,16 +149,28 @@ def main() -> None:
     print(f"magnitude_similarity: {similarities['magnitude_similarity']}")
     print(f"motion_area_similarity: {similarities['motion_area_similarity']}")
     print(f"angle_similarity:     {similarities['angle_similarity']}")
+    print(f"vibration_difference: {metrics.vibration_difference}")
+    print(f"vibration_ratio:      {metrics.vibration_ratio}")
 
     print("\nexpert_summary:")
     print(f"  vibration_score:     {es.vibration_score}")
     print(f"  magnitude_jitter:    {es.magnitude_jitter}")
     print(f"  magnitude_std:       {es.magnitude_std}")
+    print(f"  vibration_high_freq_mean: {es.vibration_high_freq_mean}")
+    print(f"  vibration_high_freq_max:  {es.vibration_high_freq_max}")
+    print(f"  roi_usage_ratio:     {es.roi_usage_ratio}")
+    print(f"  roi_frames_used:     {es.roi_frames_used}")
+    print(f"  roi_fallback_frames: {es.roi_fallback_frames}")
 
     print("\nlearner_summary:")
     print(f"  vibration_score:     {ls.vibration_score}")
     print(f"  magnitude_jitter:    {ls.magnitude_jitter}")
     print(f"  magnitude_std:       {ls.magnitude_std}")
+    print(f"  vibration_high_freq_mean: {ls.vibration_high_freq_mean}")
+    print(f"  vibration_high_freq_max:  {ls.vibration_high_freq_max}")
+    print(f"  roi_usage_ratio:     {ls.roi_usage_ratio}")
+    print(f"  roi_frames_used:     {ls.roi_frames_used}")
+    print(f"  roi_fallback_frames: {ls.roi_fallback_frames}")
 
 
 if __name__ == "__main__":

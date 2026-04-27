@@ -23,6 +23,7 @@ from .schemas import (
     RawOpticalFlowResult,
     RunInfo,
     SummaryOpticalFlowResult,
+    VideoFlowSummary,
 )
 
 
@@ -134,6 +135,8 @@ def _compute_robust_peak_magnitude(frames: List[FrameFlowFeatures]) -> float:
 def _build_comparison_metrics(
     expert_frames: List[FrameFlowFeatures],
     learner_frames: List[FrameFlowFeatures],
+    expert_summary: VideoFlowSummary,
+    learner_summary: VideoFlowSummary,
 ) -> ComparisonMetrics:
     # Smooth curves first
     expert_mean_magnitudes = smooth_signal(
@@ -194,12 +197,22 @@ def _build_comparison_metrics(
         learner_frames,
         active_motion_threshold=0.1,
     )
+    vibration_difference = (
+        learner_summary.vibration_score - expert_summary.vibration_score
+    )
+    vibration_ratio = (
+        learner_summary.vibration_score / expert_summary.vibration_score
+        if expert_summary.vibration_score > 0
+        else 0.0
+    )
 
     return ComparisonMetrics(
         mean_magnitude_difference=round(mean_magnitude_difference, 6),
         peak_magnitude_difference=round(peak_magnitude_difference, 6),
         motion_area_difference=round(motion_area_difference, 6),
         mean_direction_difference_deg=round(mean_direction_difference_deg, 6),
+        vibration_difference=round(vibration_difference, 6),
+        vibration_ratio=round(vibration_ratio, 6),
         magnitude_curve_mae=round(magnitude_curve_mae, 6),
         angle_curve_mae_deg=round(angle_curve_mae_deg, 6),
         motion_area_curve_mae=round(motion_area_curve_mae, 6),
@@ -216,6 +229,7 @@ def _build_interpretation_ready(
         "peak_magnitude_difference": metrics.peak_magnitude_difference,
         "motion_area_difference": metrics.motion_area_difference,
         "mean_direction_difference_deg": metrics.mean_direction_difference_deg,
+        "vibration_difference": abs(metrics.vibration_difference),
         "magnitude_curve_mae": metrics.magnitude_curve_mae,
         "angle_curve_mae_deg": metrics.angle_curve_mae_deg,
         "motion_area_curve_mae": metrics.motion_area_curve_mae,
@@ -239,6 +253,9 @@ def _build_interpretation_ready(
 
     if metrics.mean_direction_difference_deg >= 25 or metrics.angle_curve_mae_deg >= 40:
         observations.append("Learner motion direction differs noticeably from expert")
+
+    if metrics.vibration_difference > 0.05:
+        observations.append("Learner motion shows higher vibration/instability than expert")
 
     if not observations:
         if metrics.mean_magnitude_difference < 0.2 and metrics.motion_area_difference < 0.05:
@@ -298,9 +315,21 @@ def run_optical_flow_comparison(
     expert_used, learner_used = _truncate_to_shorter(expert_frames, learner_frames)
     frame_count_used = min(len(expert_used), len(learner_used))
 
-    expert_summary = build_video_flow_summary(expert_used)
-    learner_summary = build_video_flow_summary(learner_used)
-    comparison_metrics = _build_comparison_metrics(expert_used, learner_used)
+    roi_enabled = bool(config.use_hand_roi) if config is not None else False
+    expert_summary = build_video_flow_summary(
+        expert_used,
+        roi_enabled=roi_enabled,
+    )
+    learner_summary = build_video_flow_summary(
+        learner_used,
+        roi_enabled=roi_enabled,
+    )
+    comparison_metrics = _build_comparison_metrics(
+        expert_used,
+        learner_used,
+        expert_summary=expert_summary,
+        learner_summary=learner_summary,
+    )
     interpretation_ready = _build_interpretation_ready(
         comparison_metrics,
         expert_summary,

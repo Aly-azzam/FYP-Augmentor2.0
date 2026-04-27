@@ -90,6 +90,7 @@ def extract_frame_flow_features(
     frame_index: int,
     timestamp_sec: float,
     motion_threshold: float = 2.0,
+    roi_used: bool = False,
 ) -> FrameFlowFeatures:
     """
     Extract summary features from one dense optical flow frame.
@@ -111,6 +112,7 @@ def extract_frame_flow_features(
         max_magnitude=round(max_magnitude, 6),
         mean_angle_deg=round(mean_angle, 6),
         motion_area_ratio=round(motion_area_ratio, 6),
+        roi_used=roi_used,
     )
 
 
@@ -193,11 +195,30 @@ def _compute_magnitude_jitter(mean_magnitudes: List[float]) -> float:
     return float(np.mean(diffs)) if diffs.size > 0 else 0.0
 
 
-def _compute_vibration_score(magnitude_jitter: float) -> float:
+def _compute_high_frequency_vibration(
+    raw_signal: List[float],
+    smoothed_signal: List[float],
+) -> tuple[float, float]:
     """
-    Simple normalized vibration score in [0, 1].
+    Measure rapid motion instability as the residual from a smoothed signal.
     """
-    return float(np.clip(magnitude_jitter / 1.0, 0.0, 1.0))
+    if not raw_signal or len(raw_signal) != len(smoothed_signal):
+        return 0.0, 0.0
+
+    raw_arr = np.asarray(raw_signal, dtype=np.float32)
+    smoothed_arr = np.asarray(smoothed_signal, dtype=np.float32)
+    high_freq = np.abs(raw_arr - smoothed_arr)
+
+    high_freq_mean = float(np.mean(high_freq)) if high_freq.size > 0 else 0.0
+    high_freq_max = float(np.max(high_freq)) if high_freq.size > 0 else 0.0
+    return high_freq_mean, high_freq_max
+
+
+def _compute_vibration_score(vibration_high_freq_mean: float) -> float:
+    """
+    Normalize high-frequency motion instability into [0, 1].
+    """
+    return min(1.0, vibration_high_freq_mean / 0.2)
 
 
 def _compute_robust_peak_magnitude(max_magnitudes: List[float]) -> float:
@@ -214,6 +235,7 @@ def _compute_robust_peak_magnitude(max_magnitudes: List[float]) -> float:
 
 def build_video_flow_summary(
     frame_features: List[FrameFlowFeatures],
+    roi_enabled: bool = False,
 ) -> VideoFlowSummary:
     """
     Aggregate per-frame flow features into a video-level summary.
@@ -227,7 +249,10 @@ def build_video_flow_summary(
             motion_stability_score=0.0,
             magnitude_std=0.0,
             magnitude_jitter=0.0,
+            vibration_high_freq_mean=0.0,
+            vibration_high_freq_max=0.0,
             vibration_score=0.0,
+            roi_enabled=roi_enabled,
         )
 
     raw_mean_magnitudes = [f.mean_magnitude for f in frame_features]
@@ -256,7 +281,19 @@ def build_video_flow_summary(
     motion_stability_score = _compute_motion_stability_score(mean_magnitudes)
     magnitude_std = _compute_magnitude_std(raw_mean_magnitudes)
     magnitude_jitter = _compute_magnitude_jitter(raw_mean_magnitudes)
-    vibration_score = _compute_vibration_score(magnitude_jitter)
+    vibration_high_freq_mean, vibration_high_freq_max = _compute_high_frequency_vibration(
+        raw_signal=raw_mean_magnitudes,
+        smoothed_signal=mean_magnitudes,
+    )
+    vibration_score = _compute_vibration_score(vibration_high_freq_mean)
+    roi_frames_used = sum(1 for f in frame_features if f.roi_used)
+    roi_enabled = roi_enabled or roi_frames_used > 0
+    roi_fallback_frames = len(frame_features) - roi_frames_used if roi_enabled else 0
+    roi_usage_ratio = (
+        roi_frames_used / len(frame_features)
+        if frame_features and roi_enabled
+        else 0.0
+    )
 
     return VideoFlowSummary(
         avg_magnitude=round(avg_magnitude, 6),
@@ -266,5 +303,11 @@ def build_video_flow_summary(
         motion_stability_score=round(motion_stability_score, 6),
         magnitude_std=round(magnitude_std, 6),
         magnitude_jitter=round(magnitude_jitter, 6),
+        vibration_high_freq_mean=round(vibration_high_freq_mean, 6),
+        vibration_high_freq_max=round(vibration_high_freq_max, 6),
         vibration_score=round(vibration_score, 6),
+        roi_enabled=roi_enabled,
+        roi_frames_used=roi_frames_used,
+        roi_fallback_frames=roi_fallback_frames,
+        roi_usage_ratio=round(roi_usage_ratio, 6),
     )

@@ -10,5 +10,6 @@ python-dotenv
 pytest
 numpy
 opencv-python
+imageio-ffmpeg
 mediapipe
 psycopg2-binary

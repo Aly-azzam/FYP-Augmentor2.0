@@ -25,6 +25,20 @@ class FarnebackConfig:
     resize_height: int | None = None
     #: Odd kernel size for cv2.GaussianBlur before flow, e.g. 5 -> (5, 5). 0 = disabled.
     gaussian_blur_kernel: int = 5
+    #: When True, run Farneback only inside a MediaPipe hand bounding box.
+    use_hand_roi: bool = False
+    #: Padding added around the detected hand bounding box, in pixels.
+    roi_padding_px: int = 40
+    #: Which hand to track for ROI cropping: right, left, largest, or first.
+    roi_hand_preference: str = "right"
+    #: Lock onto the initially selected ROI target and track by nearest center.
+    roi_lock_target: bool = True
+    #: Number of frames to reuse locked ROI before strict/loose fallback logic.
+    roi_lock_max_missing_frames: int = 10
+    #: Maximum accepted center movement as a ratio of frame width.
+    roi_lock_max_center_distance_ratio: float = 0.35
+    #: If True, never switch to another hand after lock is lost.
+    roi_lock_strict: bool = True
 
 
 def _validate_video_path(video_path: str | Path) -> Path:
@@ -135,46 +149,94 @@ def compute_video_optical_flow_features(
 
     fps = metadata.fps if metadata.fps > 0 else 1.0
     frame_index = 1
+    roi_detector = None
 
-    while True:
-        success, curr_frame = cap.read()
-        if not success or curr_frame is None:
-            break
-
-        curr_frame = _resize_frame_if_needed(
-            curr_frame,
-            config.resize_width,
-            config.resize_height,
-        )
-        curr_gray = _to_gray(curr_frame)
-
-        prev_for_flow = _blur_gray_for_flow(prev_gray, config.gaussian_blur_kernel)
-        curr_for_flow = _blur_gray_for_flow(curr_gray, config.gaussian_blur_kernel)
-
-        flow = cv2.calcOpticalFlowFarneback(
-            prev=prev_for_flow,
-            next=curr_for_flow,
-            flow=None,
-            pyr_scale=config.pyr_scale,
-            levels=config.levels,
-            winsize=config.winsize,
-            iterations=config.iterations,
-            poly_n=config.poly_n,
-            poly_sigma=config.poly_sigma,
-            flags=config.flags,
+    if config.use_hand_roi:
+        from .hand_roi import (
+            HandROIDetector,
+            crop_to_roi,
+            embed_roi_flow_in_canvas,
         )
 
-        timestamp_sec = frame_index / fps
-        features = extract_frame_flow_features(
-            flow=flow,
-            frame_index=frame_index,
-            timestamp_sec=timestamp_sec,
-            motion_threshold=config.motion_threshold,
+        roi_detector = HandROIDetector(
+            padding_px=config.roi_padding_px,
+            hand_preference=config.roi_hand_preference,
+            lock_target=config.roi_lock_target,
+            lock_max_missing_frames=config.roi_lock_max_missing_frames,
+            lock_max_center_distance_ratio=config.roi_lock_max_center_distance_ratio,
+            lock_strict=config.roi_lock_strict,
         )
-        frame_features.append(features)
 
-        prev_gray = curr_gray
-        frame_index += 1
+    try:
+        while True:
+            success, curr_frame = cap.read()
+            if not success or curr_frame is None:
+                break
 
-    cap.release()
+            curr_frame = _resize_frame_if_needed(
+                curr_frame,
+                config.resize_width,
+                config.resize_height,
+            )
+            curr_gray = _to_gray(curr_frame)
+
+            prev_for_flow = _blur_gray_for_flow(prev_gray, config.gaussian_blur_kernel)
+            curr_for_flow = _blur_gray_for_flow(curr_gray, config.gaussian_blur_kernel)
+            roi_used = False
+            roi = roi_detector.detect(curr_frame) if roi_detector is not None else None
+
+            if roi is not None:
+                roi_prev = crop_to_roi(prev_for_flow, roi)
+                roi_curr = crop_to_roi(curr_for_flow, roi)
+                roi_flow = cv2.calcOpticalFlowFarneback(
+                    prev=roi_prev,
+                    next=roi_curr,
+                    flow=None,
+                    pyr_scale=config.pyr_scale,
+                    levels=config.levels,
+                    winsize=config.winsize,
+                    iterations=config.iterations,
+                    poly_n=config.poly_n,
+                    poly_sigma=config.poly_sigma,
+                    flags=config.flags,
+                )
+                height, width = curr_gray.shape[:2]
+                flow = embed_roi_flow_in_canvas(
+                    roi_flow=roi_flow,
+                    roi=roi,
+                    height=height,
+                    width=width,
+                )
+                roi_used = True
+            else:
+                flow = cv2.calcOpticalFlowFarneback(
+                    prev=prev_for_flow,
+                    next=curr_for_flow,
+                    flow=None,
+                    pyr_scale=config.pyr_scale,
+                    levels=config.levels,
+                    winsize=config.winsize,
+                    iterations=config.iterations,
+                    poly_n=config.poly_n,
+                    poly_sigma=config.poly_sigma,
+                    flags=config.flags,
+                )
+
+            timestamp_sec = frame_index / fps
+            features = extract_frame_flow_features(
+                flow=flow,
+                frame_index=frame_index,
+                timestamp_sec=timestamp_sec,
+                motion_threshold=config.motion_threshold,
+                roi_used=roi_used,
+            )
+            frame_features.append(features)
+
+            prev_gray = curr_gray
+            frame_index += 1
+    finally:
+        cap.release()
+        if roi_detector is not None:
+            roi_detector.close()
+
     return metadata, frame_features

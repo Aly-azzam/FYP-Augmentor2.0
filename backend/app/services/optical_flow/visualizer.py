@@ -118,59 +118,141 @@ def visualize_video_optical_flow_hsv(
         raise RuntimeError(f"Failed to open VideoWriter for output: {output_path}")
 
     frame_index = 1
+    roi_detector = None
 
-    while True:
-        success, curr_frame = cap.read()
-        if not success or curr_frame is None:
-            break
-
-        curr_frame = _resize_frame_if_needed(
-            curr_frame,
-            config.resize_width,
-            config.resize_height,
-        )
-        curr_gray = _to_gray(curr_frame)
-
-        prev_for_flow = _blur_gray_for_flow(prev_gray, config.gaussian_blur_kernel)
-        curr_for_flow = _blur_gray_for_flow(curr_gray, config.gaussian_blur_kernel)
-
-        flow = cv2.calcOpticalFlowFarneback(
-            prev=prev_for_flow,
-            next=curr_for_flow,
-            flow=None,
-            pyr_scale=config.pyr_scale,
-            levels=config.levels,
-            winsize=config.winsize,
-            iterations=config.iterations,
-            poly_n=config.poly_n,
-            poly_sigma=config.poly_sigma,
-            flags=config.flags,
+    if config.use_hand_roi:
+        from .hand_roi import (
+            HandROIDetector,
+            crop_to_roi,
+            embed_roi_flow_in_canvas,
         )
 
-        vis_frame = flow_to_hsv_bgr(
-            flow,
-            magnitude_clip_percentile=magnitude_clip_percentile,
+        roi_detector = HandROIDetector(
+            padding_px=config.roi_padding_px,
+            hand_preference=config.roi_hand_preference,
+            lock_target=config.roi_lock_target,
+            lock_max_missing_frames=config.roi_lock_max_missing_frames,
+            lock_max_center_distance_ratio=config.roi_lock_max_center_distance_ratio,
+            lock_strict=config.roi_lock_strict,
         )
 
-        label = overlay_text if overlay_text else input_path.stem
-        cv2.putText(
-            vis_frame,
-            f"{label} | frame={frame_index}",
-            (10, 24),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (255, 255, 255),
-            2,
-            cv2.LINE_AA,
-        )
+    try:
+        while True:
+            success, curr_frame = cap.read()
+            if not success or curr_frame is None:
+                break
 
-        writer.write(vis_frame)
+            curr_frame = _resize_frame_if_needed(
+                curr_frame,
+                config.resize_width,
+                config.resize_height,
+            )
+            curr_gray = _to_gray(curr_frame)
 
-        prev_gray = curr_gray
-        frame_index += 1
+            prev_for_flow = _blur_gray_for_flow(prev_gray, config.gaussian_blur_kernel)
+            curr_for_flow = _blur_gray_for_flow(curr_gray, config.gaussian_blur_kernel)
+            roi = roi_detector.detect(curr_frame) if roi_detector is not None else None
+            roi_used = False
 
-    cap.release()
-    writer.release()
+            if roi is not None:
+                roi_prev = crop_to_roi(prev_for_flow, roi)
+                roi_curr = crop_to_roi(curr_for_flow, roi)
+                roi_flow = cv2.calcOpticalFlowFarneback(
+                    prev=roi_prev,
+                    next=roi_curr,
+                    flow=None,
+                    pyr_scale=config.pyr_scale,
+                    levels=config.levels,
+                    winsize=config.winsize,
+                    iterations=config.iterations,
+                    poly_n=config.poly_n,
+                    poly_sigma=config.poly_sigma,
+                    flags=config.flags,
+                )
+                flow = embed_roi_flow_in_canvas(
+                    roi_flow=roi_flow,
+                    roi=roi,
+                    height=height,
+                    width=width,
+                )
+                roi_used = True
+            else:
+                flow = cv2.calcOpticalFlowFarneback(
+                    prev=prev_for_flow,
+                    next=curr_for_flow,
+                    flow=None,
+                    pyr_scale=config.pyr_scale,
+                    levels=config.levels,
+                    winsize=config.winsize,
+                    iterations=config.iterations,
+                    poly_n=config.poly_n,
+                    poly_sigma=config.poly_sigma,
+                    flags=config.flags,
+                )
+
+            vis_frame = flow_to_hsv_bgr(
+                flow,
+                magnitude_clip_percentile=magnitude_clip_percentile,
+            )
+
+            roi_status = ""
+            if config.use_hand_roi:
+                dim_context = cv2.convertScaleAbs(curr_frame, alpha=0.45, beta=12)
+                flow_overlay = cv2.addWeighted(
+                    dim_context,
+                    0.35,
+                    vis_frame,
+                    0.9,
+                    0,
+                )
+                moving_mask = np.linalg.norm(flow, axis=2) > 1e-6
+                vis_frame = np.where(
+                    moving_mask[..., None],
+                    flow_overlay,
+                    dim_context,
+                ).astype(np.uint8)
+
+                roi_label = (
+                    getattr(roi_detector, "last_roi_label", None)
+                    if roi_detector is not None
+                    else None
+                )
+                if roi_used:
+                    roi_status = f" [ROI:{roi_label or 'active'}]"
+                else:
+                    roi_status = " [fallback]"
+                if roi is not None:
+                    x1, y1, x2, y2 = roi
+                    cv2.rectangle(
+                        vis_frame,
+                        (x1, y1),
+                        (x2, y2),
+                        (0, 255, 0),
+                        2,
+                    )
+
+            label = overlay_text if overlay_text else input_path.stem
+            cv2.putText(
+                vis_frame,
+                f"{label}{roi_status} | frame={frame_index}",
+                (10, 24),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+
+            writer.write(vis_frame)
+
+            prev_gray = curr_gray
+            frame_index += 1
+    finally:
+        cap.release()
+        writer.release()
+        if roi_detector is not None:
+            roi_detector.close()
+
     return output_path
 
 

@@ -3,8 +3,8 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Numeric, String, Text, func
-from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
+from sqlalchemy import Boolean, DateTime, ForeignKey, JSON, Numeric, String, Text, func
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship, synonym
 
 from app.db.base import Base
@@ -40,11 +40,11 @@ class Evaluation(Base):
     score_confidence: Mapped[Decimal | None] = mapped_column(Numeric, nullable=True)
     explanation_confidence: Mapped[Decimal | None] = mapped_column(Numeric, nullable=True)
     gate_passed: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="true")
-    gate_reasons: Mapped[list[Any] | dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
-    metrics: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
-    per_metric_breakdown: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
-    key_error_moments: Mapped[list[dict[str, Any]] | None] = mapped_column(JSONB, nullable=True)
-    semantic_phases: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    gate_reasons: Mapped[list[Any] | dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    metrics: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    per_metric_breakdown: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    key_error_moments: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, nullable=True)
+    semantic_phases: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     summary_text: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

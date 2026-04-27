@@ -2,8 +2,8 @@ import uuid
 from datetime import datetime
 from typing import Any, Optional
 
-from sqlalchemy import DateTime, ForeignKey, String, Text, func
-from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
+from sqlalchemy import JSON, DateTime, ForeignKey, String, Text, func
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
@@ -26,10 +26,10 @@ class EvaluationFeedback(Base):
     mode: Mapped[str] = mapped_column(String(50), nullable=False)
     model_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     explanation_text: Mapped[str] = mapped_column(Text, nullable=False)
-    strengths: Mapped[Optional[list[str]]] = mapped_column(JSONB, nullable=True)
-    weaknesses: Mapped[Optional[list[str]]] = mapped_column(JSONB, nullable=True)
-    advice: Mapped[Optional[dict[str, Any] | list[str] | str]] = mapped_column(JSONB, nullable=True)
-    cited_timestamps: Mapped[Optional[list[dict[str, Any]]]] = mapped_column(JSONB, nullable=True)
+    strengths: Mapped[Optional[list[str]]] = mapped_column(JSON, nullable=True)
+    weaknesses: Mapped[Optional[list[str]]] = mapped_column(JSON, nullable=True)
+    advice: Mapped[Optional[dict[str, Any] | list[str] | str]] = mapped_column(JSON, nullable=True)
+    cited_timestamps: Mapped[Optional[list[dict[str, Any]]]] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

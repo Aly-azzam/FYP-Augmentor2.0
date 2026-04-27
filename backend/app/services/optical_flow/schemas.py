@@ -44,6 +44,10 @@ class FrameFlowFeatures(BaseModel):
         le=1,
         description="Ratio of moving pixels over total pixels",
     )
+    roi_used: bool = Field(
+        default=False,
+        description="True when hand ROI cropping was applied for this frame pair",
+    )
 
 
 class VideoFlowSummary(BaseModel):
@@ -77,11 +81,41 @@ class VideoFlowSummary(BaseModel):
         ge=0,
         description="Average absolute difference between consecutive mean magnitudes",
     )
+    vibration_high_freq_mean: float = Field(
+        ...,
+        ge=0,
+        description="Mean absolute high-frequency residual from smoothed motion magnitude",
+    )
+    vibration_high_freq_max: float = Field(
+        ...,
+        ge=0,
+        description="Maximum absolute high-frequency residual from smoothed motion magnitude",
+    )
     vibration_score: float = Field(
         ...,
         ge=0,
         le=1,
-        description="Simple normalized instability score based on magnitude jitter",
+        description="Normalized high-frequency motion instability score",
+    )
+    roi_enabled: bool = Field(
+        default=False,
+        description="Whether hand ROI cropping was used for this video summary",
+    )
+    roi_frames_used: int = Field(
+        default=0,
+        ge=0,
+        description="Number of frame pairs where hand ROI was detected and used",
+    )
+    roi_fallback_frames: int = Field(
+        default=0,
+        ge=0,
+        description="Number of frame pairs that fell back to full-frame flow",
+    )
+    roi_usage_ratio: float = Field(
+        default=0.0,
+        ge=0,
+        le=1,
+        description="Ratio of frame pairs where hand ROI was used",
     )
 
 
@@ -98,6 +132,15 @@ class ComparisonMetrics(BaseModel):
     peak_magnitude_difference: float = Field(..., ge=0)
     motion_area_difference: float = Field(..., ge=0)
     mean_direction_difference_deg: float = Field(..., ge=0, le=180)
+    vibration_difference: float = Field(
+        default=0.0,
+        description="Learner vibration score minus expert vibration score",
+    )
+    vibration_ratio: float = Field(
+        default=0.0,
+        ge=0,
+        description="Learner vibration score divided by expert vibration score",
+    )
 
     magnitude_curve_mae: float = Field(..., ge=0)
     angle_curve_mae_deg: float = Field(..., ge=0)

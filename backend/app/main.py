@@ -8,6 +8,7 @@ from app.core.config import settings
 from app.core.database import engine, get_db
 from app.db.base import Base
 from app.api.routes import courses, chapters, uploads, evaluations, history, progress
+from app.api.routes import optical_flow
 from app.api.routes import expert_mediapipe
 from app.api.mediapipe import router as mediapipe_router
 from fastapi import Depends
@@ -42,6 +43,7 @@ app.include_router(uploads.router)
 app.include_router(evaluations.router)
 app.include_router(history.router)
 app.include_router(progress.router)
+app.include_router(optical_flow.router)
 app.include_router(mediapipe_router)
 app.include_router(expert_mediapipe.router)
 app.mount("/storage", StaticFiles(directory=settings.STORAGE_ROOT), name="storage")
