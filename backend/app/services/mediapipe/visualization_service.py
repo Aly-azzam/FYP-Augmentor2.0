@@ -154,19 +154,22 @@ def _draw_strong_marker(
     cv2.circle(frame, center, inner_radius, color, thickness=-1, lineType=cv2.LINE_AA)
 
 
-def _draw_bbox(
+def _draw_landmark_bbox(
     frame: np.ndarray,
-    bbox,
-    width: int,
-    height: int,
+    landmarks_xy: List[Tuple[int, int]],
 ) -> None:
-    if bbox is None:
+    if not landmarks_xy:
         return
-    x_min = int(round(bbox.x_min * width))
-    y_min = int(round(bbox.y_min * height))
-    x_max = int(round(bbox.x_max * width))
-    y_max = int(round(bbox.y_max * height))
-    cv2.rectangle(frame, (x_min, y_min), (x_max, y_max), COLOR_BBOX, thickness=2, lineType=cv2.LINE_AA)
+    xs = [point[0] for point in landmarks_xy]
+    ys = [point[1] for point in landmarks_xy]
+    cv2.rectangle(
+        frame,
+        (min(xs), min(ys)),
+        (max(xs), max(ys)),
+        COLOR_BBOX,
+        thickness=2,
+        lineType=cv2.LINE_AA,
+    )
 
 
 def _draw_trajectory(
@@ -228,12 +231,15 @@ def _draw_overlay(
     height: int,
     show_text: bool,
 ) -> None:
-    # Trajectory is cheap to draw even when the current frame has no
-    # detection; it reflects the most recent wrist positions.
-    if feature_frame is not None:
-        _draw_trajectory(frame, feature_frame.trajectory_history, width, height)
+    hands = raw_frame.hands or (
+        [raw_frame.selected_hand] if raw_frame.selected_hand is not None else []
+    )
+    feature_by_label = {
+        hand_feature.handedness: hand_feature
+        for hand_feature in (feature_frame.hands if feature_frame is not None else [])
+    }
 
-    if not raw_frame.has_detection or raw_frame.selected_hand is None:
+    if not raw_frame.has_detection or not hands:
         if show_text:
             _draw_text_block(
                 frame,
@@ -241,41 +247,50 @@ def _draw_overlay(
             )
         return
 
-    selected = raw_frame.selected_hand
+    for hand in hands:
+        hand_feature = feature_by_label.get(hand.handedness)
+        if hand_feature is not None:
+            _draw_trajectory(frame, hand_feature.trajectory_history, width, height)
 
-    landmarks_xy: List[Tuple[int, int]] = []
-    for landmark in selected.landmarks:
-        landmarks_xy.append(
-            (
-                int(round(landmark.x * width)),
-                int(round(landmark.y * height)),
+        landmarks_xy: List[Tuple[int, int]] = []
+        for landmark in hand.landmarks:
+            landmarks_xy.append(
+                (
+                    int(round(landmark.x * width)),
+                    int(round(landmark.y * height)),
+                )
             )
-        )
 
-    if feature_frame is not None and feature_frame.hand_bbox is not None:
-        _draw_bbox(frame, feature_frame.hand_bbox, width, height)
+        _draw_landmark_bbox(frame, landmarks_xy)
+        _draw_skeleton(frame, landmarks_xy)
 
-    _draw_skeleton(frame, landmarks_xy)
+        wrist_xy = _denormalize_point(hand.wrist, width, height)
+        index_xy = _denormalize_point(hand.index_tip, width, height)
+        thumb_xy = _denormalize_point(hand.thumb_tip, width, height)
+        middle_xy = _denormalize_point(hand.middle_tip, width, height)
+        center_xy = _denormalize_point(hand.hand_center, width, height)
 
-    wrist_xy = _denormalize_point(selected.wrist, width, height)
-    index_xy = _denormalize_point(selected.index_tip, width, height)
-    thumb_xy = _denormalize_point(selected.thumb_tip, width, height)
-    middle_xy = _denormalize_point(selected.middle_tip, width, height)
-    center_xy = _denormalize_point(selected.hand_center, width, height)
-
-    _draw_strong_marker(frame, wrist_xy, color=COLOR_WRIST, inner_radius=7, outer_radius=14)
-    _draw_strong_marker(frame, index_xy, color=COLOR_INDEX_TIP, inner_radius=5, outer_radius=10)
-    _draw_strong_marker(frame, thumb_xy, color=COLOR_THUMB_TIP, inner_radius=5, outer_radius=10)
-    _draw_strong_marker(frame, middle_xy, color=COLOR_MIDDLE_TIP, inner_radius=5, outer_radius=10)
-    _draw_strong_marker(frame, center_xy, color=COLOR_HAND_CENTER, inner_radius=4, outer_radius=8)
+        _draw_strong_marker(frame, wrist_xy, color=COLOR_WRIST, inner_radius=7, outer_radius=14)
+        _draw_strong_marker(frame, index_xy, color=COLOR_INDEX_TIP, inner_radius=5, outer_radius=10)
+        _draw_strong_marker(frame, thumb_xy, color=COLOR_THUMB_TIP, inner_radius=5, outer_radius=10)
+        _draw_strong_marker(frame, middle_xy, color=COLOR_MIDDLE_TIP, inner_radius=5, outer_radius=10)
+        _draw_strong_marker(frame, center_xy, color=COLOR_HAND_CENTER, inner_radius=4, outer_radius=8)
 
     if show_text:
         lines = [
             f"frame {raw_frame.frame_index}",
-            f"hand: {selected.handedness}  conf: {selected.detection_confidence:.2f}",
+            f"hands: {len(hands)}",
+            ", ".join(
+                f"{hand.handedness} {hand.detection_confidence:.2f}"
+                for hand in hands
+            ),
         ]
         if feature_frame is not None and feature_frame.hand_orientation_deg is not None:
-            lines.append(f"orientation: {feature_frame.hand_orientation_deg:.1f} deg")
+            selected = raw_frame.selected_hand
+            selected_label = selected.handedness if selected is not None else "primary"
+            lines.append(
+                f"{selected_label} orientation: {feature_frame.hand_orientation_deg:.1f} deg"
+            )
         _draw_text_block(frame, lines)
 
 

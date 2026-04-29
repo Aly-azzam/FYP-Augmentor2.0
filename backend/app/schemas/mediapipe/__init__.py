@@ -7,6 +7,7 @@ features produced by the MediaPipe Hands extraction pipeline.
 from app.schemas.mediapipe.mediapipe_schema import (
     MediaPipeDetectionsDocument,
     MediaPipeFeaturesDocument,
+    MediaPipeHandFrameFeatures,
     MediaPipeFrameFeatures,
     MediaPipeFrameRaw,
     MediaPipeHandBoundingBox,
@@ -19,6 +20,7 @@ from app.schemas.mediapipe.mediapipe_schema import (
 __all__ = [
     "MediaPipeDetectionsDocument",
     "MediaPipeFeaturesDocument",
+    "MediaPipeHandFrameFeatures",
     "MediaPipeFrameFeatures",
     "MediaPipeFrameRaw",
     "MediaPipeHandBoundingBox",

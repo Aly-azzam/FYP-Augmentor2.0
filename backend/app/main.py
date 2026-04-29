@@ -5,9 +5,10 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.core.database import get_db
+from app.core.database import engine, get_db
+from app.db.base import Base
 from app.api.routes import courses, chapters, uploads, evaluations, history, progress
-from app.api.routes import expert_mediapipe, expert_sam2, inspection
+from app.api.routes import expert_mediapipe, expert_sam2, inspection, optical_flow
 from app.api import sam2_yolo
 from app.api.mediapipe import router as mediapipe_router
 from app.api.sam2 import router as sam2_router
@@ -43,6 +44,7 @@ app.include_router(uploads.router)
 app.include_router(evaluations.router)
 app.include_router(history.router)
 app.include_router(progress.router)
+app.include_router(optical_flow.router)
 app.include_router(mediapipe_router)
 app.include_router(sam2_router)
 app.include_router(sam2_yolo.router)
@@ -50,6 +52,13 @@ app.include_router(expert_mediapipe.router)
 app.include_router(expert_sam2.router)
 app.include_router(inspection.router)
 app.mount("/storage", StaticFiles(directory=settings.STORAGE_ROOT), name="storage")
+
+
+@app.on_event("startup")
+def ensure_database_tables() -> None:
+    """Create core tables if the database is empty or freshly created."""
+    Base.metadata.create_all(bind=engine)
+
 
 @app.get("/health", tags=["Health"])
 async def health_check():

@@ -1,8 +1,8 @@
 """MediaPipe Hands extraction service.
 
 This service walks a video frame by frame with OpenCV, runs MediaPipe
-Hands on each frame, picks a single hand per frame (prefer right hand,
-otherwise the first detected hand), and writes two JSON documents into a
+Hands on each frame, records every detected hand, keeps a primary selected
+hand for backwards-compatible feature extraction, and writes two JSON documents into a
 dedicated run folder under ``backend/storage/mediapipe/runs/<run_id>/``:
 
     detections.json   -> raw per-frame extraction (MediaPipeDetectionsDocument)
@@ -104,29 +104,6 @@ def _initialize_hands_detector(
         min_tracking_confidence=min_tracking_confidence,
     )
     return mp.tasks.vision.HandLandmarker.create_from_options(options)
-
-
-def _select_hand_index(handedness_per_hand: Optional[list]) -> int:
-    """Prefer a right hand when present, otherwise take the first detection.
-
-    ``handedness_per_hand`` is the Tasks API ``results.handedness`` list:
-    ``list[list[Category]]``. We look at the top-ranked category for each
-    hand and return the first index whose normalized label is ``"Right"``;
-    if none is found, we default to index ``0``.
-    """
-    if not handedness_per_hand:
-        return 0
-    for hand_index, categories in enumerate(handedness_per_hand):
-        if not categories:
-            continue
-        top_category = categories[0]
-        raw_label = getattr(top_category, "category_name", None)
-        if raw_label is None:
-            raw_label = getattr(top_category, "display_name", None)
-        label = normalize_handedness_label(raw_label)
-        if label == "Right":
-            return hand_index
-    return 0
 
 
 def _build_selected_hand(
@@ -270,39 +247,45 @@ def run_extraction(
             handedness_per_hand = getattr(results, "handedness", None) or []
             num_hands_detected = len(hand_landmarks_per_hand)
 
-            selected_hand: Optional[MediaPipeSelectedHandRaw] = None
+            detected_hands: List[MediaPipeSelectedHandRaw] = []
             if num_hands_detected > 0:
-                chosen_index = _select_hand_index(handedness_per_hand)
-                chosen_index = min(chosen_index, num_hands_detected - 1)
-                categories = (
-                    handedness_per_hand[chosen_index]
-                    if chosen_index < len(handedness_per_hand)
-                    else []
-                )
-                try:
-                    selected_hand = _build_selected_hand(
-                        hand_landmarks_per_hand[chosen_index],
-                        categories,
+                for hand_index, hand_landmarks in enumerate(hand_landmarks_per_hand):
+                    categories = (
+                        handedness_per_hand[hand_index]
+                        if hand_index < len(handedness_per_hand)
+                        else []
                     )
-                except MediaPipeExtractionError as exc:
-                    logger.warning(
-                        "Skipping hand on frame %s (%s).", frame_index, exc
-                    )
-                    selected_hand = None
+                    try:
+                        detected_hands.append(
+                            _build_selected_hand(hand_landmarks, categories)
+                        )
+                    except MediaPipeExtractionError as exc:
+                        logger.warning(
+                            "Skipping hand %s on frame %s (%s).",
+                            hand_index,
+                            frame_index,
+                            exc,
+                        )
 
-                if selected_hand is not None:
+                if detected_hands:
                     frames_with_detection += 1
-                    if selected_hand.handedness == "Right":
+                    if any(hand.handedness == "Right" for hand in detected_hands):
                         right_hand_selected_count += 1
-                    elif selected_hand.handedness == "Left":
+                    if any(hand.handedness == "Left" for hand in detected_hands):
                         left_hand_selected_count += 1
+
+            selected_hand = next(
+                (hand for hand in detected_hands if hand.handedness == "Right"),
+                detected_hands[0] if detected_hands else None,
+            )
 
             detections_frames.append(
                 MediaPipeFrameRaw(
                     frame_index=frame_index,
                     timestamp_sec=timestamp_sec,
-                    has_detection=selected_hand is not None,
-                    num_hands_detected=num_hands_detected,
+                    has_detection=bool(detected_hands),
+                    num_hands_detected=len(detected_hands),
+                    hands=detected_hands,
                     selected_hand=selected_hand,
                 )
             )

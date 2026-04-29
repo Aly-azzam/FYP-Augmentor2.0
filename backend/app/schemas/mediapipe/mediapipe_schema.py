@@ -33,7 +33,7 @@ class MediaPipeLandmarkPoint(BaseModel):
 
 
 class MediaPipeSelectedHandRaw(BaseModel):
-    """Raw data for the single hand selected on a given frame."""
+    """Raw data for one hand detected on a given frame."""
 
     handedness: HandednessLiteral
     handedness_score: float = Field(
@@ -56,7 +56,7 @@ class MediaPipeSelectedHandRaw(BaseModel):
         ..., min_length=3, max_length=3, description="[x, y, z] of landmark 12 (middle finger tip)."
     )
     hand_center: List[float] = Field(
-        ..., min_length=2, max_length=2, description="[x, y] palm center (mean of palm landmarks)."
+        ..., min_length=3, max_length=3, description="[x, y, z] palm center (mean of palm landmarks)."
     )
 
     landmarks: List[MediaPipeLandmarkPoint] = Field(
@@ -71,6 +71,7 @@ class MediaPipeFrameRaw(BaseModel):
     timestamp_sec: float = Field(..., ge=0.0)
     has_detection: bool
     num_hands_detected: int = Field(..., ge=0)
+    hands: List[MediaPipeSelectedHandRaw] = Field(default_factory=list)
     selected_hand: Optional[MediaPipeSelectedHandRaw] = None
 
 
@@ -131,6 +132,42 @@ class MediaPipeJointAngles(BaseModel):
     thumb_mcp_thumb_ip_thumb_tip: float
 
 
+class MediaPipeHandFrameFeatures(BaseModel):
+    """Per-frame derived features for one handedness track."""
+
+    handedness: HandednessLiteral
+    detected: bool = Field(..., description="True when MediaPipe detected this hand on this frame.")
+    fallback_used: bool = Field(
+        default=False,
+        description="True when values were carried forward from the last good detection.",
+    )
+    confidence: float = Field(
+        ..., ge=0.0, le=1.0, description="Detection / fallback confidence for this hand."
+    )
+
+    wrist: List[float] = Field(..., min_length=3, max_length=3)
+    index_tip: List[float] = Field(..., min_length=3, max_length=3)
+    thumb_tip: List[float] = Field(..., min_length=3, max_length=3)
+    middle_tip: List[float] = Field(..., min_length=3, max_length=3)
+    hand_center: List[float] = Field(..., min_length=3, max_length=3)
+    landmarks: List[List[float]] = Field(
+        ..., min_length=21, max_length=21, description="All 21 landmarks as [x, y, z]."
+    )
+
+    hand_bbox: MediaPipeHandBoundingBox
+    wrist_angle_deg: float = Field(
+        ..., description="Alias for hand_orientation_deg; angle of wrist -> middle MCP."
+    )
+    hand_orientation_deg: float
+    wrist_relative_landmarks: Dict[str, List[float]]
+    joint_angles: MediaPipeJointAngles
+    wrist_velocity: Optional[List[float]] = Field(default=None, min_length=3, max_length=3)
+    index_tip_velocity: Optional[List[float]] = Field(default=None, min_length=3, max_length=3)
+    thumb_tip_velocity: Optional[List[float]] = Field(default=None, min_length=3, max_length=3)
+    middle_tip_velocity: Optional[List[float]] = Field(default=None, min_length=3, max_length=3)
+    trajectory_history: List[List[float]] = Field(default_factory=list)
+
+
 class MediaPipeFrameFeatures(BaseModel):
     """Per-frame derived features written to features.json."""
 
@@ -139,12 +176,15 @@ class MediaPipeFrameFeatures(BaseModel):
     has_detection: bool
 
     handedness: Optional[HandednessLiteral] = None
+    hands: List[MediaPipeHandFrameFeatures] = Field(default_factory=list)
+    left_hand_features: Optional[MediaPipeHandFrameFeatures] = None
+    right_hand_features: Optional[MediaPipeHandFrameFeatures] = None
 
     wrist: Optional[List[float]] = Field(
         default=None, description="[x, y, z] of wrist when detected."
     )
     hand_center: Optional[List[float]] = Field(
-        default=None, description="[x, y] palm center when detected."
+        default=None, description="[x, y, z] palm center when detected."
     )
 
     hand_bbox: Optional[MediaPipeHandBoundingBox] = None

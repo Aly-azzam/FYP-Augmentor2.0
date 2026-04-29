@@ -31,11 +31,85 @@ from app.services.context_gate_service import run_context_gate, OUT_OF_CONTEXT_M
 from app.services.evaluation_engine_service import run_evaluation_pipeline
 from app.services.media_service import find_first_expert_video_file, normalize_storage_key
 from app.services.motion_representation_service import process_video_to_motion_representation
+from app.services.optical_flow import (
+    FarnebackConfig,
+    evaluate_optical_flow_summary,
+    run_optical_flow_comparison,
+)
+from app.services.optical_flow.io_utils import save_optical_flow_results
+from app.services.optical_flow.schemas import (
+    OpticalFlowEvaluationConfigUsed,
+    OpticalFlowEvaluationResult,
+    OpticalFlowScore,
+    OpticalFlowSimilarities,
+)
+from app.services.optical_flow.visualizer import create_comparison_visualizations
 from app.services.progress_service import compute_progress
 
 router = APIRouter(prefix="/api/evaluations", tags=["Evaluations"])
 
 MIN_VALID_LANDMARK_FRAMES = 3
+
+
+def _build_schema_evaluation_result(evaluation_result: dict) -> OpticalFlowEvaluationResult:
+    return OpticalFlowEvaluationResult(
+        similarities=OpticalFlowSimilarities(**evaluation_result["similarities"]),
+        score=OpticalFlowScore(**evaluation_result["score"]),
+        config_used=OpticalFlowEvaluationConfigUsed(**evaluation_result["config_used"]),
+    )
+
+
+def _run_optical_flow_side_analysis(
+    *,
+    expert_video_path: Path,
+    learner_video_path: Path,
+    attempt_id: UUID,
+) -> dict[str, Any]:
+    output_dir = settings.STORAGE_ROOT / "outputs" / "optical_flow" / str(attempt_id)
+    visualization_dir = output_dir / "visualizations"
+    config = FarnebackConfig(
+        use_hand_roi=True,
+        roi_padding_px=40,
+    )
+
+    raw_result, summary_result = run_optical_flow_comparison(
+        expert_video_path=expert_video_path,
+        learner_video_path=learner_video_path,
+        config=config,
+    )
+    evaluation_result = evaluate_optical_flow_summary(summary_result)
+    summary_result.optical_flow_evaluation = _build_schema_evaluation_result(
+        evaluation_result
+    )
+
+    raw_json_path, summary_json_path = save_optical_flow_results(
+        raw_result=raw_result,
+        summary_result=summary_result,
+        output_dir=output_dir,
+    )
+    expert_hsv_video_path, learner_hsv_video_path = create_comparison_visualizations(
+        expert_video_path=expert_video_path,
+        learner_video_path=learner_video_path,
+        output_dir=visualization_dir,
+        run_id=raw_result.run.run_id,
+        config=config,
+    )
+
+    comparison_metrics = summary_result.comparison_metrics
+    return {
+        "run_id": raw_result.run.run_id,
+        "raw_json_path": str(raw_json_path),
+        "summary_json_path": str(summary_json_path),
+        "expert_hsv_video_path": str(expert_hsv_video_path),
+        "learner_hsv_video_path": str(learner_hsv_video_path),
+        "optical_flow_score": evaluation_result["score"]["optical_flow_score"],
+        "vibration_difference": comparison_metrics.vibration_difference,
+        "vibration_ratio": comparison_metrics.vibration_ratio,
+        "expert_vibration_score": summary_result.expert_summary.vibration_score,
+        "learner_vibration_score": summary_result.learner_summary.vibration_score,
+        "expert_roi_usage_ratio": summary_result.expert_summary.roi_usage_ratio,
+        "learner_roi_usage_ratio": summary_result.learner_summary.roi_usage_ratio,
+    }
 
 
 @router.post("/start", response_model=EvaluationStartResponse)
@@ -141,6 +215,18 @@ async def start_evaluation(
             detail="Learner video not uploaded or file missing.",
         )
 
+    optical_flow_side_analysis = None
+    try:
+        optical_flow_side_analysis = _run_optical_flow_side_analysis(
+            expert_video_path=expert_video_path,
+            learner_video_path=learner_video_path,
+            attempt_id=attempt_id,
+        )
+        print("[OPTICAL_FLOW] SIDE ANALYSIS:", optical_flow_side_analysis)
+    except Exception as exc:
+        print(f"[OPTICAL_FLOW] Side analysis failed but evaluation will continue: {exc}")
+        traceback.print_exc()
+
     try:
         expert_motion_output = process_video_to_motion_representation(str(expert_video_path))
         expert_valid = _count_valid_landmark_frames(expert_motion_output)
@@ -221,6 +307,31 @@ async def start_evaluation(
         db=db,
     )
     evaluation_id = UUID(str(evaluation_result.evaluation_id))
+    if optical_flow_side_analysis is not None:
+        try:
+            evaluation_row = (
+                db.query(EvaluationModel)
+                .filter(EvaluationModel.id == str(evaluation_id))
+                .first()
+            )
+            if evaluation_row is not None:
+                metrics = dict(evaluation_row.metrics or {})
+                metrics["optical_flow"] = optical_flow_side_analysis
+                evaluation_row.metrics = metrics
+                db.commit()
+            else:
+                print(
+                    "[OPTICAL_FLOW] Could not attach side analysis: "
+                    f"evaluation row not found for {evaluation_id}"
+                )
+        except Exception as exc:
+            db.rollback()
+            print(
+                "[OPTICAL_FLOW] Failed to persist side analysis but evaluation "
+                f"will continue: {exc}"
+            )
+            traceback.print_exc()
+
     print(
         "[EVAL] RESULT:",
         {

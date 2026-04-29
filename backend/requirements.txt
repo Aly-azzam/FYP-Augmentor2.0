@@ -13,7 +13,11 @@ opencv-python
 inference-sdk
 torch
 ultralytics
+huggingface_hub
 hydra-core
 omegaconf
 mediapipe
 imageio-ffmpeg
+imageio-ffmpeg
+mediapipe
+psycopg2-binary

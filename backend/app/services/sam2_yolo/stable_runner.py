@@ -548,6 +548,12 @@ def build_video_predictor_stable(
         build_sam2_video_predictor_hf,
     )
 
+    local_checkpoint = BACKEND_ROOT / "models" / "sam2" / "sam2_hiera_tiny.pt"
+    local_config = "configs/sam2/sam2_hiera_t.yaml"
+    if sam2_checkpoint is None and sam2_config is None and local_checkpoint.is_file():
+        sam2_checkpoint = str(local_checkpoint)
+        sam2_config = local_config
+
     if sam2_checkpoint and sam2_config:
         return build_sam2_video_predictor(
             sam2_config,

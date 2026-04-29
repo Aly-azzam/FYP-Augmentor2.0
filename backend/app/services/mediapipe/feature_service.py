@@ -25,15 +25,16 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from app.schemas.mediapipe.mediapipe_schema import (
     MediaPipeDetectionsDocument,
     MediaPipeFeaturesDocument,
     MediaPipeFrameFeatures,
-    MediaPipeFrameRaw,
+    MediaPipeHandFrameFeatures,
     MediaPipeHandBoundingBox,
     MediaPipeJointAngles,
+    MediaPipeSelectedHandRaw,
 )
 from app.utils.mediapipe.mediapipe_utils import (
     HAND_LANDMARK_NAMES,
@@ -69,11 +70,16 @@ class MediaPipeFeatureError(RuntimeError):
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _landmark_vectors(raw_frame: MediaPipeFrameRaw) -> Optional[List[List[float]]]:
-    if not raw_frame.has_detection or raw_frame.selected_hand is None:
-        return None
-    hand = raw_frame.selected_hand
+def _landmark_vectors_from_hand(hand: MediaPipeSelectedHandRaw) -> List[List[float]]:
     return [[lm.x, lm.y, lm.z] for lm in hand.landmarks]
+
+
+def _point3(values: List[float]) -> List[float]:
+    if len(values) >= 3:
+        return [float(values[0]), float(values[1]), float(values[2])]
+    if len(values) == 2:
+        return [float(values[0]), float(values[1]), 0.0]
+    return [0.0, 0.0, 0.0]
 
 
 def _compute_wrist_relative_landmarks(
@@ -130,6 +136,81 @@ def _clone_trajectory_tail(
     return [[float(x), float(y)] for x, y in trimmed]
 
 
+def _select_best_hand_by_label(
+    hands: List[MediaPipeSelectedHandRaw],
+) -> Dict[str, MediaPipeSelectedHandRaw]:
+    selected: Dict[str, MediaPipeSelectedHandRaw] = {}
+    for hand in hands:
+        if hand.handedness not in {"Left", "Right"}:
+            continue
+        current = selected.get(hand.handedness)
+        if current is None or hand.detection_confidence > current.detection_confidence:
+            selected[hand.handedness] = hand
+    return selected
+
+
+def _build_hand_features(
+    *,
+    hand: MediaPipeSelectedHandRaw,
+    timestamp_sec: float,
+    detected: bool,
+    fallback_used: bool,
+    previous_points: Optional[Dict[str, List[float]]],
+    previous_timestamp: Optional[float],
+    wrist_trajectory: List[List[float]],
+    trajectory_history_size: int,
+) -> MediaPipeHandFrameFeatures:
+    landmarks = _landmark_vectors_from_hand(hand)
+    wrist_xyz = _point3(hand.wrist)
+    index_tip = _point3(hand.index_tip)
+    thumb_tip = _point3(hand.thumb_tip)
+    middle_tip = _point3(hand.middle_tip)
+    hand_center = _point3(hand.hand_center)
+
+    bbox_model = MediaPipeHandBoundingBox(**compute_bbox_from_landmarks(landmarks))
+    orientation_deg = compute_hand_orientation(landmarks)
+    wrist_relative = _compute_wrist_relative_landmarks(landmarks)
+    joint_angles = _compute_joint_angles(landmarks)
+
+    if previous_timestamp is not None:
+        dt = max(timestamp_sec - previous_timestamp, 0.0)
+    else:
+        dt = 0.0
+
+    previous_points = previous_points or {}
+    wrist_velocity = compute_velocity(wrist_xyz, previous_points.get("wrist"), dt)
+    index_tip_velocity = compute_velocity(index_tip, previous_points.get("index_tip"), dt)
+    thumb_tip_velocity = compute_velocity(thumb_tip, previous_points.get("thumb_tip"), dt)
+    middle_tip_velocity = compute_velocity(middle_tip, previous_points.get("middle_tip"), dt)
+
+    wrist_trajectory.append([float(wrist_xyz[0]), float(wrist_xyz[1])])
+
+    return MediaPipeHandFrameFeatures(
+        handedness=hand.handedness,
+        detected=detected,
+        fallback_used=fallback_used,
+        confidence=hand.detection_confidence if detected else max(hand.detection_confidence * 0.5, 0.01),
+        wrist=wrist_xyz,
+        index_tip=index_tip,
+        thumb_tip=thumb_tip,
+        middle_tip=middle_tip,
+        hand_center=hand_center,
+        landmarks=landmarks,
+        hand_bbox=bbox_model,
+        wrist_angle_deg=orientation_deg,
+        hand_orientation_deg=orientation_deg,
+        wrist_relative_landmarks=wrist_relative,
+        joint_angles=joint_angles,
+        wrist_velocity=wrist_velocity,
+        index_tip_velocity=index_tip_velocity,
+        thumb_tip_velocity=thumb_tip_velocity,
+        middle_tip_velocity=middle_tip_velocity,
+        trajectory_history=_clone_trajectory_tail(
+            wrist_trajectory, trajectory_history_size
+        ),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -143,108 +224,95 @@ def build_features_document(
     if trajectory_history_size < 1:
         raise ValueError("trajectory_history_size must be >= 1.")
 
-    fps = detections.fps
-    dt_seconds = 1.0 / fps if fps and fps > 0 else 0.0
-
-    previous_wrist: Optional[List[float]] = None
-    previous_index_tip: Optional[List[float]] = None
-    previous_thumb_tip: Optional[List[float]] = None
-    previous_middle_tip: Optional[List[float]] = None
-    previous_timestamp: Optional[float] = None
-
-    wrist_trajectory: List[List[float]] = []
+    last_good_hand: Dict[str, MediaPipeSelectedHandRaw] = {}
+    previous_points_by_hand: Dict[str, Dict[str, List[float]]] = {}
+    previous_timestamp_by_hand: Dict[str, float] = {}
+    wrist_trajectory_by_hand: Dict[str, List[List[float]]] = {
+        "Left": [],
+        "Right": [],
+    }
     feature_frames: List[MediaPipeFrameFeatures] = []
 
     for raw_frame in detections.frames:
-        landmarks = _landmark_vectors(raw_frame)
+        source_hands = raw_frame.hands or (
+            [raw_frame.selected_hand] if raw_frame.selected_hand is not None else []
+        )
+        detected_by_label = _select_best_hand_by_label(source_hands)
+        hand_features_by_label: Dict[str, MediaPipeHandFrameFeatures] = {}
 
-        if landmarks is None:
-            feature_frames.append(
-                MediaPipeFrameFeatures(
-                    frame_index=raw_frame.frame_index,
-                    timestamp_sec=raw_frame.timestamp_sec,
-                    has_detection=False,
-                    handedness=None,
-                    wrist=None,
-                    hand_center=None,
-                    hand_bbox=None,
-                    hand_orientation_deg=None,
-                    wrist_relative_landmarks=None,
-                    joint_angles=None,
-                    wrist_velocity=None,
-                    index_tip_velocity=None,
-                    thumb_tip_velocity=None,
-                    middle_tip_velocity=None,
-                    trajectory_history=_clone_trajectory_tail(
-                        wrist_trajectory, trajectory_history_size
-                    ),
-                )
+        for label in ("Left", "Right"):
+            detected_hand = detected_by_label.get(label)
+            source_hand = detected_hand or last_good_hand.get(label)
+            if source_hand is None:
+                continue
+
+            trajectory = wrist_trajectory_by_hand.setdefault(label, [])
+            hand_feature = _build_hand_features(
+                hand=source_hand,
+                timestamp_sec=raw_frame.timestamp_sec,
+                detected=detected_hand is not None,
+                fallback_used=detected_hand is None,
+                previous_points=previous_points_by_hand.get(label),
+                previous_timestamp=previous_timestamp_by_hand.get(label),
+                wrist_trajectory=trajectory,
+                trajectory_history_size=trajectory_history_size,
             )
-            previous_wrist = None
-            previous_index_tip = None
-            previous_thumb_tip = None
-            previous_middle_tip = None
-            previous_timestamp = raw_frame.timestamp_sec
-            continue
+            hand_features_by_label[label] = hand_feature
 
-        selected_hand = raw_frame.selected_hand
-        assert selected_hand is not None  # for type-checker; has_detection==True
+            previous_points_by_hand[label] = {
+                "wrist": hand_feature.wrist,
+                "index_tip": hand_feature.index_tip,
+                "thumb_tip": hand_feature.thumb_tip,
+                "middle_tip": hand_feature.middle_tip,
+            }
+            previous_timestamp_by_hand[label] = raw_frame.timestamp_sec
+            if detected_hand is not None:
+                last_good_hand[label] = detected_hand
 
-        wrist_xyz = landmarks[_WRIST_INDEX]
-        thumb_tip = landmarks[_THUMB_TIP_INDEX]
-        index_tip = landmarks[_INDEX_TIP_INDEX]
-        middle_tip = landmarks[_MIDDLE_TIP_INDEX]
-
-        bbox_dict = compute_bbox_from_landmarks(landmarks)
-        bbox_model = MediaPipeHandBoundingBox(**bbox_dict)
-
-        orientation_deg = compute_hand_orientation(landmarks)
-        wrist_relative = _compute_wrist_relative_landmarks(landmarks)
-        joint_angles = _compute_joint_angles(landmarks)
-
-        # dt uses actual timestamp delta so velocity stays honest even if the
-        # video contains duplicated / dropped frames.
-        if previous_timestamp is not None:
-            dt = max(raw_frame.timestamp_sec - previous_timestamp, 0.0)
-        else:
-            dt = 0.0
-        if dt <= 0.0 and dt_seconds > 0.0:
-            dt = dt_seconds
-
-        wrist_velocity = compute_velocity(wrist_xyz, previous_wrist, dt)
-        index_tip_velocity = compute_velocity(index_tip, previous_index_tip, dt)
-        thumb_tip_velocity = compute_velocity(thumb_tip, previous_thumb_tip, dt)
-        middle_tip_velocity = compute_velocity(middle_tip, previous_middle_tip, dt)
-
-        wrist_trajectory.append([float(wrist_xyz[0]), float(wrist_xyz[1])])
+        hand_features = [
+            hand_features_by_label[label]
+            for label in ("Left", "Right")
+            if label in hand_features_by_label
+        ]
+        left_hand_features = hand_features_by_label.get("Left")
+        right_hand_features = hand_features_by_label.get("Right")
+        selected_feature = right_hand_features or left_hand_features
+        has_detection = bool(raw_frame.hands)
 
         feature_frames.append(
             MediaPipeFrameFeatures(
                 frame_index=raw_frame.frame_index,
                 timestamp_sec=raw_frame.timestamp_sec,
-                has_detection=True,
-                handedness=selected_hand.handedness,
-                wrist=list(wrist_xyz),
-                hand_center=list(selected_hand.hand_center),
-                hand_bbox=bbox_model,
-                hand_orientation_deg=orientation_deg,
-                wrist_relative_landmarks=wrist_relative,
-                joint_angles=joint_angles,
-                wrist_velocity=wrist_velocity,
-                index_tip_velocity=index_tip_velocity,
-                thumb_tip_velocity=thumb_tip_velocity,
-                middle_tip_velocity=middle_tip_velocity,
-                trajectory_history=_clone_trajectory_tail(
-                    wrist_trajectory, trajectory_history_size
+                has_detection=has_detection,
+                handedness=selected_feature.handedness if selected_feature else None,
+                hands=hand_features,
+                left_hand_features=left_hand_features,
+                right_hand_features=right_hand_features,
+                wrist=selected_feature.wrist if selected_feature else None,
+                hand_center=selected_feature.hand_center if selected_feature else None,
+                hand_bbox=selected_feature.hand_bbox if selected_feature else None,
+                hand_orientation_deg=(
+                    selected_feature.hand_orientation_deg if selected_feature else None
+                ),
+                wrist_relative_landmarks=(
+                    selected_feature.wrist_relative_landmarks if selected_feature else None
+                ),
+                joint_angles=selected_feature.joint_angles if selected_feature else None,
+                wrist_velocity=selected_feature.wrist_velocity if selected_feature else None,
+                index_tip_velocity=(
+                    selected_feature.index_tip_velocity if selected_feature else None
+                ),
+                thumb_tip_velocity=(
+                    selected_feature.thumb_tip_velocity if selected_feature else None
+                ),
+                middle_tip_velocity=(
+                    selected_feature.middle_tip_velocity if selected_feature else None
+                ),
+                trajectory_history=(
+                    selected_feature.trajectory_history if selected_feature else []
                 ),
             )
         )
-
-        previous_wrist = wrist_xyz
-        previous_index_tip = index_tip
-        previous_thumb_tip = thumb_tip
-        previous_middle_tip = middle_tip
-        previous_timestamp = raw_frame.timestamp_sec
 
     return MediaPipeFeaturesDocument(
         run_id=detections.run_id,

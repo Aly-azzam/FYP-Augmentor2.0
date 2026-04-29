@@ -47,9 +47,16 @@ class Settings(BaseSettings):
     CONFIG_VERSION: str = "0.1.0"
     EXPLANATION_MODE: str = "rule"
 
+    # Optional computer-vision provider settings.
+    roboflow_api_key: str | None = None
+    roboflow_model_id: str | None = None
+    roboflow_confidence: float | None = None
+    frame_stride: int | None = None
+
     model_config = SettingsConfigDict(
         env_file=str(Path(__file__).resolve().parents[2] / ".env"),
         env_file_encoding="utf-8",
+        extra="allow",
     )
 
 

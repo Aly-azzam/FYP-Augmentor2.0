@@ -115,12 +115,13 @@ def normalize_handedness_label(label: Optional[str]) -> str:
 # ---------------------------------------------------------------------------
 
 def compute_hand_center(landmarks: Sequence[Sequence[float]]) -> List[float]:
-    """Return the 2D palm center ``[x, y]`` from the palm landmark indices."""
+    """Return the 3D palm center ``[x, y, z]`` from the palm landmark indices."""
     if len(landmarks) < 21:
         raise ValueError("compute_hand_center: expected 21 landmarks.")
     xs = [float(landmarks[i][0]) for i in PALM_CENTER_INDICES]
     ys = [float(landmarks[i][1]) for i in PALM_CENTER_INDICES]
-    return [sum(xs) / len(xs), sum(ys) / len(ys)]
+    zs = [float(landmarks[i][2]) for i in PALM_CENTER_INDICES]
+    return [sum(xs) / len(xs), sum(ys) / len(ys), sum(zs) / len(zs)]
 
 
 def compute_bbox_from_landmarks(landmarks: Sequence[Sequence[float]]) -> dict:

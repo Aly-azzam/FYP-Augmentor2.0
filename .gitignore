@@ -67,3 +67,17 @@ backend/models/**/*.safetensors
 *.log
 .DS_Store
 Thumbs.db
+!**/.gitkeep
+backend/storage/learner/**
+*.whl
+# Local SQLite/database files
+backend/*.db
+backend/*.sqlite
+backend/*.sqlite3
+# Generated project snapshots / debug dumps
+backend_tree.txt
+*_tree.txt
+*.mp4
+*.db
+vendor/
+**/vendor/

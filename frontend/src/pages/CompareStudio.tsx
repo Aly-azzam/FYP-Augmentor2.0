@@ -255,6 +255,28 @@ interface Sam2LearnerResult {
   warnings: string[];
 }
 
+interface OpticalFlowSummaryMetrics {
+  avg_magnitude: number;
+  motion_stability_score: number;
+  vibration_score: number;
+  vibration_high_freq_mean: number;
+  magnitude_jitter: number;
+  roi_usage_ratio: number;
+}
+
+interface OpticalFlowLearnerResult {
+  run_id: string;
+  learner_video_path: string;
+  learner_video_url?: string | null;
+  raw_json_path: string;
+  raw_json_url?: string | null;
+  summary_json_path: string;
+  summary_json_url?: string | null;
+  visualization_video_path: string | null;
+  visualization_video_url?: string | null;
+  summary: OpticalFlowSummaryMetrics;
+}
+
 const scoreColor = (score: number): string => {
   if (score >= 90) return '#22c55e';
   if (score >= 70) return '#3b82f6';
@@ -285,6 +307,18 @@ function prettyJson(value: unknown): string {
   } catch {
     return String(value);
   }
+}
+
+function storagePathToUrl(path: string | null | undefined): string | null {
+  if (!path) return null;
+  if (path.startsWith('/storage/')) return path;
+  const normalized = path.replace(/\\/g, '/');
+  const marker = '/storage/';
+  const markerIndex = normalized.lastIndexOf(marker);
+  if (markerIndex >= 0) {
+    return normalized.slice(markerIndex);
+  }
+  return normalized;
 }
 
 function formatMetricValue(value: unknown): string {
@@ -397,8 +431,9 @@ export default function CompareStudio() {
   const [selectedExpertVideoId, setSelectedExpertVideoId] = useState<string | null>(null);
   const [inspectionModel, setInspectionModel] = useState<InspectionModel>('mediapipe');
   // Learner overlay: show the raw uploaded video, the MediaPipe annotated
-  // output, or the YOLO+SAM2 scissors overlay (Compare Studio is learner-focused).
-  const [learnerOverlay, setLearnerOverlay] = useState<'none' | 'mediapipe' | 'sam2'>('none');
+  // output, YOLO+SAM2 scissors overlay, or Optical Flow visualization.
+  const [learnerOverlay, setLearnerOverlay] =
+    useState<'none' | 'mediapipe' | 'sam2' | 'optical_flow'>('none');
 
   // YOLO+SAM2 learner scissors tracking state.
   const [sam2LearnerRun, setSam2LearnerRun] = useState<Sam2LearnerResult | null>(null);
@@ -426,6 +461,12 @@ export default function CompareStudio() {
   const [manualSamDraftBox, setManualSamDraftBox] = useState<[number, number, number, number] | null>(null);
   const manualSamDragStartRef = useRef<[number, number] | null>(null);
 
+  // Optical Flow learner-only analysis state.
+  const [opticalFlowRun, setOpticalFlowRun] = useState<OpticalFlowLearnerResult | null>(null);
+  const [isOpticalFlowProcessing, setIsOpticalFlowProcessing] = useState(false);
+  const [opticalFlowError, setOpticalFlowError] = useState<string | null>(null);
+  const [opticalFlowVideoVersion, setOpticalFlowVideoVersion] = useState(0);
+
   // ── Refs ──────────────────────────────────────────────────────────────────
 
   const expertVideoRef = useRef<HTMLVideoElement>(null);
@@ -439,11 +480,11 @@ export default function CompareStudio() {
 
   // ── Derived data ─────────────────────────────────────────────────────────
 
+  const requestedCourseId = searchParams.get('courseId');
+  const requestedClipId = searchParams.get('clipId');
   const course = courses.find((c) => c.id === selectedCourse);
   const clips = selectedCourse ? getClipsForCourse(selectedCourse) : [];
   const clip = clips.find((c) => c.id === selectedClip);
-  const requestedCourseId = searchParams.get('courseId');
-  const requestedClipId = searchParams.get('clipId');
   const hasSelectedExpertReference = Boolean(selectedClip || requestedClipId);
 
   // ── Effects ──────────────────────────────────────────────────────────────
@@ -652,6 +693,9 @@ export default function CompareStudio() {
         });
         setManualSamDraftBox(null);
         setLearnerOverlay('none');
+        setOpticalFlowRun(null);
+        setOpticalFlowError(null);
+        setOpticalFlowVideoVersion(0);
         resetEvaluation();
         toast.success('Practice video ready');
       };
@@ -753,23 +797,9 @@ export default function CompareStudio() {
     setMediapipeError(null);
 
     try {
-      if (!manualSamPrompt.box && manualSamPrompt.positive_points.length === 0) {
-        throw new Error('Add a manual SAM2 init box or at least one positive point on frame 0.');
-      }
       const formData = new FormData();
       formData.append('file', userVideo);
-      formData.append('manual_init_sam', 'true');
-      formData.append('auto_local_roi_sam', 'false');
-      formData.append(
-        'manual_prompt_json',
-        JSON.stringify({
-          frame_index: 0,
-          init_mode: 'manual',
-          box: manualSamPrompt.box,
-          positive_points: manualSamPrompt.positive_points,
-          negative_points: manualSamPrompt.negative_points,
-        }),
-      );
+      formData.append('render_annotation', 'true');
 
       const response = await fetch('/api/mediapipe/process-upload', {
         method: 'POST',
@@ -808,7 +838,7 @@ export default function CompareStudio() {
     } finally {
       setIsMediapipeProcessing(false);
     }
-  }, [userVideo, manualSamPrompt]);
+  }, [userVideo]);
 
   // ── YOLO+SAM2 scissors learner run ───────────────────────────────────────
   //
@@ -1014,9 +1044,63 @@ export default function CompareStudio() {
     [isManualSamInitMode, eventToVideoPixels, manualSamPointMode],
   );
 
-  // Compare Studio is learner-focused. The YOLO+SAM2 tab runs only on the
-  // uploaded learner video and reuses precomputed expert artifacts by path.
+  // ── Optical Flow run ─────────────────────────────────────────────────────
 
+  const runOpticalFlow = useCallback(async () => {
+    if (!userVideo) {
+      toast.error('Upload a practice video first');
+      return;
+    }
+
+    setIsOpticalFlowProcessing(true);
+    setOpticalFlowError(null);
+
+    try {
+      const formData = new FormData();
+      formData.append('file', userVideo);
+      formData.append('save_visualization', 'true');
+      formData.append('use_hand_roi', 'true');
+      formData.append('roi_padding_px', '40');
+
+      const response = await fetch('/api/optical-flow/learner', {
+        method: 'POST',
+        body: formData,
+      });
+
+      let payload: any = null;
+      try {
+        payload = await response.json();
+      } catch {
+        payload = null;
+      }
+
+      if (!response.ok) {
+        const detail =
+          payload?.detail ||
+          payload?.message ||
+          `Optical Flow failed with status ${response.status}`;
+        throw new Error(detail);
+      }
+
+      const result = payload as OpticalFlowLearnerResult;
+      setOpticalFlowRun(result);
+      setOpticalFlowVideoVersion(Date.now());
+      if (result.visualization_video_url || result.visualization_video_path) {
+        setLearnerOverlay('optical_flow');
+      }
+      toast.success('Optical Flow ready');
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : 'Optical Flow processing failed.';
+      setOpticalFlowError(message);
+      toast.error(message);
+    } finally {
+      setIsOpticalFlowProcessing(false);
+    }
+  }, [userVideo]);
+
+  // Compare Studio is learner-focused. The YOLO+SAM2 and Optical Flow tabs run
+  // on the uploaded learner video and reuse precomputed expert artifacts by path.
   const mediapipeAnnotatedSource =
     mediapipeRun?.annotated_video_url && mediapipeVideoVersion > 0
       ? `${mediapipeRun.annotated_video_url}${mediapipeRun.annotated_video_url.includes('?') ? '&' : '?'}v=${mediapipeVideoVersion}`
@@ -1045,12 +1129,23 @@ export default function CompareStudio() {
     setSam2OverlayVideoError(null);
   }, [sam2AnnotatedSource]);
 
+  const opticalFlowVisualizationUrl =
+    opticalFlowRun?.visualization_video_url ??
+    storagePathToUrl(opticalFlowRun?.visualization_video_path);
+  const opticalFlowLearnerSource =
+    opticalFlowVisualizationUrl && opticalFlowVideoVersion > 0
+      ? `${opticalFlowVisualizationUrl}${opticalFlowVisualizationUrl.includes('?') ? '&' : '?'}v=${opticalFlowVideoVersion}`
+      : opticalFlowVisualizationUrl;
+
   const learnerVideoSource = (() => {
     if (learnerOverlay === 'mediapipe' && mediapipeAnnotatedSource) {
       return mediapipeAnnotatedSource;
     }
     if (learnerOverlay === 'sam2' && sam2AnnotatedSource) {
       return sam2AnnotatedSource;
+    }
+    if (learnerOverlay === 'optical_flow' && opticalFlowLearnerSource) {
+      return opticalFlowLearnerSource;
     }
     return userVideoUrl;
   })();
@@ -1345,7 +1440,8 @@ export default function CompareStudio() {
               <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)', flexWrap: 'wrap' }}>
                 {(mediapipeRun?.annotated_video_url ||
                   sam2OverlayBaseUrl ||
-                  sam2LearnerRun?.annotated_video_url) && (
+                  sam2LearnerRun?.annotated_video_url ||
+                  opticalFlowVisualizationUrl) && (
                   <div
                     role="tablist"
                     aria-label="Learner video source"
@@ -1390,6 +1486,19 @@ export default function CompareStudio() {
                       >
                         <Hand size={12} style={{ marginRight: 4 }} />
                         YOLO+SAM2 Scissors
+                      </button>
+                    )}
+                    {opticalFlowVisualizationUrl && (
+                      <button
+                        type="button"
+                        role="tab"
+                        aria-selected={learnerOverlay === 'optical_flow'}
+                        className={`btn ${learnerOverlay === 'optical_flow' ? 'btn-primary' : 'btn-ghost'}`}
+                        style={{ borderRadius: 0, fontSize: '0.75rem', padding: 'var(--space-xs) var(--space-sm)' }}
+                        onClick={() => setLearnerOverlay('optical_flow')}
+                      >
+                        <Activity size={12} style={{ marginRight: 4 }} />
+                        Flow
                       </button>
                     )}
                   </div>
@@ -1439,8 +1548,11 @@ export default function CompareStudio() {
                   key={learnerVideoSource ?? userVideoUrl}
                   ref={learnerVideoRef}
                   src={learnerVideoSource ?? undefined}
-                  controls={learnerOverlay === 'sam2'}
+                  controls={learnerOverlay === 'sam2' || learnerOverlay === 'optical_flow'}
                   onClick={handleLearnerTipClick}
+                  muted={learnerMuted}
+                  playsInline
+                  preload="auto"
                   onTimeUpdate={() => {
                     if (learnerVideoRef.current)
                       setLearnerCurrentTime(learnerVideoRef.current.currentTime);
@@ -1453,6 +1565,11 @@ export default function CompareStudio() {
                     if (learnerOverlay === 'sam2') {
                       console.error('YOLO+SAM2 overlay video failed to load:', learnerVideoSource);
                       setSam2OverlayVideoError('YOLO+SAM2 overlay video could not be loaded.');
+                    }
+                    if (learnerOverlay === 'optical_flow') {
+                      setOpticalFlowError(
+                        'Optical Flow video was generated, but the browser could not load it.',
+                      );
                     }
                   }}
                   style={{ cursor: isSelectingTip ? 'crosshair' : 'default' }}
@@ -1611,6 +1728,23 @@ export default function CompareStudio() {
                     SAM2 Manual Init (frame 0)
                   </span>
                 )}
+                {learnerOverlay === 'optical_flow' && opticalFlowVisualizationUrl && (
+                  <span
+                    className="badge badge-blue"
+                    style={{
+                      position: 'absolute',
+                      top: 8,
+                      left: 8,
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: 4,
+                      fontSize: '0.65rem',
+                    }}
+                  >
+                    <Activity size={10} />
+                    Optical Flow
+                  </span>
+                )}
               </div>
 
               {renderTimeline(learnerCurrentTime, learnerDuration, (e) =>
@@ -1684,6 +1818,7 @@ export default function CompareStudio() {
               <TabsTrigger value="tools">Tools</TabsTrigger>
               <TabsTrigger value="evaluate">Evaluate</TabsTrigger>
               <TabsTrigger value="mediapipe">MediaPipe</TabsTrigger>
+              <TabsTrigger value="optical-flow">Optical Flow</TabsTrigger>
               <TabsTrigger value="timers">Timers</TabsTrigger>
             </TabsList>
 
@@ -2885,6 +3020,210 @@ export default function CompareStudio() {
                   </TabsContent>
                 </Tabs>
 
+              </div>
+            </TabsContent>
+
+            {/* ── Tab: Optical Flow ─────────────────────────────────────── */}
+            <TabsContent value="optical-flow">
+              <div
+                style={{
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: 'var(--space-md)',
+                  padding: 'var(--space-sm) 0',
+                }}
+              >
+                <div
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 'var(--space-sm)',
+                  }}
+                >
+                  <Activity size={18} style={{ color: 'var(--accent-primary)' }} />
+                  <span className="text-small" style={{ fontWeight: 600 }}>
+                    Motion Instability (Optical Flow)
+                  </span>
+                </div>
+                <p
+                  className="text-small"
+                  style={{ color: 'var(--text-muted)', margin: 0 }}
+                >
+                  Run learner-only Optical Flow to estimate vibration and motion
+                  stability. These values are side-analysis only and do not affect
+                  the evaluation score.
+                </p>
+
+                <button
+                  className="btn btn-primary"
+                  style={{
+                    width: '100%',
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    gap: 'var(--space-xs)',
+                  }}
+                  disabled={!userVideo || isOpticalFlowProcessing}
+                  onClick={runOpticalFlow}
+                >
+                  {isOpticalFlowProcessing ? (
+                    <>
+                      <Loader2
+                        size={14}
+                        style={{ animation: 'spin 1s linear infinite' }}
+                      />
+                      Processing...
+                    </>
+                  ) : (
+                    <>
+                      <Activity size={14} />
+                      {opticalFlowRun ? 'Run Optical Flow Again' : 'Run Optical Flow'}
+                    </>
+                  )}
+                </button>
+
+                {!userVideo && (
+                  <p
+                    className="text-small"
+                    style={{
+                      color: 'var(--text-muted)',
+                      textAlign: 'center',
+                      margin: 0,
+                    }}
+                  >
+                    Upload a practice video to enable Optical Flow
+                  </p>
+                )}
+
+                {opticalFlowError && (
+                  <div
+                    className="text-small"
+                    style={{
+                      background: 'var(--bg-tertiary)',
+                      border: '1px solid var(--danger, #ef4444)',
+                      color: 'var(--danger, #ef4444)',
+                      borderRadius: 'var(--radius-md)',
+                      padding: 'var(--space-sm) var(--space-md)',
+                    }}
+                  >
+                    {opticalFlowError}
+                  </div>
+                )}
+
+                {opticalFlowRun && (
+                  <>
+                    <div
+                      style={{
+                        display: 'grid',
+                        gridTemplateColumns: '1fr 1fr',
+                        gap: 'var(--space-sm)',
+                      }}
+                    >
+                      {[
+                        {
+                          label: 'Vibration',
+                          value: opticalFlowRun.summary.vibration_score,
+                        },
+                        {
+                          label: 'High freq.',
+                          value: opticalFlowRun.summary.vibration_high_freq_mean,
+                        },
+                        {
+                          label: 'Stability',
+                          value: opticalFlowRun.summary.motion_stability_score,
+                        },
+                        {
+                          label: 'Avg magnitude',
+                          value: opticalFlowRun.summary.avg_magnitude,
+                        },
+                        {
+                          label: 'ROI usage',
+                          value: opticalFlowRun.summary.roi_usage_ratio,
+                        },
+                        {
+                          label: 'Jitter',
+                          value: opticalFlowRun.summary.magnitude_jitter,
+                        },
+                      ].map((metric) => (
+                        <div
+                          key={metric.label}
+                          className="stat-card"
+                          style={{ padding: 'var(--space-sm)' }}
+                        >
+                          <div
+                            className="stat-value"
+                            style={{ fontSize: '1.25rem' }}
+                          >
+                            {formatMetricValue(metric.value)}
+                          </div>
+                          <div
+                            className="stat-label"
+                            style={{ fontSize: '0.7rem' }}
+                          >
+                            {metric.label}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+
+                    <button
+                      type="button"
+                      className={`btn ${learnerOverlay === 'optical_flow' ? 'btn-primary' : 'btn-secondary'}`}
+                      style={{ width: '100%' }}
+                      disabled={!opticalFlowVisualizationUrl}
+                      onClick={() => {
+                        setLearnerOverlay((current) =>
+                          current === 'optical_flow' ? 'none' : 'optical_flow',
+                        );
+                      }}
+                    >
+                      {learnerOverlay === 'optical_flow'
+                        ? 'Show Original Learner Video'
+                        : 'Show Optical Flow Visualization'}
+                    </button>
+
+                    {opticalFlowVisualizationUrl && (
+                      <div
+                        className="video-container"
+                        style={{
+                          aspectRatio: '16/9',
+                          border: '1px solid var(--border-default)',
+                        }}
+                      >
+                        <video
+                          key={`optical-flow-preview-${opticalFlowLearnerSource ?? opticalFlowVisualizationUrl}`}
+                          src={opticalFlowLearnerSource ?? opticalFlowVisualizationUrl}
+                          controls
+                          muted
+                          playsInline
+                          preload="metadata"
+                        />
+                      </div>
+                    )}
+
+                    <div
+                      style={{
+                        display: 'flex',
+                        flexDirection: 'column',
+                        gap: 'var(--space-xs)',
+                        fontSize: '0.75rem',
+                        color: 'var(--text-secondary)',
+                      }}
+                    >
+                      <span>
+                        <strong>run_id:</strong>{' '}
+                        <code
+                          style={{
+                            fontFamily: 'var(--font-mono)',
+                            fontSize: '0.7rem',
+                          }}
+                        >
+                          {opticalFlowRun.run_id}
+                        </code>
+                      </span>
+                    </div>
+                  </>
+                )}
               </div>
             </TabsContent>
 
