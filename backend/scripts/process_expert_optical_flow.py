@@ -22,6 +22,7 @@ from app.services.optical_flow import (  # noqa: E402
     build_video_flow_summary,
     compute_video_optical_flow_features,
 )
+from app.services.optical_flow.farneback_service import _effective_roi_source  # noqa: E402
 from app.services.optical_flow.visualizer import visualize_video_optical_flow_hsv  # noqa: E402
 
 
@@ -49,10 +50,34 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Run Farneback only inside detected MediaPipe hand ROIs when possible.",
     )
     parser.add_argument(
+        "--roi-source",
+        choices=("none", "mediapipe_hand", "yolo_scissors", "yolo_scissors_expanded"),
+        default="mediapipe_hand",
+        help="ROI provider for Optical Flow cropping.",
+    )
+    parser.add_argument(
         "--roi-padding-px",
         type=int,
         default=40,
         help="Padding in pixels around the detected hand ROI.",
+    )
+    parser.add_argument(
+        "--max-roi-hold-frames",
+        type=int,
+        default=5,
+        help="Frames to reuse the previous YOLO ROI after a YOLO miss.",
+    )
+    parser.add_argument(
+        "--roi-smoothing-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Smooth YOLO expanded ROI before Optical Flow cropping.",
+    )
+    parser.add_argument(
+        "--roi-smoothing-alpha",
+        type=float,
+        default=0.65,
+        help="Exponential smoothing alpha for YOLO expanded ROI.",
     )
     return parser
 
@@ -117,7 +142,11 @@ def main() -> None:
 
     config = FarnebackConfig(
         use_hand_roi=args.use_hand_roi,
+        roi_source=args.roi_source,
         roi_padding_px=args.roi_padding_px,
+        max_roi_hold_frames=args.max_roi_hold_frames,
+        roi_smoothing_enabled=args.roi_smoothing_enabled,
+        roi_smoothing_alpha=args.roi_smoothing_alpha,
     )
     run_id = f"expert_of_{expert_video_id}_{uuid.uuid4().hex[:12]}"
     created_at = datetime.now(timezone.utc).isoformat()
@@ -128,7 +157,18 @@ def main() -> None:
     )
     summary = build_video_flow_summary(
         frames,
-        roi_enabled=config.use_hand_roi,
+        roi_enabled=_effective_roi_source(config) != "none",
+        roi_source_used=_effective_roi_source(config),
+        roi_smoothing_enabled=(
+            config.roi_smoothing_enabled
+            if _effective_roi_source(config) in {"yolo_scissors", "yolo_scissors_expanded"}
+            else False
+        ),
+        roi_smoothing_alpha=(
+            config.roi_smoothing_alpha
+            if _effective_roi_source(config) in {"yolo_scissors", "yolo_scissors_expanded"}
+            else None
+        ),
     )
 
     common_payload = {

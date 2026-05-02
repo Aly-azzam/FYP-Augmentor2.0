@@ -1059,6 +1059,7 @@ export default function CompareStudio() {
       const formData = new FormData();
       formData.append('file', userVideo);
       formData.append('save_visualization', 'true');
+      formData.append('roi_source', 'yolo_scissors');
       formData.append('use_hand_roi', 'true');
       formData.append('roi_padding_px', '40');
 

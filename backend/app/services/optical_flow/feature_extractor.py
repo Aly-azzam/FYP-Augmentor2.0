@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import List
+from typing import List, Literal
 
 import cv2
 import numpy as np
@@ -91,6 +91,25 @@ def extract_frame_flow_features(
     timestamp_sec: float,
     motion_threshold: float = 2.0,
     roi_used: bool = False,
+    roi_source: Literal[
+        "none",
+        "mediapipe_hand",
+        "yolo_scissors",
+        "yolo_scissors_expanded",
+        "previous_yolo_bbox",
+    ] = "none",
+    roi_found: bool = False,
+    original_scissors_bbox: list[float] | None = None,
+    yolo_scissors_bbox: list[float] | None = None,
+    expanded_roi_bbox: list[int] | None = None,
+    expanded_optical_flow_roi: list[int] | None = None,
+    expanded_roi_bbox_raw: list[int] | None = None,
+    expanded_roi_bbox_smoothed: list[int] | None = None,
+    detection_confidence: float | None = None,
+    roi_reused_from_previous: bool = False,
+    fallback_used: bool = False,
+    fallback_reason: str | None = None,
+    roi_area_ratio: float = 0.0,
 ) -> FrameFlowFeatures:
     """
     Extract summary features from one dense optical flow frame.
@@ -113,6 +132,19 @@ def extract_frame_flow_features(
         mean_angle_deg=round(mean_angle, 6),
         motion_area_ratio=round(motion_area_ratio, 6),
         roi_used=roi_used,
+        roi_source=roi_source,
+        roi_found=roi_found,
+        original_scissors_bbox=original_scissors_bbox,
+        yolo_scissors_bbox=yolo_scissors_bbox or original_scissors_bbox,
+        expanded_roi_bbox=expanded_roi_bbox,
+        expanded_optical_flow_roi=expanded_optical_flow_roi or expanded_roi_bbox,
+        expanded_roi_bbox_raw=expanded_roi_bbox_raw,
+        expanded_roi_bbox_smoothed=expanded_roi_bbox_smoothed,
+        detection_confidence=detection_confidence,
+        roi_reused_from_previous=roi_reused_from_previous,
+        fallback_used=fallback_used,
+        fallback_reason=fallback_reason,
+        roi_area_ratio=round(float(roi_area_ratio), 6),
     )
 
 
@@ -236,6 +268,15 @@ def _compute_robust_peak_magnitude(max_magnitudes: List[float]) -> float:
 def build_video_flow_summary(
     frame_features: List[FrameFlowFeatures],
     roi_enabled: bool = False,
+    roi_source_used: Literal[
+        "none",
+        "mediapipe_hand",
+        "yolo_scissors",
+        "yolo_scissors_expanded",
+        "previous_yolo_bbox",
+    ] = "none",
+    roi_smoothing_enabled: bool = False,
+    roi_smoothing_alpha: float | None = None,
 ) -> VideoFlowSummary:
     """
     Aggregate per-frame flow features into a video-level summary.
@@ -253,6 +294,9 @@ def build_video_flow_summary(
             vibration_high_freq_max=0.0,
             vibration_score=0.0,
             roi_enabled=roi_enabled,
+            roi_source_used=roi_source_used if roi_enabled else "none",
+            roi_smoothing_enabled=roi_smoothing_enabled,
+            roi_smoothing_alpha=roi_smoothing_alpha,
         )
 
     raw_mean_magnitudes = [f.mean_magnitude for f in frame_features]
@@ -294,6 +338,30 @@ def build_video_flow_summary(
         if frame_features and roi_enabled
         else 0.0
     )
+    if roi_source_used == "none" and roi_enabled:
+        if any(f.roi_source == "yolo_scissors_expanded" for f in frame_features):
+            roi_source_used = "yolo_scissors_expanded"
+        elif any(f.roi_source == "yolo_scissors" for f in frame_features):
+            roi_source_used = "yolo_scissors"
+        elif any(f.roi_source == "mediapipe_hand" for f in frame_features):
+            roi_source_used = "mediapipe_hand"
+
+    yolo_detection_frames = sum(
+        1
+        for f in frame_features
+        if f.roi_source in {"yolo_scissors", "yolo_scissors_expanded"}
+        and f.roi_found
+        and not f.roi_reused_from_previous
+    )
+    yolo_detection_ratio = (
+        yolo_detection_frames / len(frame_features)
+        if frame_features and roi_source_used in {"yolo_scissors", "yolo_scissors_expanded"}
+        else 0.0
+    )
+    reused_roi_frame_count = sum(1 for f in frame_features if f.roi_reused_from_previous)
+    fallback_frame_count = sum(1 for f in frame_features if f.fallback_used)
+    roi_area_ratios = [f.roi_area_ratio for f in frame_features if f.roi_used]
+    average_roi_area_ratio = _safe_mean(roi_area_ratios)
 
     return VideoFlowSummary(
         avg_magnitude=round(avg_magnitude, 6),
@@ -310,4 +378,11 @@ def build_video_flow_summary(
         roi_frames_used=roi_frames_used,
         roi_fallback_frames=roi_fallback_frames,
         roi_usage_ratio=round(roi_usage_ratio, 6),
+        roi_source_used=roi_source_used if roi_enabled else "none",
+        yolo_detection_ratio=round(yolo_detection_ratio, 6),
+        reused_roi_frame_count=reused_roi_frame_count,
+        fallback_frame_count=fallback_frame_count,
+        average_roi_area_ratio=round(average_roi_area_ratio, 6),
+        roi_smoothing_enabled=roi_smoothing_enabled,
+        roi_smoothing_alpha=roi_smoothing_alpha,
     )

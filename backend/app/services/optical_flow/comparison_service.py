@@ -8,7 +8,11 @@ from typing import List
 
 import numpy as np
 
-from .farneback_service import FarnebackConfig, compute_video_optical_flow_features
+from .farneback_service import (
+    FarnebackConfig,
+    _effective_roi_source,
+    compute_video_optical_flow_features,
+)
 from .feature_extractor import (
     build_video_flow_summary,
     compute_mean_angle_deg,
@@ -315,14 +319,37 @@ def run_optical_flow_comparison(
     expert_used, learner_used = _truncate_to_shorter(expert_frames, learner_frames)
     frame_count_used = min(len(expert_used), len(learner_used))
 
-    roi_enabled = bool(config.use_hand_roi) if config is not None else False
+    roi_source_used = _effective_roi_source(config) if config is not None else "none"
+    roi_enabled = roi_source_used != "none"
     expert_summary = build_video_flow_summary(
         expert_used,
         roi_enabled=roi_enabled,
+        roi_source_used=roi_source_used,
+        roi_smoothing_enabled=(
+            bool(config.roi_smoothing_enabled)
+            if config is not None and roi_source_used in {"yolo_scissors", "yolo_scissors_expanded"}
+            else False
+        ),
+        roi_smoothing_alpha=(
+            config.roi_smoothing_alpha
+            if config is not None and roi_source_used in {"yolo_scissors", "yolo_scissors_expanded"}
+            else None
+        ),
     )
     learner_summary = build_video_flow_summary(
         learner_used,
         roi_enabled=roi_enabled,
+        roi_source_used=roi_source_used,
+        roi_smoothing_enabled=(
+            bool(config.roi_smoothing_enabled)
+            if config is not None and roi_source_used in {"yolo_scissors", "yolo_scissors_expanded"}
+            else False
+        ),
+        roi_smoothing_alpha=(
+            config.roi_smoothing_alpha
+            if config is not None and roi_source_used in {"yolo_scissors", "yolo_scissors_expanded"}
+            else None
+        ),
     )
     comparison_metrics = _build_comparison_metrics(
         expert_used,

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import logging
 import os
 import tempfile
 from dataclasses import dataclass
@@ -14,10 +16,13 @@ from app.services.sam2_yolo.schemas import InitialPrompt, YoloScissorsDetection
 
 BACKEND_ROOT = Path(__file__).resolve().parents[3]
 load_dotenv(BACKEND_ROOT / ".env")
+logger = logging.getLogger(__name__)
 
 DEFAULT_ROBOFLOW_MODEL_ID = "scissors_ego_real/1"
 DEFAULT_ROBOFLOW_CONFIDENCE = float(os.getenv("ROBOFLOW_CONFIDENCE", "0.5"))
 DEFAULT_BBOX_SHRINK = float(os.getenv("SAM2_YOLO_BBOX_SHRINK", "0.65"))
+DEFAULT_YOLO_SCISSORS_OUTPUT_ROOT = BACKEND_ROOT / "storage" / "outputs" / "yolo_scissors"
+YOLO_SCISSORS_RAW_FILENAME = "yolo_scissors_raw.json"
 
 
 class YoloScissorsDetectionError(RuntimeError):
@@ -120,6 +125,30 @@ class YoloPromptFrame:
     detection: YoloScissorsDetection
 
 
+@dataclass(slots=True)
+class YoloScissorsFrameResult:
+    frame_index: int
+    timestamp: float
+    detected: bool
+    confidence: float | None = None
+    bbox: list[float] | None = None
+    center_point: list[float] | None = None
+    class_name: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = {
+            "frame_index": self.frame_index,
+            "timestamp": self.timestamp,
+            "detected": self.detected,
+            "confidence": self.confidence,
+            "bbox": self.bbox,
+            "center_point": self.center_point,
+        }
+        if self.class_name is not None:
+            payload["class_name"] = self.class_name
+        return payload
+
+
 def find_initial_yolo_prompt_frame(
     *,
     video_path: Path,
@@ -173,6 +202,225 @@ def find_initial_yolo_prompt_frame(
         "YOLO did not detect scissors in the scanned prompt frames "
         f"(stride={frame_stride}, scanned={scanned_frames}). Last errors: {detail}"
     )
+
+
+def scan_yolo_scissors_video(
+    *,
+    video_path: Path,
+    confidence_threshold: float = DEFAULT_ROBOFLOW_CONFIDENCE,
+    frame_stride: int = 5,
+    max_scanned_frames: int = 30,
+) -> dict[str, Any]:
+    video = Path(video_path).expanduser().resolve()
+    cap = cv2.VideoCapture(str(video))
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video: {video}")
+
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    frame_index = 0
+    scanned_frames = 0
+    frame_results: list[YoloScissorsFrameResult] = []
+    prompt_detection: tuple[int, float, YoloScissorsDetection] | None = None
+
+    try:
+        while scanned_frames < max(1, max_scanned_frames):
+            ok, frame = cap.read()
+            if not ok:
+                break
+
+            if frame is None or frame.size == 0:
+                frame_index += 1
+                continue
+            if frame_index % max(1, frame_stride) != 0:
+                frame_index += 1
+                continue
+
+            timestamp = round(frame_index / max(fps, 1e-6), 6)
+            try:
+                detection = detect_best_scissors_roboflow(
+                    frame=frame,
+                    confidence_threshold=confidence_threshold,
+                )
+                bbox = [round(float(value), 3) for value in detection.bbox]
+                center_point = detection.point
+                frame_results.append(
+                    YoloScissorsFrameResult(
+                        frame_index=frame_index,
+                        timestamp=timestamp,
+                        detected=True,
+                        confidence=round(float(detection.confidence), 6),
+                        bbox=bbox,
+                        center_point=center_point,
+                        class_name=detection.class_name,
+                    )
+                )
+                logger.info(
+                    "YOLO scissors detected frame=%s confidence=%.4f bbox=%s",
+                    frame_index,
+                    detection.confidence,
+                    bbox,
+                )
+                if prompt_detection is None:
+                    prompt_detection = (frame_index, timestamp, detection)
+            except YoloScissorsDetectionError:
+                frame_results.append(
+                    YoloScissorsFrameResult(
+                        frame_index=frame_index,
+                        timestamp=timestamp,
+                        detected=False,
+                    )
+                )
+
+            scanned_frames += 1
+            frame_index += 1
+    finally:
+        cap.release()
+
+    best_prompt_frame = None
+    if prompt_detection is not None:
+        best_frame_index, timestamp, detection = prompt_detection
+        best_prompt_frame = {
+            "frame_index": best_frame_index,
+            "timestamp": timestamp,
+            "confidence": round(float(detection.confidence), 6),
+            "bbox": [round(float(value), 3) for value in detection.bbox],
+            "center_point": detection.point,
+        }
+        if detection.class_name is not None:
+            best_prompt_frame["class_name"] = detection.class_name
+
+    return {
+        "video_path": str(video),
+        "fps": fps,
+        "width": width,
+        "height": height,
+        "frame_stride": max(1, frame_stride),
+        "max_scanned_frames": max_scanned_frames,
+        "scanned_frame_count": scanned_frames,
+        "frames": [frame_result.to_dict() for frame_result in frame_results],
+        "best_prompt_frame": best_prompt_frame,
+    }
+
+
+def get_or_create_yolo_scissors_raw_artifact(
+    *,
+    video_path: Path,
+    run_id: str,
+    output_root: Path = DEFAULT_YOLO_SCISSORS_OUTPUT_ROOT,
+    confidence_threshold: float = DEFAULT_ROBOFLOW_CONFIDENCE,
+    frame_stride: int = 5,
+    max_scanned_frames: int = 30,
+    reuse_existing: bool = True,
+) -> tuple[dict[str, Any], Path, bool]:
+    video = Path(video_path).expanduser().resolve()
+    output_dir = Path(output_root).expanduser().resolve() / run_id
+    output_path = output_dir / YOLO_SCISSORS_RAW_FILENAME
+    if reuse_existing and output_path.is_file():
+        payload = json.loads(output_path.read_text(encoding="utf-8"))
+        existing_video_path = payload.get("video_path")
+        if existing_video_path and Path(existing_video_path).expanduser().resolve() == video:
+            logger.info("Reusing YOLO scissors raw artifact at %s", output_path)
+            return payload, output_path, True
+        logger.info(
+            "Ignoring YOLO scissors artifact for different video at %s",
+            output_path,
+        )
+
+    payload = scan_yolo_scissors_video(
+        video_path=video,
+        confidence_threshold=confidence_threshold,
+        frame_stride=frame_stride,
+        max_scanned_frames=max_scanned_frames,
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    logger.info("Saved YOLO scissors raw artifact to %s", output_path)
+    return payload, output_path, False
+
+
+def save_yolo_scissors_raw_artifact(
+    *,
+    video_path: Path,
+    run_id: str,
+    output_root: Path = DEFAULT_YOLO_SCISSORS_OUTPUT_ROOT,
+    confidence_threshold: float = DEFAULT_ROBOFLOW_CONFIDENCE,
+    frame_stride: int = 5,
+    max_scanned_frames: int = 30,
+) -> Path:
+    _, output_path, _ = get_or_create_yolo_scissors_raw_artifact(
+        video_path=video_path,
+        run_id=run_id,
+        output_root=output_root,
+        confidence_threshold=confidence_threshold,
+        frame_stride=frame_stride,
+        max_scanned_frames=max_scanned_frames,
+        reuse_existing=False,
+    )
+    return output_path
+
+
+def prompt_from_yolo_scissors_artifact(
+    *,
+    payload: dict[str, Any],
+    video_path: Path,
+    debug_image_path: Path | None = None,
+    bbox_shrink: float = DEFAULT_BBOX_SHRINK,
+) -> InitialPrompt:
+    best_prompt_frame = payload.get("best_prompt_frame")
+    if not isinstance(best_prompt_frame, dict):
+        raise YoloScissorsDetectionError("YOLO did not detect scissors in the scanned prompt frames")
+
+    raw_bbox = [round(float(value), 3) for value in best_prompt_frame["bbox"]]
+    center_point = [round(float(value), 3) for value in best_prompt_frame["center_point"]]
+    sam2_prompt_bbox = [
+        round(float(value), 3)
+        for value in shrink_bbox(
+            raw_bbox,
+            shrink_factor=bbox_shrink,
+        )
+    ]
+    prompt = InitialPrompt(
+        frame_index=int(best_prompt_frame["frame_index"]),
+        timestamp_sec=round(float(best_prompt_frame.get("timestamp", 0.0)), 6),
+        point=center_point,
+        bbox=sam2_prompt_bbox,
+        raw_yolo_bbox=raw_bbox,
+        sam2_prompt_bbox=sam2_prompt_bbox,
+        bbox_shrink=round(float(bbox_shrink), 6),
+        confidence=round(float(best_prompt_frame["confidence"]), 6),
+        class_name=best_prompt_frame.get("class_name"),
+    )
+
+    if debug_image_path is not None:
+        frame = read_video_frame(video_path=video_path, frame_index=prompt.frame_index)
+        save_debug_first_frame(
+            frame=frame,
+            detection=YoloScissorsDetection(
+                bbox=raw_bbox,
+                confidence=prompt.confidence,
+                class_name=prompt.class_name,
+            ),
+            prompt=prompt,
+            output_path=debug_image_path,
+        )
+
+    return prompt
+
+
+def read_video_frame(*, video_path: Path, frame_index: int) -> Any:
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video: {video_path}")
+    try:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_index))
+        ok, frame = cap.read()
+        if not ok or frame is None or frame.size == 0:
+            raise RuntimeError(f"Could not read frame {frame_index} from video: {video_path}")
+        return frame
+    finally:
+        cap.release()
 
 
 def detect_best_scissors_roboflow(

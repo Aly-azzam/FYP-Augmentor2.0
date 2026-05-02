@@ -5,9 +5,11 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from .schemas import FrameFlowFeatures
 from .farneback_service import (
     FarnebackConfig,
     _blur_gray_for_flow,
+    _effective_roi_source,
     _resize_frame_if_needed,
     _to_gray,
     _validate_video_path,
@@ -79,6 +81,7 @@ def visualize_video_optical_flow_hsv(
     config: FarnebackConfig | None = None,
     magnitude_clip_percentile: float = 95.0,
     overlay_text: str | None = None,
+    frame_features: list[FrameFlowFeatures] | None = None,
 ) -> Path:
     """
     Create an HSV optical flow visualization video for one input video.
@@ -119,26 +122,59 @@ def visualize_video_optical_flow_hsv(
 
     frame_index = 1
     roi_detector = None
+    active_roi_source = _effective_roi_source(config)
+    frame_feature_lookup = (
+        {feature.frame_index: feature for feature in frame_features}
+        if frame_features is not None
+        else None
+    )
 
-    if config.use_hand_roi:
+    if frame_feature_lookup is not None:
+        print("[OF] visualization using precomputed ROI metadata", flush=True)
+        print("[OF] visualization will NOT rerun YOLO", flush=True)
+
+    if active_roi_source != "none":
         from .hand_roi import (
             HandROIDetector,
             crop_to_roi,
             embed_roi_flow_in_canvas,
         )
 
-        effective_roi_padding_px = max(
-            int(config.roi_padding_px),
-            int(config.roi_enlarge_padding_px),
-        )
-        roi_detector = HandROIDetector(
-            padding_px=effective_roi_padding_px,
-            hand_preference=config.roi_hand_preference,
-            lock_target=config.roi_lock_target,
-            lock_max_missing_frames=config.roi_lock_max_missing_frames,
-            lock_max_center_distance_ratio=config.roi_lock_max_center_distance_ratio,
-            lock_strict=config.roi_lock_strict,
-        )
+        if frame_feature_lookup is not None:
+            print("[OF] visualization did not initialize YOLO ROI provider", flush=True)
+        elif active_roi_source == "mediapipe_hand":
+            effective_roi_padding_px = max(
+                int(config.roi_padding_px),
+                int(config.roi_enlarge_padding_px),
+            )
+            roi_detector = HandROIDetector(
+                padding_px=effective_roi_padding_px,
+                hand_preference=config.roi_hand_preference,
+                lock_target=config.roi_lock_target,
+                lock_max_missing_frames=config.roi_lock_max_missing_frames,
+                lock_max_center_distance_ratio=config.roi_lock_max_center_distance_ratio,
+                lock_strict=config.roi_lock_strict,
+            )
+        else:
+            from .yolo_scissors_roi import (  # noqa: PLC0415
+                SharedYoloScissorsROIProvider,
+                YoloScissorsROIConfig,
+            )
+
+            roi_detector = SharedYoloScissorsROIProvider(
+                video_path=input_path,
+                config=YoloScissorsROIConfig(
+                    roi_expand_x=config.roi_expand_x,
+                    roi_expand_y=config.roi_expand_y,
+                    roi_extra_down_ratio=config.roi_extra_down_ratio,
+                    roi_extra_up_ratio=config.roi_extra_up_ratio,
+                    max_roi_hold_frames=config.max_roi_hold_frames,
+                    confidence_threshold=config.yolo_confidence_threshold,
+                    roi_smoothing_enabled=config.roi_smoothing_enabled,
+                    roi_smoothing_alpha=config.roi_smoothing_alpha,
+                    artifact_path=config.yolo_scissors_artifact_path,
+                ),
+            )
 
     try:
         while True:
@@ -155,7 +191,37 @@ def visualize_video_optical_flow_hsv(
 
             prev_for_flow = _blur_gray_for_flow(prev_gray, config.gaussian_blur_kernel)
             curr_for_flow = _blur_gray_for_flow(curr_gray, config.gaussian_blur_kernel)
-            roi = roi_detector.detect(curr_frame) if roi_detector is not None else None
+            roi = None
+            yolo_debug: dict | None = None
+            frame_feature = (
+                frame_feature_lookup.get(frame_index)
+                if frame_feature_lookup is not None
+                else None
+            )
+            if frame_feature is not None:
+                roi_source = frame_feature.roi_source
+                active_roi_source = roi_source
+                bbox = (
+                    frame_feature.expanded_roi_bbox_smoothed
+                    or frame_feature.expanded_roi_bbox
+                )
+                if bbox is not None and frame_feature.roi_found:
+                    roi = tuple(int(value) for value in bbox)
+                if roi_source in {"yolo_scissors", "yolo_scissors_expanded", "previous_yolo_bbox"}:
+                    yolo_debug = {
+                        "original_scissors_bbox": frame_feature.original_scissors_bbox,
+                        "expanded_roi_bbox_raw": frame_feature.expanded_roi_bbox_raw,
+                        "expanded_roi_bbox_smoothed": frame_feature.expanded_roi_bbox_smoothed,
+                        "roi_reused_from_previous": frame_feature.roi_reused_from_previous,
+                        "fallback_used": frame_feature.fallback_used,
+                        "fallback_reason": frame_feature.fallback_reason,
+                    }
+            elif roi_detector is not None:
+                if active_roi_source == "yolo_scissors_expanded":
+                    roi = roi_detector.detect(curr_frame, frame_index)
+                    yolo_debug = roi_detector.last_debug_dict()
+                else:
+                    roi = roi_detector.detect(curr_frame)
             roi_used = False
 
             if roi is not None:
@@ -180,6 +246,11 @@ def visualize_video_optical_flow_hsv(
                     width=width,
                 )
                 roi_used = True
+                metric_flow = (
+                    roi_flow
+                    if active_roi_source in {"yolo_scissors", "yolo_scissors_expanded", "previous_yolo_bbox"}
+                    else flow
+                )
             else:
                 flow = cv2.calcOpticalFlowFarneback(
                     prev=prev_for_flow,
@@ -193,14 +264,25 @@ def visualize_video_optical_flow_hsv(
                     poly_sigma=config.poly_sigma,
                     flags=config.flags,
                 )
+                metric_flow = flow
 
             vis_frame = flow_to_hsv_bgr(
                 flow,
                 magnitude_clip_percentile=magnitude_clip_percentile,
             )
+            metric_magnitude = np.linalg.norm(metric_flow, axis=2)
+            mean_magnitude = (
+                float(np.mean(metric_magnitude)) if metric_magnitude.size > 0 else 0.0
+            )
+            max_magnitude = (
+                float(np.max(metric_magnitude)) if metric_magnitude.size > 0 else 0.0
+            )
+            if frame_feature is not None:
+                mean_magnitude = frame_feature.mean_magnitude
+                max_magnitude = frame_feature.max_magnitude
 
             roi_status = ""
-            if config.use_hand_roi:
+            if active_roi_source != "none":
                 dim_context = cv2.convertScaleAbs(curr_frame, alpha=0.45, beta=12)
                 flow_overlay = cv2.addWeighted(
                     dim_context,
@@ -216,15 +298,46 @@ def visualize_video_optical_flow_hsv(
                     dim_context,
                 ).astype(np.uint8)
 
-                roi_label = (
-                    getattr(roi_detector, "last_roi_label", None)
-                    if roi_detector is not None
-                    else None
-                )
-                if roi_used:
+                if active_roi_source in {"yolo_scissors", "yolo_scissors_expanded", "previous_yolo_bbox"}:
+                    if roi_used:
+                        reused = (
+                            yolo_debug.get("roi_reused_from_previous", False)
+                            if yolo_debug is not None
+                            else False
+                        )
+                        roi_status = " [YOLO ROI:reused]" if reused else " [YOLO ROI]"
+                    else:
+                        roi_status = " [YOLO fallback]"
+                elif roi_used:
+                    roi_label = (
+                        getattr(roi_detector, "last_roi_label", None)
+                        if roi_detector is not None
+                        else None
+                    )
                     roi_status = f" [ROI:{roi_label or 'active'}]"
                 else:
                     roi_status = " [fallback]"
+                if yolo_debug is not None:
+                    raw_bbox = yolo_debug.get("original_scissors_bbox")
+                    if raw_bbox is not None:
+                        x1, y1, x2, y2 = [int(round(value)) for value in raw_bbox]
+                        cv2.rectangle(
+                            vis_frame,
+                            (x1, y1),
+                            (x2, y2),
+                            (0, 0, 255),
+                            2,
+                        )
+                        cv2.putText(
+                            vis_frame,
+                            "YOLO scissors bbox",
+                            (x1, max(44, y1 - 10)),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.55,
+                            (0, 0, 255),
+                            2,
+                            cv2.LINE_AA,
+                        )
                 if roi is not None:
                     x1, y1, x2, y2 = roi
                     cv2.rectangle(
@@ -234,6 +347,21 @@ def visualize_video_optical_flow_hsv(
                         (0, 255, 0),
                         2,
                     )
+                    roi_label = (
+                        "OF expanded ROI"
+                        if active_roi_source in {"yolo_scissors", "yolo_scissors_expanded", "previous_yolo_bbox"}
+                        else "Optical Flow ROI"
+                    )
+                    cv2.putText(
+                        vis_frame,
+                        roi_label,
+                        (x1, max(24, y1 - 10)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.55,
+                        (0, 255, 0),
+                        2,
+                        cv2.LINE_AA,
+                    )
 
             label = overlay_text if overlay_text else input_path.stem
             cv2.putText(
@@ -242,6 +370,19 @@ def visualize_video_optical_flow_hsv(
                 (10, 24),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.6,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                vis_frame,
+                (
+                    f"mean_mag={mean_magnitude:.3f} max_mag={max_magnitude:.3f} "
+                    f"vibration={(frame_feature.vibration_delta if frame_feature is not None and frame_feature.vibration_delta is not None else 0.0):.3f}"
+                ),
+                (10, 48),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
                 (255, 255, 255),
                 2,
                 cv2.LINE_AA,
@@ -257,6 +398,7 @@ def visualize_video_optical_flow_hsv(
         if roi_detector is not None:
             roi_detector.close()
 
+    print("[OF] visualization finished", flush=True)
     return output_path
 
 

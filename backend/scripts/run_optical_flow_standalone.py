@@ -52,6 +52,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Run Farneback only inside detected MediaPipe hand ROIs when possible.",
     )
     parser.add_argument(
+        "--roi-source",
+        choices=("none", "mediapipe_hand", "yolo_scissors", "yolo_scissors_expanded"),
+        default="mediapipe_hand",
+        help=(
+            "ROI provider. Use yolo_scissors_expanded to use shared YOLO "
+            "scissors detections."
+        ),
+    )
+    parser.add_argument(
         "--roi-padding-px",
         type=int,
         default=40,
@@ -102,6 +111,54 @@ def _build_parser() -> argparse.ArgumentParser:
         default=0.3,
         help="Maximum accepted locked-target center movement as a ratio of frame width.",
     )
+    parser.add_argument(
+        "--roi-expand-x",
+        type=float,
+        default=2.2,
+        help="Horizontal expansion factor for YOLO scissors Optical Flow ROI.",
+    )
+    parser.add_argument(
+        "--roi-expand-y",
+        type=float,
+        default=2.5,
+        help="Config/debug value for YOLO scissors Optical Flow ROI vertical expansion.",
+    )
+    parser.add_argument(
+        "--roi-extra-down-ratio",
+        type=float,
+        default=1.5,
+        help="Extra downward YOLO ROI expansion as a scissors-box height ratio.",
+    )
+    parser.add_argument(
+        "--roi-extra-up-ratio",
+        type=float,
+        default=0.4,
+        help="Extra upward YOLO ROI expansion as a scissors-box height ratio.",
+    )
+    parser.add_argument(
+        "--max-roi-hold-frames",
+        type=int,
+        default=5,
+        help="Frames to reuse the previous YOLO ROI after a YOLO miss.",
+    )
+    parser.add_argument(
+        "--yolo-confidence-threshold",
+        type=float,
+        default=None,
+        help="Optional YOLO confidence threshold for this Optical Flow run only.",
+    )
+    parser.add_argument(
+        "--roi-smoothing-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Smooth YOLO expanded ROI before Optical Flow cropping.",
+    )
+    parser.add_argument(
+        "--roi-smoothing-alpha",
+        type=float,
+        default=0.65,
+        help="Exponential smoothing alpha for YOLO expanded ROI.",
+    )
     return parser
 
 
@@ -120,6 +177,7 @@ def main() -> None:
     learner_video_path = _resolve_path(args.learner_video)
     farneback_config = FarnebackConfig(
         use_hand_roi=args.use_hand_roi,
+        roi_source=args.roi_source,
         roi_padding_px=args.roi_padding_px,
         roi_enlarge_padding_px=args.roi_enlarge_padding_px,
         roi_hand_preference=args.roi_hand_preference,
@@ -127,6 +185,14 @@ def main() -> None:
         roi_lock_strict=args.roi_lock_strict,
         roi_lock_max_missing_frames=args.roi_lock_max_missing_frames,
         roi_lock_max_center_distance_ratio=args.roi_lock_max_center_distance_ratio,
+        roi_expand_x=args.roi_expand_x,
+        roi_expand_y=args.roi_expand_y,
+        roi_extra_down_ratio=args.roi_extra_down_ratio,
+        roi_extra_up_ratio=args.roi_extra_up_ratio,
+        max_roi_hold_frames=args.max_roi_hold_frames,
+        yolo_confidence_threshold=args.yolo_confidence_threshold,
+        roi_smoothing_enabled=args.roi_smoothing_enabled,
+        roi_smoothing_alpha=args.roi_smoothing_alpha,
     )
 
     raw_result, summary_result = run_optical_flow_comparison(

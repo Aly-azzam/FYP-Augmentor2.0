@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import time
 import uuid
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -17,6 +18,7 @@ from app.services.optical_flow import (
     build_video_flow_summary,
     compute_video_optical_flow_features,
 )
+from app.services.optical_flow.farneback_service import _effective_roi_source
 from app.services.optical_flow.visualizer import visualize_video_optical_flow_hsv
 
 
@@ -95,7 +97,11 @@ async def process_learner_optical_flow(
     file: UploadFile = File(...),
     save_visualization: bool = Form(default=True),
     use_hand_roi: bool = Form(default=True),
+    roi_source: str = Form(default="mediapipe_hand"),
     roi_padding_px: int = Form(default=40),
+    max_roi_hold_frames: int = Form(default=5),
+    roi_smoothing_enabled: bool = Form(default=True),
+    roi_smoothing_alpha: float = Form(default=0.65),
 ) -> dict[str, Any]:
     """
     Upload and process a learner video with Optical Flow only.
@@ -103,6 +109,13 @@ async def process_learner_optical_flow(
     This endpoint does not compare against an expert video and does not affect
     the main evaluation score or persistence models.
     """
+    request_start = time.perf_counter()
+    print("[OF] learner request received", flush=True)
+    print(f"[OF] roi_source={roi_source}", flush=True)
+    print(f"[OF] use_hand_roi={use_hand_roi}", flush=True)
+    print(f"[OF] roi_padding_px={roi_padding_px}", flush=True)
+    print(f"[OF] save_visualization={save_visualization}", flush=True)
+
     run_id = f"learner_of_{uuid.uuid4().hex[:12]}"
     learner_video_path = (
         settings.STORAGE_ROOT
@@ -126,8 +139,13 @@ async def process_learner_optical_flow(
 
         config = FarnebackConfig(
             use_hand_roi=use_hand_roi,
+            roi_source=roi_source,  # type: ignore[arg-type]
             roi_padding_px=roi_padding_px,
+            max_roi_hold_frames=max_roi_hold_frames,
+            roi_smoothing_enabled=roi_smoothing_enabled,
+            roi_smoothing_alpha=roi_smoothing_alpha,
         )
+        active_roi_source = _effective_roi_source(config)
         created_at = datetime.now(timezone.utc).isoformat()
         video_metadata, frames = compute_video_optical_flow_features(
             video_path=learner_video_path,
@@ -135,7 +153,18 @@ async def process_learner_optical_flow(
         )
         summary = build_video_flow_summary(
             frames,
-            roi_enabled=config.use_hand_roi,
+            roi_enabled=active_roi_source != "none",
+            roi_source_used=active_roi_source,
+            roi_smoothing_enabled=(
+                config.roi_smoothing_enabled
+                if active_roi_source in {"yolo_scissors", "yolo_scissors_expanded"}
+                else False
+            ),
+            roi_smoothing_alpha=(
+                config.roi_smoothing_alpha
+                if active_roi_source in {"yolo_scissors", "yolo_scissors_expanded"}
+                else None
+            ),
         )
 
         raw_json_path = raw_dir / "learner_optical_flow_raw.json"
@@ -144,13 +173,16 @@ async def process_learner_optical_flow(
 
         created_visualization_path: Path | None = None
         if save_visualization:
+            print("[OF] visualization started", flush=True)
             created_visualization_path = visualize_video_optical_flow_hsv(
                 video_path=learner_video_path,
                 output_video_path=visualization_video_path,
                 config=config,
                 overlay_text="learner",
+                frame_features=frames,
             )
             _make_browser_compatible_mp4(created_visualization_path)
+            print(f"[OF] visualization finished: {created_visualization_path}", flush=True)
 
         common_payload = {
             "run_id": run_id,
@@ -176,13 +208,22 @@ async def process_learner_optical_flow(
             "frames": [frame.model_dump(mode="json") for frame in frames],
         }
 
+        print(f"[OF] saving raw JSON: {raw_json_path}", flush=True)
         raw_json_path.write_text(
             json.dumps(raw_payload, indent=2),
             encoding="utf-8",
         )
+        print(f"[OF] saving summary JSON: {summary_json_path}", flush=True)
         summary_json_path.write_text(
             json.dumps(common_payload, indent=2),
             encoding="utf-8",
+        )
+        print("[OF] JSON saved", flush=True)
+        total_processing_time_sec = time.perf_counter() - request_start
+        print("[OF] learner Optical Flow finished successfully", flush=True)
+        print(
+            f"[OF] total_processing_time_sec={total_processing_time_sec:.2f}",
+            flush=True,
         )
 
         return {

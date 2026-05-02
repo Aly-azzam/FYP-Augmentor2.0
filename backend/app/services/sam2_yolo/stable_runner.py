@@ -4,6 +4,7 @@ import argparse
 import contextlib
 import gc
 import json
+import logging
 import math
 import os
 import shutil
@@ -44,8 +45,10 @@ from app.services.sam2_yolo.trajectory_metrics import compute_trajectory_metrics
 from app.services.sam2_yolo.visualization import write_sam2_yolo_overlay_video
 from app.services.sam2_yolo.yolo_scissors_detector import (
     DEFAULT_ROBOFLOW_CONFIDENCE,
+    DEFAULT_YOLO_SCISSORS_OUTPUT_ROOT,
     YoloScissorsDetectionError,
-    detect_scissors_prompt,
+    get_or_create_yolo_scissors_raw_artifact,
+    prompt_from_yolo_scissors_artifact,
 )
 
 
@@ -53,6 +56,7 @@ BACKEND_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_OUTPUT_ROOT = BACKEND_ROOT / "storage" / "outputs" / "sam2_yolo" / "runs"
 DEFAULT_FRAME_STRIDE = 5
 DEFAULT_MAX_PROCESSED_FRAMES: int | None = None
+logger = logging.getLogger(__name__)
 
 _CPU_STABILITY_CONFIGURED = False
 
@@ -108,12 +112,23 @@ def run_stable_yolo_sam2_tracking(
     initial_prompt: InitialPrompt | None = None
 
     try:
-        initial_prompt = detect_scissors_prompt(
+        yolo_payload, _, _ = get_or_create_yolo_scissors_raw_artifact(
             video_path=video,
+            run_id=run_id,
+            output_root=DEFAULT_YOLO_SCISSORS_OUTPUT_ROOT,
             confidence_threshold=roboflow_confidence,
-            debug_image_path=debug_path,
             frame_stride=stride,
             max_scanned_frames=30,
+        )
+        logger.info("[SAM2] using shared YOLO best_prompt_frame=%s", yolo_payload.get("best_prompt_frame"))
+        initial_prompt = prompt_from_yolo_scissors_artifact(
+            payload=yolo_payload,
+            video_path=video,
+            debug_image_path=debug_path,
+        )
+        logger.info(
+            "[SAM2] shrunken bbox=%s",
+            initial_prompt.sam2_prompt_bbox or initial_prompt.bbox,
         )
     except YoloScissorsDetectionError as exc:
         summary = _build_failed_summary(

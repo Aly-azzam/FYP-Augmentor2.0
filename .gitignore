@@ -81,3 +81,5 @@ backend_tree.txt
 *.db
 vendor/
 **/vendor/
+
+backend/datasets/**
