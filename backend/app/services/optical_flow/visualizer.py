@@ -9,6 +9,8 @@ from .schemas import FrameFlowFeatures
 from .farneback_service import (
     FarnebackConfig,
     _blur_gray_for_flow,
+    crop_to_roi,
+    embed_roi_flow_in_canvas,
     _effective_roi_source,
     _resize_frame_if_needed,
     _to_gray,
@@ -134,15 +136,11 @@ def visualize_video_optical_flow_hsv(
         print("[OF] visualization will NOT rerun YOLO", flush=True)
 
     if active_roi_source != "none":
-        from .hand_roi import (
-            HandROIDetector,
-            crop_to_roi,
-            embed_roi_flow_in_canvas,
-        )
-
         if frame_feature_lookup is not None:
             print("[OF] visualization did not initialize YOLO ROI provider", flush=True)
         elif active_roi_source == "mediapipe_hand":
+            from .hand_roi import HandROIDetector
+
             effective_roi_padding_px = max(
                 int(config.roi_padding_px),
                 int(config.roi_enlarge_padding_px),
@@ -156,24 +154,9 @@ def visualize_video_optical_flow_hsv(
                 lock_strict=config.roi_lock_strict,
             )
         else:
-            from .yolo_scissors_roi import (  # noqa: PLC0415
-                SharedYoloScissorsROIProvider,
-                YoloScissorsROIConfig,
-            )
-
-            roi_detector = SharedYoloScissorsROIProvider(
-                video_path=input_path,
-                config=YoloScissorsROIConfig(
-                    roi_expand_x=config.roi_expand_x,
-                    roi_expand_y=config.roi_expand_y,
-                    roi_extra_down_ratio=config.roi_extra_down_ratio,
-                    roi_extra_up_ratio=config.roi_extra_up_ratio,
-                    max_roi_hold_frames=config.max_roi_hold_frames,
-                    confidence_threshold=config.yolo_confidence_threshold,
-                    roi_smoothing_enabled=config.roi_smoothing_enabled,
-                    roi_smoothing_alpha=config.roi_smoothing_alpha,
-                    artifact_path=config.yolo_scissors_artifact_path,
-                ),
+            raise RuntimeError(
+                "YOLO Optical Flow visualization requires precomputed frame_features "
+                "so visualization does not rerun YOLO."
             )
 
     try:
@@ -201,17 +184,21 @@ def visualize_video_optical_flow_hsv(
             if frame_feature is not None:
                 roi_source = frame_feature.roi_source
                 active_roi_source = roi_source
-                bbox = (
-                    frame_feature.expanded_roi_bbox_smoothed
-                    or frame_feature.expanded_roi_bbox
-                )
+                bbox = frame_feature.expanded_roi_xyxy or frame_feature.expanded_roi_bbox
                 if bbox is not None and frame_feature.roi_found:
                     roi = tuple(int(value) for value in bbox)
-                if roi_source in {"yolo_scissors", "yolo_scissors_expanded", "previous_yolo_bbox"}:
+                if roi_source in {
+                    "yolo",
+                    "yolo_scissors",
+                    "yolo_scissors_expanded",
+                    "previous_yolo_bbox",
+                    "previous_yolo_fallback",
+                    "full_frame_fallback",
+                }:
                     yolo_debug = {
-                        "original_scissors_bbox": frame_feature.original_scissors_bbox,
-                        "expanded_roi_bbox_raw": frame_feature.expanded_roi_bbox_raw,
-                        "expanded_roi_bbox_smoothed": frame_feature.expanded_roi_bbox_smoothed,
+                        "original_scissors_bbox": frame_feature.scissors_bbox_xyxy,
+                        "expanded_roi_bbox_raw": frame_feature.expanded_roi_xyxy,
+                        "expanded_roi_bbox_smoothed": frame_feature.expanded_roi_xyxy,
                         "roi_reused_from_previous": frame_feature.roi_reused_from_previous,
                         "fallback_used": frame_feature.fallback_used,
                         "fallback_reason": frame_feature.fallback_reason,
@@ -248,7 +235,15 @@ def visualize_video_optical_flow_hsv(
                 roi_used = True
                 metric_flow = (
                     roi_flow
-                    if active_roi_source in {"yolo_scissors", "yolo_scissors_expanded", "previous_yolo_bbox"}
+                    if active_roi_source
+                    in {
+                        "yolo",
+                        "yolo_scissors",
+                        "yolo_scissors_expanded",
+                        "previous_yolo_bbox",
+                        "previous_yolo_fallback",
+                        "full_frame_fallback",
+                    }
                     else flow
                 )
             else:
@@ -298,7 +293,14 @@ def visualize_video_optical_flow_hsv(
                     dim_context,
                 ).astype(np.uint8)
 
-                if active_roi_source in {"yolo_scissors", "yolo_scissors_expanded", "previous_yolo_bbox"}:
+                if active_roi_source in {
+                    "yolo",
+                    "yolo_scissors",
+                    "yolo_scissors_expanded",
+                    "previous_yolo_bbox",
+                    "previous_yolo_fallback",
+                    "full_frame_fallback",
+                }:
                     if roi_used:
                         reused = (
                             yolo_debug.get("roi_reused_from_previous", False)
@@ -349,7 +351,15 @@ def visualize_video_optical_flow_hsv(
                     )
                     roi_label = (
                         "OF expanded ROI"
-                        if active_roi_source in {"yolo_scissors", "yolo_scissors_expanded", "previous_yolo_bbox"}
+                        if active_roi_source
+                        in {
+                            "yolo",
+                            "yolo_scissors",
+                            "yolo_scissors_expanded",
+                            "previous_yolo_bbox",
+                            "previous_yolo_fallback",
+                            "full_frame_fallback",
+                        }
                         else "Optical Flow ROI"
                     )
                     cv2.putText(

@@ -1,37 +1,38 @@
 from __future__ import annotations
 
-import hashlib
-import json
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Sequence
 
 import numpy as np
 
-from app.services.sam2_yolo.yolo_scissors_detector import (
-    DEFAULT_YOLO_SCISSORS_OUTPUT_ROOT,
-    YOLO_SCISSORS_RAW_FILENAME,
-)
-
 
 ROIBox = tuple[int, int, int, int]
-DetectionFn = Callable[..., Any]
+DEFAULT_LOCAL_YOLO_SCISSORS_MODEL_PATH = (
+    Path(__file__).resolve().parents[3]
+    / "models"
+    / "yolo"
+    / "best.pt"
+)
 
 
 @dataclass(slots=True)
 class YoloScissorsROIConfig:
     """Optical Flow-only ROI expansion config for YOLO scissors detections."""
 
-    roi_expand_x: float = 2.2
-    roi_expand_y: float = 2.5
+    roi_expand_x: float = 2.4
+    roi_expand_y: float = 2.8
+    roi_extra_x_ratio: float = 0.7
     roi_extra_down_ratio: float = 1.5
-    roi_extra_up_ratio: float = 0.4
+    roi_extra_up_ratio: float = 0.3
     max_roi_hold_frames: int = 5
-    confidence_threshold: float | None = None
-    roi_smoothing_enabled: bool = True
+    confidence_threshold: float | None = 0.25
+    roi_smoothing_enabled: bool = False
     roi_smoothing_alpha: float = 0.65
-    artifact_path: str | Path | None = None
-    artifact_root: str | Path = DEFAULT_YOLO_SCISSORS_OUTPUT_ROOT
+    model_path: str | Path = DEFAULT_LOCAL_YOLO_SCISSORS_MODEL_PATH
+    imgsz: int = 640
+    half: bool = True
 
 
 @dataclass(slots=True)
@@ -43,12 +44,13 @@ class YoloScissorsROIResult:
     expanded_roi_bbox_raw: list[int] | None
     expanded_roi_bbox_smoothed: list[int] | None
     detection_confidence: float | None
-    roi_source: str = "yolo_scissors_expanded"
+    roi_source: str = "yolo"
     roi_found: bool = False
     roi_reused_from_previous: bool = False
     fallback_used: bool = False
     fallback_reason: str | None = None
     detection_class_name: str | None = None
+    yolo_detected: bool = False
 
     @property
     def roi_tuple(self) -> ROIBox | None:
@@ -60,6 +62,16 @@ class YoloScissorsROIResult:
     def to_debug_dict(self) -> dict[str, Any]:
         """Return the JSON/debug shape expected by Optical Flow callers."""
         return asdict(self)
+
+
+@dataclass(slots=True)
+class YoloScissorsFrameDetection:
+    frame_index: int
+    detected: bool
+    bbox: list[float] | None
+    expanded_roi: list[int] | None
+    confidence: float | None
+    class_name: str | None = None
 
 
 @dataclass(slots=True)
@@ -87,36 +99,23 @@ def _coerce_bbox(bbox: Sequence[float]) -> tuple[float, float, float, float]:
     return x1, y1, x2, y2
 
 
-def expand_scissors_bbox_to_roi(
-    scissors_bbox: Sequence[float],
-    *,
+def expand_scissors_bbox_to_hand_roi(
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
     frame_width: int,
     frame_height: int,
-    config: YoloScissorsROIConfig | None = None,
 ) -> list[int]:
-    """
-    Expand a YOLO scissors bbox into a larger scissors+hand/wrist ROI.
+    bw = float(x2) - float(x1)
+    bh = float(y2) - float(y1)
+    if bw <= 0 or bh <= 0:
+        raise ValueError("YOLO scissors bbox must have positive width and height.")
 
-    The vertical expansion intentionally follows the requested asymmetric
-    formula while horizontal expansion is centered around the scissors bbox.
-    """
-    config = config or YoloScissorsROIConfig()
-    x1, y1, x2, y2 = _coerce_bbox(scissors_bbox)
-
-    width = x2 - x1
-    height = y2 - y1
-    center_x = (x1 + x2) / 2.0
-
-    new_width = width * float(config.roi_expand_x)
-    new_x1 = center_x - new_width / 2.0
-    new_x2 = center_x + new_width / 2.0
-    new_y1 = y1 - height * float(config.roi_extra_up_ratio)
-    new_y2 = y2 + height * float(config.roi_extra_down_ratio)
-
-    clamped_x1 = max(0, min(int(round(new_x1)), frame_width - 1))
-    clamped_y1 = max(0, min(int(round(new_y1)), frame_height - 1))
-    clamped_x2 = max(0, min(int(round(new_x2)), frame_width))
-    clamped_y2 = max(0, min(int(round(new_y2)), frame_height))
+    clamped_x1 = max(0, int(float(x1) - 0.7 * bw))
+    clamped_x2 = min(int(frame_width), int(float(x2) + 0.7 * bw))
+    clamped_y1 = max(0, int(float(y1) - 0.3 * bh))
+    clamped_y2 = min(int(frame_height), int(float(y2) + 1.5 * bh))
 
     if clamped_x2 <= clamped_x1 or clamped_y2 <= clamped_y1:
         raise ValueError("Expanded YOLO scissors ROI is empty after clamping.")
@@ -124,107 +123,23 @@ def expand_scissors_bbox_to_roi(
     return [clamped_x1, clamped_y1, clamped_x2, clamped_y2]
 
 
-@dataclass(slots=True)
-class _SharedYoloFrame:
-    frame_index: int
-    detected: bool
-    bbox: list[float] | None
-    confidence: float | None
-    class_name: str | None = None
-
-
-def _file_fingerprint(path: Path) -> tuple[int, str] | None:
-    if not path.is_file():
-        return None
-    digest = hashlib.sha256()
-    try:
-        with path.open("rb") as file:
-            while chunk := file.read(1024 * 1024):
-                digest.update(chunk)
-        return path.stat().st_size, digest.hexdigest()
-    except OSError:
-        return None
-
-
-def _load_json(path: Path) -> dict[str, Any] | None:
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    return payload if isinstance(payload, dict) else None
-
-
-def find_shared_yolo_artifact_for_video(
+def expand_scissors_bbox_to_roi(
+    scissors_bbox: Sequence[float],
     *,
-    video_path: str | Path,
-    artifact_path: str | Path | None = None,
-    artifact_root: str | Path = DEFAULT_YOLO_SCISSORS_OUTPUT_ROOT,
-) -> tuple[dict[str, Any], Path] | None:
-    video = Path(video_path).expanduser().resolve()
-    explicit_path = Path(artifact_path).expanduser().resolve() if artifact_path else None
-    candidates = [explicit_path] if explicit_path is not None else []
-    root = Path(artifact_root).expanduser().resolve()
-    if explicit_path is None and root.is_dir():
-        candidates.extend(root.glob(f"*/{YOLO_SCISSORS_RAW_FILENAME}"))
-
-    source_fingerprint: tuple[int, str] | None = None
-    for candidate in candidates:
-        if candidate is None or not candidate.is_file():
-            continue
-        payload = _load_json(candidate)
-        if payload is None:
-            continue
-
-        recorded_path = payload.get("video_path")
-        if recorded_path:
-            recorded = Path(str(recorded_path)).expanduser()
-            recorded_resolved = recorded.resolve() if recorded.is_absolute() else recorded
-            if recorded_resolved == video:
-                return payload, candidate
-
-            if recorded_resolved.is_file():
-                source_fingerprint = source_fingerprint or _file_fingerprint(video)
-                if source_fingerprint is not None and _file_fingerprint(recorded_resolved) == source_fingerprint:
-                    return payload, candidate
-
-    return None
-
-
-def _shared_frames_from_payload(payload: dict[str, Any]) -> list[_SharedYoloFrame]:
-    frames: list[_SharedYoloFrame] = []
-    for item in payload.get("frames", []):
-        if not isinstance(item, dict):
-            continue
-        try:
-            frames.append(
-                _SharedYoloFrame(
-                    frame_index=int(item["frame_index"]),
-                    detected=bool(item.get("detected", False)),
-                    bbox=(
-                        [float(value) for value in item["bbox"]]
-                        if item.get("bbox") is not None
-                        else None
-                    ),
-                    confidence=(
-                        float(item["confidence"])
-                        if item.get("confidence") is not None
-                        else None
-                    ),
-                    class_name=item.get("class_name"),
-                )
-            )
-        except (KeyError, TypeError, ValueError):
-            continue
-    return sorted(frames, key=lambda frame: frame.frame_index)
-
-
-def _nearest_shared_frame(
-    frames: Sequence[_SharedYoloFrame],
-    frame_index: int,
-) -> _SharedYoloFrame | None:
-    if not frames:
-        return None
-    return min(frames, key=lambda frame: abs(frame.frame_index - int(frame_index)))
+    frame_width: int,
+    frame_height: int,
+    config: YoloScissorsROIConfig | None = None,
+) -> list[int]:
+    del config
+    x1, y1, x2, y2 = _coerce_bbox(scissors_bbox)
+    return expand_scissors_bbox_to_hand_roi(
+        x1,
+        y1,
+        x2,
+        y2,
+        frame_width,
+        frame_height,
+    )
 
 
 def clamp_roi_bbox(
@@ -270,193 +185,150 @@ def smooth_roi_bbox(
     )
 
 
-def _default_detect_scissors(
+def _select_yolo_device() -> int | str:
+    try:
+        import torch  # type: ignore  # noqa: PLC0415
+
+        if torch.cuda.is_available():
+            return 0
+    except Exception:  # noqa: BLE001 - torch availability varies by environment.
+        pass
+    return "cpu"
+
+
+def _best_box_from_result(result: Any) -> tuple[list[float], float, str | None] | None:
+    boxes = getattr(result, "boxes", None)
+    if boxes is None or len(boxes) == 0:
+        return None
+
+    best: tuple[list[float], float, str | None] | None = None
+    names = getattr(result, "names", {})
+    for box in boxes:
+        conf_value = float(box.conf.detach().cpu().item())
+        xyxy = [float(value) for value in box.xyxy.detach().cpu().numpy()[0].tolist()]
+        class_id = (
+            int(box.cls.detach().cpu().item())
+            if getattr(box, "cls", None) is not None
+            else -1
+        )
+        class_name = names.get(class_id) if isinstance(names, dict) else None
+        if best is None or conf_value > best[1]:
+            best = (xyxy, conf_value, class_name)
+    return best
+
+
+def collect_yolo_scissors_detections_for_video(
     *,
-    frame: np.ndarray,
-    confidence_threshold: float | None,
-) -> Any:
-    from app.services.sam2_yolo.yolo_scissors_detector import (  # noqa: PLC0415
-        DEFAULT_ROBOFLOW_CONFIDENCE,
-        detect_best_scissors_roboflow,
-    )
-
-    return detect_best_scissors_roboflow(
-        frame=frame,
-        confidence_threshold=(
-            DEFAULT_ROBOFLOW_CONFIDENCE
-            if confidence_threshold is None
-            else float(confidence_threshold)
-        ),
-    )
-
-
-def get_yolo_scissors_roi_for_frame(
-    frame: np.ndarray,
-    frame_index: int,
-    video_path: str | Path | None = None,
-    previous_bbox: Sequence[int] | None = None,
-    *,
-    previous_original_scissors_bbox: Sequence[float] | None = None,
-    previous_detection_confidence: float | None = None,
-    previous_detection_class_name: str | None = None,
-    previous_expanded_roi_bbox_raw: Sequence[int] | None = None,
-    previous_smoothed_bbox: Sequence[int] | None = None,
-    frames_since_previous_bbox: int = 0,
+    video_path: str | Path,
     config: YoloScissorsROIConfig | None = None,
-    detection_fn: DetectionFn | None = None,
-) -> YoloScissorsROIResult:
+) -> dict[int, YoloScissorsFrameDetection]:
     """
-    Detect scissors with the existing YOLO service and return an expanded ROI.
+    Run local YOLO once over the whole video using Ultralytics streaming.
 
-    This is an Optical Flow adapter only. It does not alter YOLO/SAM2 behavior
-    or their model/output contracts.
+    Frame indices are zero-based to match Ultralytics video result ordering and
+    OpenCV frame positions. The Optical Flow pair for frame N uses detection N.
     """
     config = config or YoloScissorsROIConfig()
-    detector = detection_fn or _default_detect_scissors
-    video_path_str = str(video_path) if video_path is not None else None
+    model_path = Path(config.model_path).expanduser().resolve()
+    print(f"[YOLO-OF] Using model path: {model_path}", flush=True)
+    if not model_path.is_file():
+        raise FileNotFoundError(f"Local YOLO scissors model not found: {model_path}")
 
-    try:
-        detection = detector(
-            frame=frame,
-            confidence_threshold=config.confidence_threshold,
-        )
-        original_bbox = [float(value) for value in detection.bbox]
-        frame_width, frame_height = _frame_bounds(frame)
-        expanded_roi = expand_scissors_bbox_to_roi(
-            original_bbox,
-            frame_width=frame_width,
-            frame_height=frame_height,
-            config=config,
-        )
-        smoothed_roi = smooth_roi_bbox(
-            expanded_roi,
-            previous_smoothed_bbox,
-            frame_width=frame_width,
-            frame_height=frame_height,
-            config=config,
-        )
-        return YoloScissorsROIResult(
-            frame_index=int(frame_index),
-            video_path=video_path_str,
-            original_scissors_bbox=original_bbox,
-            expanded_roi_bbox=smoothed_roi,
-            expanded_roi_bbox_raw=expanded_roi,
-            expanded_roi_bbox_smoothed=smoothed_roi,
-            detection_confidence=round(float(detection.confidence), 6),
-            roi_found=True,
-            detection_class_name=getattr(detection, "class_name", None),
-        )
-    except Exception as exc:  # noqa: BLE001 - fallback must capture detector-specific misses.
-        fallback_reason = f"yolo_missing: {exc}"
+    from ultralytics import YOLO  # noqa: PLC0415
 
-    hold_limit = max(0, int(config.max_roi_hold_frames))
-    if previous_bbox is not None and frames_since_previous_bbox < hold_limit:
-        return YoloScissorsROIResult(
-            frame_index=int(frame_index),
-            video_path=video_path_str,
-            original_scissors_bbox=(
-                [float(value) for value in previous_original_scissors_bbox]
-                if previous_original_scissors_bbox is not None
-                else None
-            ),
-            expanded_roi_bbox=[int(value) for value in previous_bbox],
-            expanded_roi_bbox_raw=(
-                [int(value) for value in previous_expanded_roi_bbox_raw]
-                if previous_expanded_roi_bbox_raw is not None
-                else None
-            ),
-            expanded_roi_bbox_smoothed=[int(value) for value in previous_bbox],
-            detection_confidence=previous_detection_confidence,
-            roi_source="previous_yolo_bbox",
-            roi_found=True,
-            roi_reused_from_previous=True,
-            fallback_used=True,
-            fallback_reason=fallback_reason,
-            detection_class_name=previous_detection_class_name,
-        )
-
-    return YoloScissorsROIResult(
-        frame_index=int(frame_index),
-        video_path=video_path_str,
-        original_scissors_bbox=None,
-        expanded_roi_bbox=None,
-        expanded_roi_bbox_raw=None,
-        expanded_roi_bbox_smoothed=None,
-        detection_confidence=None,
-        roi_found=False,
-        fallback_used=True,
-        fallback_reason=(
-            fallback_reason
-            if previous_bbox is None
-            else f"roi_hold_expired: {fallback_reason}"
-        ),
+    device = _select_yolo_device()
+    use_half = bool(config.half and device != "cpu")
+    model = YOLO(str(model_path))
+    print(
+        f"[YOLO-OF] Loaded YOLO model from {model_path} on device={device}",
+        flush=True,
     )
+    print(f"[YOLO-OF] Processing video: {video_path}", flush=True)
+
+    started = time.perf_counter()
+    detections: dict[int, YoloScissorsFrameDetection] = {}
+    detection_count = 0
+    results_generator = model.predict(
+        source=str(video_path),
+        stream=True,
+        imgsz=int(config.imgsz),
+        conf=float(config.confidence_threshold or 0.25),
+        device=device,
+        half=use_half,
+        verbose=False,
+    )
+
+    for frame_index, result in enumerate(results_generator):
+        orig_shape = getattr(result, "orig_shape", None)
+        if orig_shape is None:
+            frame_height, frame_width = 1, 1
+        else:
+            frame_height, frame_width = int(orig_shape[0]), int(orig_shape[1])
+
+        best = _best_box_from_result(result)
+        if best is None:
+            detections[frame_index] = YoloScissorsFrameDetection(
+                frame_index=frame_index,
+                detected=False,
+                bbox=None,
+                expanded_roi=None,
+                confidence=None,
+            )
+            continue
+
+        bbox, confidence, class_name = best
+        expanded_roi = expand_scissors_bbox_to_roi(
+            bbox,
+            frame_width=frame_width,
+            frame_height=frame_height,
+            config=config,
+        )
+        detections[frame_index] = YoloScissorsFrameDetection(
+            frame_index=frame_index,
+            detected=True,
+            bbox=bbox,
+            expanded_roi=expanded_roi,
+            confidence=round(float(confidence), 6),
+            class_name=class_name,
+        )
+        detection_count += 1
+
+    elapsed = time.perf_counter() - started
+    total = len(detections)
+    ratio = detection_count / total if total else 0.0
+    print(
+        "[YOLO-OF] Streaming YOLO done. "
+        f"frames={total}, detections={detection_count}, "
+        f"yolo_detection_ratio={ratio:.6f}, yolo_runtime_sec={elapsed:.2f}",
+        flush=True,
+    )
+    return detections
 
 
 class YoloScissorsROIProvider:
-    """Stateful Optical Flow ROI provider with short YOLO-miss hold behavior."""
+    """Deprecated compatibility wrapper.
+
+    Optical Flow must use ``collect_yolo_scissors_detections_for_video`` so YOLO
+    receives the whole video with ``stream=True`` instead of individual frames.
+    """
 
     def __init__(
         self,
         *,
         video_path: str | Path | None = None,
         config: YoloScissorsROIConfig | None = None,
-        detection_fn: DetectionFn | None = None,
     ) -> None:
-        self.video_path = video_path
+        self.video_path = str(video_path) if video_path is not None else None
         self.config = config or YoloScissorsROIConfig()
-        self.detection_fn = detection_fn
-        self._held_roi: _HeldROI | None = None
         self.last_result: YoloScissorsROIResult | None = None
 
+    def _detect_best_box(self, frame_bgr: np.ndarray) -> tuple[list[float], float, str | None] | None:
+        del frame_bgr
+        raise RuntimeError("Use streamed whole-video YOLO detection for Optical Flow.")
+
     def detect(self, frame_bgr: np.ndarray, frame_index: int) -> ROIBox | None:
-        held = self._held_roi
-        result = get_yolo_scissors_roi_for_frame(
-            frame=frame_bgr,
-            frame_index=frame_index,
-            video_path=self.video_path,
-            previous_bbox=held.expanded_roi_bbox_smoothed if held is not None else None,
-            previous_original_scissors_bbox=(
-                held.original_scissors_bbox if held is not None else None
-            ),
-            previous_detection_confidence=(
-                held.detection_confidence if held is not None else None
-            ),
-            previous_detection_class_name=(
-                held.detection_class_name if held is not None else None
-            ),
-            previous_expanded_roi_bbox_raw=(
-                held.expanded_roi_bbox_raw if held is not None else None
-            ),
-            previous_smoothed_bbox=(
-                held.expanded_roi_bbox_smoothed if held is not None else None
-            ),
-            frames_since_previous_bbox=(
-                int(frame_index) - held.last_valid_frame_index
-                if held is not None
-                else 0
-            ),
-            config=self.config,
-            detection_fn=self.detection_fn,
-        )
-        self.last_result = result
-
-        if result.roi_found and not result.roi_reused_from_previous:
-            if (
-                result.original_scissors_bbox is not None
-                and result.expanded_roi_bbox_raw is not None
-                and result.expanded_roi_bbox_smoothed is not None
-            ):
-                self._held_roi = _HeldROI(
-                    original_scissors_bbox=result.original_scissors_bbox,
-                    expanded_roi_bbox_raw=result.expanded_roi_bbox_raw,
-                    expanded_roi_bbox_smoothed=result.expanded_roi_bbox_smoothed,
-                    detection_confidence=result.detection_confidence,
-                    detection_class_name=result.detection_class_name,
-                    last_valid_frame_index=int(frame_index),
-                )
-
-        return result.roi_tuple
+        del frame_bgr, frame_index
+        raise RuntimeError("Use streamed whole-video YOLO detection for Optical Flow.")
 
     def last_debug_dict(self) -> dict[str, Any] | None:
         return self.last_result.to_debug_dict() if self.last_result is not None else None
@@ -466,120 +338,9 @@ class YoloScissorsROIProvider:
         return None
 
 
-class SharedYoloScissorsROIProvider:
-    """Optical Flow ROI provider backed by shared yolo_scissors_raw.json artifacts."""
+SharedYoloScissorsROIProvider = YoloScissorsROIProvider
 
-    def __init__(
-        self,
-        *,
-        video_path: str | Path,
-        config: YoloScissorsROIConfig | None = None,
-    ) -> None:
-        self.video_path = Path(video_path).expanduser().resolve()
-        self.config = config or YoloScissorsROIConfig()
-        matched = find_shared_yolo_artifact_for_video(
-            video_path=self.video_path,
-            artifact_path=self.config.artifact_path,
-            artifact_root=self.config.artifact_root,
-        )
-        self.artifact_path: Path | None = matched[1] if matched is not None else None
-        self.frames = _shared_frames_from_payload(matched[0]) if matched is not None else []
-        self._held_roi: _HeldROI | None = None
-        self.last_result: YoloScissorsROIResult | None = None
 
-        if self.artifact_path is not None:
-            print(
-                f"[OF][YOLO-ROI] loaded shared artifact={self.artifact_path}",
-                flush=True,
-            )
-        else:
-            print(
-                f"[OF][YOLO-ROI] shared artifact missing for video={self.video_path}",
-                flush=True,
-            )
-
-    def detect(self, frame_bgr: np.ndarray, frame_index: int) -> ROIBox | None:
-        frame_width, frame_height = _frame_bounds(frame_bgr)
-        nearest = _nearest_shared_frame(self.frames, frame_index)
-        if nearest is not None and nearest.detected and nearest.bbox is not None:
-            original_bbox = [float(value) for value in nearest.bbox]
-            expanded_roi = expand_scissors_bbox_to_roi(
-                original_bbox,
-                frame_width=frame_width,
-                frame_height=frame_height,
-                config=self.config,
-            )
-            result = YoloScissorsROIResult(
-                frame_index=int(frame_index),
-                video_path=str(self.video_path),
-                original_scissors_bbox=original_bbox,
-                expanded_roi_bbox=expanded_roi,
-                expanded_roi_bbox_raw=expanded_roi,
-                expanded_roi_bbox_smoothed=expanded_roi,
-                detection_confidence=(
-                    round(float(nearest.confidence), 6)
-                    if nearest.confidence is not None
-                    else None
-                ),
-                roi_source="yolo_scissors_expanded",
-                roi_found=True,
-                detection_class_name=nearest.class_name,
-            )
-            self._held_roi = _HeldROI(
-                original_scissors_bbox=original_bbox,
-                expanded_roi_bbox_raw=expanded_roi,
-                expanded_roi_bbox_smoothed=expanded_roi,
-                detection_confidence=result.detection_confidence,
-                detection_class_name=nearest.class_name,
-                last_valid_frame_index=int(frame_index),
-            )
-            self.last_result = result
-            return result.roi_tuple
-
-        held = self._held_roi
-        hold_limit = max(0, int(self.config.max_roi_hold_frames))
-        if held is not None and int(frame_index) - held.last_valid_frame_index <= hold_limit:
-            result = YoloScissorsROIResult(
-                frame_index=int(frame_index),
-                video_path=str(self.video_path),
-                original_scissors_bbox=held.original_scissors_bbox,
-                expanded_roi_bbox=held.expanded_roi_bbox_smoothed,
-                expanded_roi_bbox_raw=held.expanded_roi_bbox_raw,
-                expanded_roi_bbox_smoothed=held.expanded_roi_bbox_smoothed,
-                detection_confidence=held.detection_confidence,
-                roi_source="previous_yolo_bbox",
-                roi_found=True,
-                roi_reused_from_previous=True,
-                fallback_used=True,
-                fallback_reason="shared_yolo_detection_missing",
-                detection_class_name=held.detection_class_name,
-            )
-            self.last_result = result
-            return result.roi_tuple
-
-        fallback_reason = (
-            "shared_yolo_artifact_missing"
-            if self.artifact_path is None
-            else "shared_yolo_detection_missing"
-        )
-        self.last_result = YoloScissorsROIResult(
-            frame_index=int(frame_index),
-            video_path=str(self.video_path),
-            original_scissors_bbox=None,
-            expanded_roi_bbox=None,
-            expanded_roi_bbox_raw=None,
-            expanded_roi_bbox_smoothed=None,
-            detection_confidence=None,
-            roi_source="none",
-            roi_found=False,
-            fallback_used=True,
-            fallback_reason=fallback_reason,
-        )
-        return None
-
-    def last_debug_dict(self) -> dict[str, Any] | None:
-        return self.last_result.to_debug_dict() if self.last_result is not None else None
-
-    def close(self) -> None:
-        return None
+def get_yolo_scissors_roi_for_frame(*_args: Any, **_kwargs: Any) -> YoloScissorsROIResult:
+    raise RuntimeError("Use YoloScissorsROIProvider so the local YOLO model is loaded once.")
 

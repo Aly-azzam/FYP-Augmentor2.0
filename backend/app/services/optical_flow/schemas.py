@@ -51,9 +51,12 @@ class FrameFlowFeatures(BaseModel):
     roi_source: Literal[
         "none",
         "mediapipe_hand",
+        "yolo",
         "yolo_scissors",
         "yolo_scissors_expanded",
         "previous_yolo_bbox",
+        "previous_yolo_fallback",
+        "full_frame_fallback",
     ] = Field(
         default="none",
         description="ROI provider used for this frame pair",
@@ -91,6 +94,50 @@ class FrameFlowFeatures(BaseModel):
         ge=0,
         le=1,
         description="YOLO scissors detection confidence when available",
+    )
+    yolo_detected: bool = Field(
+        default=False,
+        description="True when local YOLO detected scissors on this frame",
+    )
+    yolo_confidence: Optional[float] = Field(
+        default=None,
+        ge=0,
+        le=1,
+        description="Local YOLO scissors confidence for this frame",
+    )
+    scissors_bbox_xyxy: Optional[List[float]] = Field(
+        default=None,
+        description="Raw local YOLO scissors bbox [x1, y1, x2, y2]",
+    )
+    expanded_roi_xyxy: Optional[List[int]] = Field(
+        default=None,
+        description="Expanded YOLO Optical Flow ROI [x1, y1, x2, y2]",
+    )
+    roi_width: int = Field(
+        default=0,
+        ge=0,
+        description="Expanded ROI width in pixels",
+    )
+    roi_height: int = Field(
+        default=0,
+        ge=0,
+        description="Expanded ROI height in pixels",
+    )
+    flow_mean_magnitude: float = Field(
+        default=0.0,
+        ge=0,
+        description="Mean Optical Flow magnitude for the processed ROI",
+    )
+    flow_max_magnitude: float = Field(
+        default=0.0,
+        ge=0,
+        description="Maximum Optical Flow magnitude for the processed ROI",
+    )
+    flow_motion_area_ratio: float = Field(
+        default=0.0,
+        ge=0,
+        le=1,
+        description="Motion area ratio for the processed ROI",
     )
     roi_reused_from_previous: bool = Field(
         default=False,
@@ -187,12 +234,50 @@ class VideoFlowSummary(BaseModel):
     roi_source_used: Literal[
         "none",
         "mediapipe_hand",
+        "yolo",
         "yolo_scissors",
         "yolo_scissors_expanded",
         "previous_yolo_bbox",
+        "previous_yolo_fallback",
+        "full_frame_fallback",
     ] = Field(
         default="none",
         description="Configured/effective ROI source used for this video summary",
+    )
+    total_frames: int = Field(
+        default=0,
+        ge=0,
+        description="Total frames reported by video metadata when available",
+    )
+    processed_pairs: int = Field(
+        default=0,
+        ge=0,
+        description="Number of consecutive frame pairs processed",
+    )
+    yolo_detection_count: int = Field(
+        default=0,
+        ge=0,
+        description="Number of processed pairs with a fresh local YOLO scissors detection",
+    )
+    fallback_count: int = Field(
+        default=0,
+        ge=0,
+        description="Number of processed pairs using a YOLO fallback ROI",
+    )
+    full_frame_fallback_count: int = Field(
+        default=0,
+        ge=0,
+        description="Number of processed pairs using full-frame fallback",
+    )
+    average_flow_mean_magnitude: float = Field(
+        default=0.0,
+        ge=0,
+        description="Average per-pair flow mean magnitude",
+    )
+    peak_flow_magnitude: float = Field(
+        default=0.0,
+        ge=0,
+        description="Peak per-pair flow magnitude",
     )
     yolo_detection_ratio: float = Field(
         default=0.0,

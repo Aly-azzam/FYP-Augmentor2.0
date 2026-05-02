@@ -96,11 +96,11 @@ async def optical_flow_health() -> dict[str, str]:
 async def process_learner_optical_flow(
     file: UploadFile = File(...),
     save_visualization: bool = Form(default=True),
-    use_hand_roi: bool = Form(default=True),
-    roi_source: str = Form(default="mediapipe_hand"),
+    use_hand_roi: bool = Form(default=False),
+    roi_source: str = Form(default="yolo_scissors"),
     roi_padding_px: int = Form(default=40),
     max_roi_hold_frames: int = Form(default=5),
-    roi_smoothing_enabled: bool = Form(default=True),
+    roi_smoothing_enabled: bool = Form(default=False),
     roi_smoothing_alpha: float = Form(default=0.65),
 ) -> dict[str, Any]:
     """

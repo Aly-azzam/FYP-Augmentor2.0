@@ -7,6 +7,7 @@ from .yolo_scissors_roi import (
     YoloScissorsROIConfig,
     YoloScissorsROIProvider,
     YoloScissorsROIResult,
+    collect_yolo_scissors_detections_for_video,
     expand_scissors_bbox_to_roi,
     get_yolo_scissors_roi_for_frame,
 )
@@ -20,6 +21,7 @@ __all__ = [
     "YoloScissorsROIResult",
     "build_video_flow_summary",
     "compute_video_optical_flow_features",
+    "collect_yolo_scissors_detections_for_video",
     "evaluate_optical_flow_summary",
     "expand_scissors_bbox_to_roi",
     "extract_frame_flow_features",

@@ -94,9 +94,12 @@ def extract_frame_flow_features(
     roi_source: Literal[
         "none",
         "mediapipe_hand",
+        "yolo",
         "yolo_scissors",
         "yolo_scissors_expanded",
         "previous_yolo_bbox",
+        "previous_yolo_fallback",
+        "full_frame_fallback",
     ] = "none",
     roi_found: bool = False,
     original_scissors_bbox: list[float] | None = None,
@@ -124,6 +127,17 @@ def extract_frame_flow_features(
         motion_threshold=motion_threshold,
     )
 
+    effective_yolo_bbox = yolo_scissors_bbox or original_scissors_bbox
+    effective_roi = expanded_optical_flow_roi or expanded_roi_bbox
+    roi_width = max(0, int(effective_roi[2]) - int(effective_roi[0])) if effective_roi else 0
+    roi_height = max(0, int(effective_roi[3]) - int(effective_roi[1])) if effective_roi else 0
+    yolo_detected = bool(
+        roi_source in {"yolo", "yolo_scissors", "yolo_scissors_expanded"}
+        and roi_found
+        and not roi_reused_from_previous
+        and effective_yolo_bbox is not None
+    )
+
     return FrameFlowFeatures(
         frame_index=frame_index,
         timestamp_sec=timestamp_sec,
@@ -135,12 +149,21 @@ def extract_frame_flow_features(
         roi_source=roi_source,
         roi_found=roi_found,
         original_scissors_bbox=original_scissors_bbox,
-        yolo_scissors_bbox=yolo_scissors_bbox or original_scissors_bbox,
+        yolo_scissors_bbox=effective_yolo_bbox,
         expanded_roi_bbox=expanded_roi_bbox,
-        expanded_optical_flow_roi=expanded_optical_flow_roi or expanded_roi_bbox,
+        expanded_optical_flow_roi=effective_roi,
         expanded_roi_bbox_raw=expanded_roi_bbox_raw,
         expanded_roi_bbox_smoothed=expanded_roi_bbox_smoothed,
         detection_confidence=detection_confidence,
+        yolo_detected=yolo_detected,
+        yolo_confidence=detection_confidence if yolo_detected else None,
+        scissors_bbox_xyxy=effective_yolo_bbox if yolo_detected else None,
+        expanded_roi_xyxy=effective_roi,
+        roi_width=roi_width,
+        roi_height=roi_height,
+        flow_mean_magnitude=round(mean_magnitude, 6),
+        flow_max_magnitude=round(max_magnitude, 6),
+        flow_motion_area_ratio=round(motion_area_ratio, 6),
         roi_reused_from_previous=roi_reused_from_previous,
         fallback_used=fallback_used,
         fallback_reason=fallback_reason,
@@ -271,9 +294,12 @@ def build_video_flow_summary(
     roi_source_used: Literal[
         "none",
         "mediapipe_hand",
+        "yolo",
         "yolo_scissors",
         "yolo_scissors_expanded",
         "previous_yolo_bbox",
+        "previous_yolo_fallback",
+        "full_frame_fallback",
     ] = "none",
     roi_smoothing_enabled: bool = False,
     roi_smoothing_alpha: float | None = None,
@@ -295,6 +321,13 @@ def build_video_flow_summary(
             vibration_score=0.0,
             roi_enabled=roi_enabled,
             roi_source_used=roi_source_used if roi_enabled else "none",
+            total_frames=0,
+            processed_pairs=0,
+            yolo_detection_count=0,
+            fallback_count=0,
+            full_frame_fallback_count=0,
+            average_flow_mean_magnitude=0.0,
+            peak_flow_magnitude=0.0,
             roi_smoothing_enabled=roi_smoothing_enabled,
             roi_smoothing_alpha=roi_smoothing_alpha,
         )
@@ -349,7 +382,7 @@ def build_video_flow_summary(
     yolo_detection_frames = sum(
         1
         for f in frame_features
-        if f.roi_source in {"yolo_scissors", "yolo_scissors_expanded"}
+        if f.roi_source in {"yolo", "yolo_scissors", "yolo_scissors_expanded"}
         and f.roi_found
         and not f.roi_reused_from_previous
     )
@@ -360,6 +393,14 @@ def build_video_flow_summary(
     )
     reused_roi_frame_count = sum(1 for f in frame_features if f.roi_reused_from_previous)
     fallback_frame_count = sum(1 for f in frame_features if f.fallback_used)
+    yolo_fallback_count = sum(
+        1
+        for f in frame_features
+        if f.roi_source in {"previous_yolo_fallback", "full_frame_fallback"}
+    )
+    full_frame_fallback_count = sum(
+        1 for f in frame_features if f.roi_source == "full_frame_fallback"
+    )
     roi_area_ratios = [f.roi_area_ratio for f in frame_features if f.roi_used]
     average_roi_area_ratio = _safe_mean(roi_area_ratios)
 
@@ -379,7 +420,14 @@ def build_video_flow_summary(
         roi_fallback_frames=roi_fallback_frames,
         roi_usage_ratio=round(roi_usage_ratio, 6),
         roi_source_used=roi_source_used if roi_enabled else "none",
+        total_frames=len(frame_features) + 1 if frame_features else 0,
+        processed_pairs=len(frame_features),
+        yolo_detection_count=yolo_detection_frames,
         yolo_detection_ratio=round(yolo_detection_ratio, 6),
+        fallback_count=yolo_fallback_count,
+        full_frame_fallback_count=full_frame_fallback_count,
+        average_flow_mean_magnitude=round(avg_magnitude, 6),
+        peak_flow_magnitude=round(max(max_magnitudes), 6) if max_magnitudes else 0.0,
         reused_roi_frame_count=reused_roi_frame_count,
         fallback_frame_count=fallback_frame_count,
         average_roi_area_ratio=round(average_roi_area_ratio, 6),

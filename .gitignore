@@ -82,4 +82,12 @@ backend_tree.txt
 vendor/
 **/vendor/
 
-backend/datasets/**
+
+# YOLO datasets and training outputs
+backend/datasets/
+backend/runs/
+
+# Keep trained model folder
+!backend/models/
+!backend/models/yolo/
+!backend/models/yolo/best.pt

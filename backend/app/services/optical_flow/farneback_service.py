@@ -31,8 +31,8 @@ class FarnebackConfig:
     gaussian_blur_kernel: int = 5
     #: When True, run Farneback only inside a MediaPipe hand bounding box.
     use_hand_roi: bool = False
-    #: ROI provider. ``use_hand_roi=True`` keeps legacy MediaPipe behavior unless this is changed.
-    roi_source: ROISource = "mediapipe_hand"
+    #: ROI provider. YOLO scissors is the default Optical Flow ROI source.
+    roi_source: ROISource = "yolo_scissors"
     #: Padding added around the detected hand bounding box, in pixels.
     roi_padding_px: int = 40
     #: Minimum effective ROI padding used for locked hand tracking.
@@ -48,21 +48,21 @@ class FarnebackConfig:
     #: If True, never switch to another hand after lock is lost.
     roi_lock_strict: bool = True
     #: Horizontal expansion factor for YOLO scissors Optical Flow ROI.
-    roi_expand_x: float = 2.2
+    roi_expand_x: float = 2.4
     #: Kept for config/debug parity with the YOLO ROI helper.
     roi_expand_y: float = 2.5
     #: Extra downward YOLO ROI expansion as a scissors-box height ratio.
     roi_extra_down_ratio: float = 1.5
     #: Extra upward YOLO ROI expansion as a scissors-box height ratio.
-    roi_extra_up_ratio: float = 0.4
+    roi_extra_up_ratio: float = 0.3
     #: Number of frames to reuse the last valid YOLO ROI after a YOLO miss.
     max_roi_hold_frames: int = 5
     #: Optional per-run YOLO confidence threshold; None uses the existing YOLO service default.
     yolo_confidence_threshold: float | None = None
-    #: Optional path to a shared yolo_scissors_raw.json artifact.
-    yolo_scissors_artifact_path: str | None = None
+    #: Local Ultralytics YOLO scissors model used by Optical Flow ROI.
+    yolo_scissors_model_path: str | None = None
     #: Smooth YOLO expanded ROI before using it for Optical Flow cropping.
-    roi_smoothing_enabled: bool = True
+    roi_smoothing_enabled: bool = False
     #: Exponential smoothing alpha for YOLO expanded ROI.
     roi_smoothing_alpha: float = 0.65
 
@@ -88,6 +88,25 @@ def _roi_area_ratio(roi: tuple[int, int, int, int] | None, frame_shape: tuple[in
     frame_area = max(1, int(width) * int(height))
     roi_area = max(0, x2 - x1) * max(0, y2 - y1)
     return float(roi_area / frame_area)
+
+
+def crop_to_roi(frame: np.ndarray, roi: tuple[int, int, int, int]) -> np.ndarray:
+    x1, y1, x2, y2 = roi
+    return frame[y1:y2, x1:x2]
+
+
+def embed_roi_flow_in_canvas(
+    roi_flow: np.ndarray,
+    roi: tuple[int, int, int, int],
+    height: int,
+    width: int,
+) -> np.ndarray:
+    x1, y1, x2, y2 = roi
+    canvas = np.zeros((height, width, 2), dtype=roi_flow.dtype)
+    paste_h = min(y2 - y1, roi_flow.shape[0])
+    paste_w = min(x2 - x1, roi_flow.shape[1])
+    canvas[y1 : y1 + paste_h, x1 : x1 + paste_w] = roi_flow[:paste_h, :paste_w]
+    return canvas
 
 
 def _validate_video_path(video_path: str | Path) -> Path:
@@ -177,6 +196,36 @@ def compute_video_optical_flow_features(
     path = _validate_video_path(video_path)
 
     metadata = read_video_metadata(path)
+    active_roi_source = _effective_roi_source(config)
+    roi_detector = None
+    yolo_detections = None
+    held_yolo_detection = None
+
+    if active_roi_source == "yolo_scissors_expanded":
+        from .yolo_scissors_roi import (  # noqa: PLC0415
+            DEFAULT_LOCAL_YOLO_SCISSORS_MODEL_PATH,
+            YoloScissorsROIConfig,
+            collect_yolo_scissors_detections_for_video,
+        )
+
+        yolo_config = YoloScissorsROIConfig(
+            roi_expand_x=config.roi_expand_x,
+            roi_expand_y=config.roi_expand_y,
+            roi_extra_down_ratio=config.roi_extra_down_ratio,
+            roi_extra_up_ratio=config.roi_extra_up_ratio,
+            max_roi_hold_frames=config.max_roi_hold_frames,
+            confidence_threshold=config.yolo_confidence_threshold,
+            roi_smoothing_enabled=config.roi_smoothing_enabled,
+            roi_smoothing_alpha=config.roi_smoothing_alpha,
+            model_path=(
+                config.yolo_scissors_model_path
+                or DEFAULT_LOCAL_YOLO_SCISSORS_MODEL_PATH
+            ),
+        )
+        yolo_detections = collect_yolo_scissors_detections_for_video(
+            video_path=path,
+            config=yolo_config,
+        )
 
     cap = cv2.VideoCapture(str(path))
     if not cap.isOpened():
@@ -204,54 +253,25 @@ def compute_video_optical_flow_features(
 
     fps = metadata.fps if metadata.fps > 0 else 1.0
     frame_index = 1
-    roi_detector = None
-    active_roi_source = _effective_roi_source(config)
-    crop_to_roi = None
-    embed_roi_flow_in_canvas = None
     processed_count = 0
     yolo_roi_frames = 0
     extraction_start = time.perf_counter()
 
-    if active_roi_source != "none":
-        from .hand_roi import (
-            HandROIDetector,
-            crop_to_roi,
-            embed_roi_flow_in_canvas,
+    if active_roi_source == "mediapipe_hand":
+        from .hand_roi import HandROIDetector
+
+        effective_roi_padding_px = max(
+            int(config.roi_padding_px),
+            int(config.roi_enlarge_padding_px),
         )
-
-        if active_roi_source == "mediapipe_hand":
-            effective_roi_padding_px = max(
-                int(config.roi_padding_px),
-                int(config.roi_enlarge_padding_px),
-            )
-            roi_detector = HandROIDetector(
-                padding_px=effective_roi_padding_px,
-                hand_preference=config.roi_hand_preference,
-                lock_target=config.roi_lock_target,
-                lock_max_missing_frames=config.roi_lock_max_missing_frames,
-                lock_max_center_distance_ratio=config.roi_lock_max_center_distance_ratio,
-                lock_strict=config.roi_lock_strict,
-            )
-        else:
-            from .yolo_scissors_roi import (  # noqa: PLC0415
-                SharedYoloScissorsROIProvider,
-                YoloScissorsROIConfig,
-            )
-
-            roi_detector = SharedYoloScissorsROIProvider(
-                video_path=path,
-                config=YoloScissorsROIConfig(
-                    roi_expand_x=config.roi_expand_x,
-                    roi_expand_y=config.roi_expand_y,
-                    roi_extra_down_ratio=config.roi_extra_down_ratio,
-                    roi_extra_up_ratio=config.roi_extra_up_ratio,
-                    max_roi_hold_frames=config.max_roi_hold_frames,
-                    confidence_threshold=config.yolo_confidence_threshold,
-                    roi_smoothing_enabled=config.roi_smoothing_enabled,
-                    roi_smoothing_alpha=config.roi_smoothing_alpha,
-                    artifact_path=config.yolo_scissors_artifact_path,
-                ),
-            )
+        roi_detector = HandROIDetector(
+            padding_px=effective_roi_padding_px,
+            hand_preference=config.roi_hand_preference,
+            lock_target=config.roi_lock_target,
+            lock_max_missing_frames=config.roi_lock_max_missing_frames,
+            lock_max_center_distance_ratio=config.roi_lock_max_center_distance_ratio,
+            lock_strict=config.roi_lock_strict,
+        )
 
     print("[OF] feature extraction started", flush=True)
     try:
@@ -272,17 +292,65 @@ def compute_video_optical_flow_features(
             roi_used = False
             roi = None
             yolo_debug: dict | None = None
-            if roi_detector is not None:
-                if active_roi_source == "yolo_scissors_expanded":
-                    yolo_roi_frames += 1
-                    roi = roi_detector.detect(curr_frame, frame_index)
-                    yolo_debug = roi_detector.last_debug_dict()
+            if active_roi_source == "yolo_scissors_expanded" and yolo_detections is not None:
+                yolo_roi_frames += 1
+                yolo_detection = yolo_detections.get(frame_index)
+                if (
+                    yolo_detection is not None
+                    and yolo_detection.detected
+                    and yolo_detection.bbox is not None
+                    and yolo_detection.expanded_roi is not None
+                ):
+                    held_yolo_detection = yolo_detection
+                    roi = tuple(int(value) for value in yolo_detection.expanded_roi)
+                    yolo_debug = {
+                        "original_scissors_bbox": yolo_detection.bbox,
+                        "expanded_roi_bbox": yolo_detection.expanded_roi,
+                        "expanded_roi_bbox_raw": yolo_detection.expanded_roi,
+                        "expanded_roi_bbox_smoothed": yolo_detection.expanded_roi,
+                        "detection_confidence": yolo_detection.confidence,
+                        "roi_source": "yolo",
+                        "roi_reused_from_previous": False,
+                        "fallback_used": False,
+                        "fallback_reason": None,
+                        "detection_class_name": yolo_detection.class_name,
+                        "yolo_detected": True,
+                    }
+                elif held_yolo_detection is not None and held_yolo_detection.expanded_roi is not None:
+                    roi = tuple(int(value) for value in held_yolo_detection.expanded_roi)
+                    yolo_debug = {
+                        "original_scissors_bbox": None,
+                        "expanded_roi_bbox": held_yolo_detection.expanded_roi,
+                        "expanded_roi_bbox_raw": held_yolo_detection.expanded_roi,
+                        "expanded_roi_bbox_smoothed": held_yolo_detection.expanded_roi,
+                        "detection_confidence": None,
+                        "roi_source": "previous_yolo_fallback",
+                        "roi_reused_from_previous": True,
+                        "fallback_used": True,
+                        "fallback_reason": "yolo_detection_missing",
+                        "detection_class_name": held_yolo_detection.class_name,
+                        "yolo_detected": False,
+                    }
                 else:
-                    roi = roi_detector.detect(curr_frame)
+                    height, width = curr_gray.shape[:2]
+                    roi = (0, 0, int(width), int(height))
+                    yolo_debug = {
+                        "original_scissors_bbox": None,
+                        "expanded_roi_bbox": list(roi),
+                        "expanded_roi_bbox_raw": list(roi),
+                        "expanded_roi_bbox_smoothed": list(roi),
+                        "detection_confidence": None,
+                        "roi_source": "full_frame_fallback",
+                        "roi_reused_from_previous": False,
+                        "fallback_used": True,
+                        "fallback_reason": "yolo_detection_missing_no_previous_roi",
+                        "detection_class_name": None,
+                        "yolo_detected": False,
+                    }
+            elif roi_detector is not None:
+                roi = roi_detector.detect(curr_frame)
 
             if roi is not None:
-                if crop_to_roi is None or embed_roi_flow_in_canvas is None:
-                    raise RuntimeError("ROI helpers were not initialized.")
                 roi_prev = crop_to_roi(prev_for_flow, roi)
                 roi_curr = crop_to_roi(curr_for_flow, roi)
                 roi_flow = cv2.calcOpticalFlowFarneback(
@@ -395,15 +463,16 @@ def compute_video_optical_flow_features(
                 features.vibration_delta = 0.0
             frame_features.append(features)
             if yolo_debug is not None:
+                yolo_detected = bool(yolo_debug.get("yolo_detected", False))
                 print(
-                    "[OF][YOLO-ROI] "
-                    f"frame={frame_index} "
-                    f"detected={not roi_reused_from_previous and original_scissors_bbox is not None} "
-                    f"bbox={original_scissors_bbox} "
-                    f"expanded_roi={expanded_optical_flow_roi} "
-                    f"mean_mag={features.mean_magnitude:.6f} "
-                    f"max_mag={features.max_magnitude:.6f} "
-                    f"vibration={features.vibration_delta:.6f}",
+                    "[YOLO-OF] "
+                    f"Frame {frame_index}/{metadata.frame_count} | "
+                    f"roi_source={frame_roi_source} | "
+                    f"detected={yolo_detected} | "
+                    f"conf={detection_confidence} | "
+                    f"bbox={original_scissors_bbox} | "
+                    f"roi={expanded_optical_flow_roi} | "
+                    f"mean_mag={features.mean_magnitude:.6f}",
                     flush=True,
                 )
             processed_count += 1
@@ -431,6 +500,29 @@ def compute_video_optical_flow_features(
     print("[OF] feature extraction finished", flush=True)
     print(f"[OF] total_processed_frames={processed_count}", flush=True)
     print(f"[OF] total_yolo_roi_frames={yolo_roi_frames}", flush=True)
+    if active_roi_source == "yolo_scissors_expanded":
+        yolo_detection_count = sum(
+            1 for feature in frame_features if feature.yolo_detected
+        )
+        fallback_count = sum(
+            1
+            for feature in frame_features
+            if feature.roi_source in {"previous_yolo_fallback", "full_frame_fallback"}
+        )
+        full_frame_fallback_count = sum(
+            1 for feature in frame_features if feature.roi_source == "full_frame_fallback"
+        )
+        yolo_detection_ratio = (
+            yolo_detection_count / len(frame_features) if frame_features else 0.0
+        )
+        print(
+            "[YOLO-OF] Done. "
+            f"yolo_detection_ratio={yolo_detection_ratio:.6f}, "
+            f"fallback_count={fallback_count}, "
+            f"full_frame_fallback_count={full_frame_fallback_count}, "
+            f"runtime_sec={feature_extraction_time_sec:.2f}",
+            flush=True,
+        )
     print(
         f"[OF] feature_extraction_time_sec={feature_extraction_time_sec:.2f}",
         flush=True,
