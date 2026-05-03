@@ -23,8 +23,14 @@ import cv2
 import numpy as np
 import torch
 
+from app.services.sam2_yolo.cleaned_trajectory import (
+    build_cleaned_trajectory_artifact,
+    write_trajectory_line_overlay_video,
+)
 from app.services.sam2_yolo.region_metrics import compute_region_metrics
 from app.services.sam2_yolo.schemas import (
+    CLEANED_TRAJECTORY_FILENAME,
+    DEFAULT_TRAJECTORY_POINT_MODE,
     DEBUG_FIRST_FRAME_FILENAME,
     METRICS_FILENAME,
     MODEL_NAME,
@@ -32,8 +38,10 @@ from app.services.sam2_yolo.schemas import (
     PROMPT_SOURCE,
     RAW_FILENAME,
     SUMMARY_FILENAME,
+    SMOOTH_POLYLINE_OVERLAY_FILENAME,
     TRACKING_POINT_TYPE,
     TRACKING_QUALITY_NOTE,
+    TRAJECTORY_POINT_MODES,
     ExtractedVideo,
     InitialPrompt,
     build_frame_payload,
@@ -84,6 +92,7 @@ def run_stable_yolo_sam2_tracking(
     max_processed_frames: int | None = None,
     use_gpu: bool = True,
     tracking_point_type: str = TRACKING_POINT_TYPE,
+    trajectory_point_mode: str = DEFAULT_TRAJECTORY_POINT_MODE,
     save_debug: bool = False,
     debug_gpu: bool = False,
     roboflow_confidence: float = DEFAULT_ROBOFLOW_CONFIDENCE,
@@ -93,6 +102,8 @@ def run_stable_yolo_sam2_tracking(
 ) -> dict[str, Any]:
     if tracking_point_type != TRACKING_POINT_TYPE:
         raise ValueError("Only tracking_point_type='bbox_center' is supported for now")
+    if trajectory_point_mode not in TRAJECTORY_POINT_MODES:
+        raise ValueError(f"trajectory_point_mode must be one of {TRAJECTORY_POINT_MODES}")
 
     run_dir = Path(output_dir).expanduser().resolve()
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -105,6 +116,8 @@ def run_stable_yolo_sam2_tracking(
     metrics_path = run_dir / METRICS_FILENAME
     summary_path = run_dir / SUMMARY_FILENAME
     overlay_path = run_dir / OVERLAY_FILENAME
+    cleaned_trajectory_path = run_dir / CLEANED_TRAJECTORY_FILENAME
+    smooth_polyline_overlay_path = run_dir / SMOOTH_POLYLINE_OVERLAY_FILENAME
     debug_path = run_dir / DEBUG_FIRST_FRAME_FILENAME if save_debug else None
     frame_cap = _resolved_frame_cap(max_processed_frames)
 
@@ -274,6 +287,7 @@ def run_stable_yolo_sam2_tracking(
             output_path=overlay_path,
             fps=tracking_result.extracted_video.output_fps,
             trajectory_metrics=metrics_payload["trajectory_metrics"],
+            trajectory_point_mode=trajectory_point_mode,
         )
     except Exception as exc:  # noqa: BLE001
         summary = _build_failed_summary(
@@ -295,6 +309,34 @@ def run_stable_yolo_sam2_tracking(
         _write_json(summary_path, summary)
         return summary
 
+    try:
+        cleaned_trajectory_payload = build_cleaned_trajectory_artifact(
+            raw_json_path=raw_path,
+            metrics_json_path=metrics_path,
+            output_path=cleaned_trajectory_path,
+            trajectory_point_mode=trajectory_point_mode,
+        )
+        write_trajectory_line_overlay_video(
+            frame_dir=tracking_result.extracted_video.frame_dir,
+            raw_frames=tracking_result.frames,
+            cleaned_trajectory=cleaned_trajectory_payload,
+            output_path=smooth_polyline_overlay_path,
+            fps=tracking_result.extracted_video.output_fps,
+        )
+        summary_payload.update(
+            {
+                "cleaned_trajectory_json_path": str(cleaned_trajectory_path),
+                "smooth_polyline_overlay_video_path": str(smooth_polyline_overlay_path),
+                "smooth_polyline_overlay_video_url": _storage_url_for(smooth_polyline_overlay_path),
+                "cleaned_trajectory_usable_for_corridor": bool(
+                    cleaned_trajectory_payload.get("usable_for_corridor", False)
+                ),
+            }
+        )
+    except Exception as exc:  # noqa: BLE001 - keep existing SAM2+YOLO outputs usable.
+        logger.exception("[SAM2] cleaned trajectory post-processing failed")
+        summary_payload["cleaned_trajectory_error"] = str(exc)
+
     _write_json(summary_path, summary_payload)
     return summary_payload
 
@@ -308,6 +350,7 @@ def run_stable_yolo_sam2_run(
     max_processed_frames: int | None = None,
     use_gpu: bool = True,
     tracking_point_type: str = TRACKING_POINT_TYPE,
+    trajectory_point_mode: str = DEFAULT_TRAJECTORY_POINT_MODE,
     save_debug: bool = False,
     debug_gpu: bool = False,
     roboflow_confidence: float = DEFAULT_ROBOFLOW_CONFIDENCE,
@@ -326,6 +369,7 @@ def run_stable_yolo_sam2_run(
         max_processed_frames=max_processed_frames,
         use_gpu=use_gpu,
         tracking_point_type=tracking_point_type,
+        trajectory_point_mode=trajectory_point_mode,
         save_debug=save_debug,
         debug_gpu=debug_gpu,
         roboflow_confidence=roboflow_confidence,
@@ -430,7 +474,7 @@ def _run_stable_sam2_tracking(
                     )
                 processed_idx = int(processed_frame_idx)
                 mask = _mask_for_object(object_ids, mask_logits, obj_id=1)
-                mask_area, mask_centroid, mask_bbox = mask_to_metrics(mask)
+                mask_area, mask_centroid, mask_bbox, mask_extreme_points = mask_to_metrics(mask)
                 original_frame_idx = extracted.processed_to_original[processed_idx]
                 timestamp_sec = extracted.processed_to_timestamp[processed_idx]
                 masks_by_processed_frame[processed_idx] = mask
@@ -442,6 +486,7 @@ def _run_stable_sam2_tracking(
                         mask_bbox=mask_bbox,
                         mask_centroid=mask_centroid,
                         mask_area=mask_area,
+                        mask_extreme_points=mask_extreme_points,
                     )
                 )
     finally:
@@ -945,6 +990,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         choices=[TRACKING_POINT_TYPE],
         default=TRACKING_POINT_TYPE,
     )
+    parser.add_argument(
+        "--trajectory_point_mode",
+        choices=list(TRAJECTORY_POINT_MODES),
+        default=DEFAULT_TRAJECTORY_POINT_MODE,
+        help="Point source used for cleaned trajectory output and debug trajectory line.",
+    )
     parser.add_argument("--save_debug", action="store_true", help="Save debug_first_frame.jpg.")
     parser.add_argument(
         "--roboflow_confidence",
@@ -970,6 +1021,7 @@ def main() -> None:
             max_processed_frames=frame_cap,
             use_gpu=args.use_gpu,
             tracking_point_type=args.tracking_point_type,
+            trajectory_point_mode=args.trajectory_point_mode,
             save_debug=args.save_debug,
             debug_gpu=args.debug_gpu,
             roboflow_confidence=args.roboflow_confidence,
@@ -986,6 +1038,7 @@ def main() -> None:
             max_processed_frames=frame_cap,
             use_gpu=args.use_gpu,
             tracking_point_type=args.tracking_point_type,
+            trajectory_point_mode=args.trajectory_point_mode,
             save_debug=args.save_debug,
             debug_gpu=args.debug_gpu,
             roboflow_confidence=args.roboflow_confidence,

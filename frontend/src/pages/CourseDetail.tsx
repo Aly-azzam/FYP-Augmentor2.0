@@ -25,12 +25,22 @@ type BackendChapterClip = {
 
 type BackendChapter = {
   id: string;
+  course_id: string;
   title: string;
   order: number;
   expert_video?: {
     url: string;
     file_path: string;
   } | null;
+};
+
+type BackendCourse = {
+  id: string;
+  title: string;
+};
+
+const backendCourseTitleByMockId: Record<string, string> = {
+  'cut-a-straight-line': 'Cut a straight line',
 };
 
 export default function CourseDetail() {
@@ -49,7 +59,10 @@ export default function CourseDetail() {
   const mockClips = useMemo(() => (courseId ? getClipsForCourse(courseId) : []), [courseId]);
 
   const clips = useMemo(() => {
-    if (courseId === 'pottery-wheel' && backendClips.length > 0) {
+    if (
+      (courseId === 'pottery-wheel' || courseId === 'cut-a-straight-line') &&
+      backendClips.length > 0
+    ) {
       return backendClips;
     }
     return mockClips;
@@ -73,13 +86,30 @@ export default function CourseDetail() {
     let cancelled = false;
 
     const loadBackendChapterClips = async () => {
-      if (courseId !== 'pottery-wheel') {
+      if (courseId !== 'pottery-wheel' && courseId !== 'cut-a-straight-line') {
         setBackendClips([]);
         return;
       }
 
       try {
-        const response = await fetch('/api/chapters');
+        let chaptersUrl = '/api/chapters';
+        const backendCourseTitle = courseId ? backendCourseTitleByMockId[courseId] : undefined;
+        if (backendCourseTitle) {
+          const coursesResponse = await fetch('/api/courses');
+          if (!coursesResponse.ok) {
+            throw new Error('Failed to load backend courses');
+          }
+
+          const backendCourses = (await coursesResponse.json()) as BackendCourse[];
+          const backendCourse = backendCourses.find(
+            (item) => item.title.toLowerCase() === backendCourseTitle.toLowerCase(),
+          );
+          if (backendCourse) {
+            chaptersUrl = `/api/chapters?course_id=${encodeURIComponent(backendCourse.id)}`;
+          }
+        }
+
+        const response = await fetch(chaptersUrl);
         if (!response.ok) {
           throw new Error('Failed to load chapters');
         }
@@ -88,11 +118,11 @@ export default function CourseDetail() {
         const chapterClips: BackendChapterClip[] = payload.map((chapter) => ({
           id: chapter.id,
           title: chapter.title,
-          duration: 10,
+          duration: courseId === 'cut-a-straight-line' ? 15 : 10,
           description: chapter.expert_video
             ? 'This chapter has a linked expert video from backend storage.'
             : 'No expert video linked yet. Upload one from Expert Upload.',
-          thumbnail: '/course-pottery.jpg',
+          thumbnail: course?.thumbnail ?? '/course-pottery.jpg',
           expertVideoUrl: chapter.expert_video?.url,
           keyPoints: chapter.expert_video
             ? ['Chapter is linked to a real expert video', 'Open Compare Studio to use this exact expert reference']
@@ -115,7 +145,7 @@ export default function CourseDetail() {
     return () => {
       cancelled = true;
     };
-  }, [courseId]);
+  }, [course?.thumbnail, courseId]);
 
   const handleClipClick = (clipId: string) => {
     if (!course) return;

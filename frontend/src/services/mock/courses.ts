@@ -79,6 +79,19 @@ export const courses: Course[] = [
     category: 'Ceramics',
     instructor: 'David Kim',
   },
+  {
+    id: 'cut-a-straight-line',
+    title: 'Cut a straight line',
+    description:
+      'Practice controlled straight-line cutting with scissors using an expert reference video.',
+    difficulty: 'beginner',
+    totalClips: 1,
+    estimatedTime: '10m',
+    progress: 0,
+    thumbnail: '/course-leather.jpg',
+    category: 'Scissor Skills',
+    instructor: 'AugMentor Team',
+  },
 ];
 
 const vaseMakingTechniques = [
@@ -179,9 +192,28 @@ const potteryWheelClips: VideoClip[] = [
   },
 ];
 
+const straightLineCuttingClips: VideoClip[] = [
+  {
+    id: '11111111-1111-4111-8111-111111111111',
+    title: 'Straight Line Cutting Expert Demo',
+    duration: 10,
+    description:
+      'Upload a straight-line cutting expert video for this chapter, then compare learner attempts in Compare Studio.',
+    thumbnail: '/course-leather.jpg',
+    keyPoints: [
+      'Upload the expert straight-line cutting video from Expert Upload',
+      'Use this chapter as the expert reference in Compare Studio',
+      'Compare learner videos against the uploaded straight cutting motion',
+    ],
+  },
+];
+
 export function getClipsForCourse(courseId: string): VideoClip[] {
   if (courseId === 'pottery-wheel') {
     return potteryWheelClips;
+  }
+  if (courseId === 'cut-a-straight-line') {
+    return straightLineCuttingClips;
   }
 
   let techniques: string[];

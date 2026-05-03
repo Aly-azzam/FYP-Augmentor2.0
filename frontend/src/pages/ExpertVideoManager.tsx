@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import { toast } from 'sonner';
-import { Upload, RefreshCw } from 'lucide-react';
+import { Plus, Upload, RefreshCw } from 'lucide-react';
 
 type ExpertVideo = {
   id: string;
@@ -27,6 +27,8 @@ export default function ExpertVideoManager() {
   const [error, setError] = useState<string | null>(null);
   const [selectedFiles, setSelectedFiles] = useState<Record<string, File | null>>({});
   const [uploadingChapterId, setUploadingChapterId] = useState<string | null>(null);
+  const [newChapterTitle, setNewChapterTitle] = useState('Cut a straight line');
+  const [creatingChapter, setCreatingChapter] = useState(false);
 
   const loadChapters = async () => {
     setLoading(true);
@@ -51,6 +53,49 @@ export default function ExpertVideoManager() {
 
   const handleFileChange = (chapterId: string, file: File | null) => {
     setSelectedFiles((prev) => ({ ...prev, [chapterId]: file }));
+  };
+
+  const handleCreateChapter = async () => {
+    const title = newChapterTitle.trim();
+    if (!title) {
+      toast.error('Please enter a chapter title.');
+      return;
+    }
+
+    setCreatingChapter(true);
+    try {
+      const response = await fetch('/api/chapters', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          title,
+          course_title: 'Cut a straight line',
+        }),
+      });
+
+      let payload: any = null;
+      try {
+        payload = await response.json();
+      } catch {
+        payload = null;
+      }
+
+      if (!response.ok) {
+        throw new Error(
+          payload?.detail || payload?.message || `Create failed with status ${response.status}`,
+        );
+      }
+
+      toast.success(`Chapter created. ID: ${payload.id}`);
+      setNewChapterTitle('');
+      await loadChapters();
+    } catch (createError) {
+      const message =
+        createError instanceof Error ? createError.message : 'Failed to create chapter.';
+      toast.error(message);
+    } finally {
+      setCreatingChapter(false);
+    }
   };
 
   const handleUpload = async (chapterId: string) => {
@@ -114,6 +159,39 @@ export default function ExpertVideoManager() {
         </Link>
       </div>
 
+      <div className="glass" style={{ padding: 'var(--space-lg)', marginBottom: 'var(--space-lg)' }}>
+        <h2 className="heading-4" style={{ marginBottom: 'var(--space-xs)' }}>
+          Create a new expert chapter
+        </h2>
+        <p className="text-small" style={{ color: 'var(--text-secondary)', marginBottom: 'var(--space-md)' }}>
+          Create a database chapter, then upload a video below to make it the expert reference.
+        </p>
+        <div style={{ display: 'flex', gap: 'var(--space-sm)', alignItems: 'center', flexWrap: 'wrap' }}>
+          <input
+            type="text"
+            value={newChapterTitle}
+            onChange={(event) => setNewChapterTitle(event.target.value)}
+            placeholder="Chapter title, e.g. Cut a straight line"
+            style={{
+              minWidth: 280,
+              padding: '0.65rem 0.75rem',
+              borderRadius: 'var(--radius-md)',
+              border: '1px solid var(--border-primary)',
+              background: 'var(--bg-secondary)',
+              color: 'var(--text-primary)',
+            }}
+          />
+          <button
+            className="btn btn-primary"
+            onClick={() => void handleCreateChapter()}
+            disabled={creatingChapter}
+          >
+            <Plus size={14} />
+            {creatingChapter ? 'Creating...' : 'Create Chapter'}
+          </button>
+        </div>
+      </div>
+
       {loading ? (
         <div className="glass" style={{ padding: 'var(--space-xl)' }}>
           Loading chapters...
@@ -143,6 +221,9 @@ export default function ExpertVideoManager() {
                     </h3>
                     <p className="text-small" style={{ color: 'var(--text-secondary)' }}>
                       Chapter order: {chapter.order}
+                    </p>
+                    <p className="text-small" style={{ color: 'var(--text-muted)' }}>
+                      Chapter ID: {chapter.id}
                     </p>
                   </div>
                   <span className={chapter.expert_video ? 'badge badge-blue' : 'badge'}>

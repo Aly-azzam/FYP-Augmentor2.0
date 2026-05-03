@@ -4,14 +4,16 @@ from pathlib import Path
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.core.config import settings
 from app.core.database import get_db
 from app.models.chapter import Chapter
+from app.models.course import Course
 from app.models.video import Video
 from app.schemas.course_schema import (
+    ChapterCreateRequest,
     ChapterDetail,
     ExpertVideoAssetOut,
     ExpertVideoOut,
@@ -27,6 +29,35 @@ from app.services.upload_service import UploadValidationError, save_upload_file,
 
 router = APIRouter(prefix="/api/chapters", tags=["Chapters"])
 
+DEFAULT_EXPERT_UPLOAD_COURSE_TITLE = "Cut a straight line"
+
+
+def _chapter_detail(chapter: Chapter) -> ChapterDetail:
+    expert_video = None
+    if chapter.expert_video is not None:
+        try:
+            storage_key = normalize_storage_key(chapter.expert_video.file_path)
+        except ValueError:
+            storage_key = None
+
+        if storage_key is not None:
+            expert_video = ExpertVideoOut(
+                id=chapter.expert_video.id,
+                chapter_id=chapter.expert_video.chapter_id,
+                file_path=storage_key,
+                url=build_storage_url(storage_key),
+                duration_seconds=chapter.expert_video.duration_seconds,
+                fps=chapter.expert_video.fps,
+            )
+
+    return ChapterDetail(
+        id=chapter.id,
+        course_id=chapter.course_id,
+        title=chapter.title,
+        order=chapter.chapter_order,
+        expert_video=expert_video,
+    )
+
 
 @router.get("", response_model=list[ChapterDetail])
 def list_chapters(course_id: UUID | None = None, db: Session = Depends(get_db)):
@@ -36,36 +67,55 @@ def list_chapters(course_id: UUID | None = None, db: Session = Depends(get_db)):
         query = query.where(Chapter.course_id == course_id)
 
     chapters = db.execute(query).scalars().all()
-    response: list[ChapterDetail] = []
-    for chapter in chapters:
-        expert_video = None
-        if chapter.expert_video is not None:
-            try:
-                storage_key = normalize_storage_key(chapter.expert_video.file_path)
-            except ValueError:
-                storage_key = None
+    return [_chapter_detail(chapter) for chapter in chapters]
 
-            if storage_key is not None:
-                expert_video = ExpertVideoOut(
-                    id=chapter.expert_video.id,
-                    chapter_id=chapter.expert_video.chapter_id,
-                    file_path=storage_key,
-                    url=build_storage_url(storage_key),
-                    duration_seconds=chapter.expert_video.duration_seconds,
-                    fps=chapter.expert_video.fps,
-                )
 
-        response.append(
-            ChapterDetail(
-                id=chapter.id,
-                course_id=chapter.course_id,
-                title=chapter.title,
-                order=chapter.chapter_order,
-                expert_video=expert_video,
-            )
+@router.post("", response_model=ChapterDetail, status_code=status.HTTP_201_CREATED)
+def create_chapter(payload: ChapterCreateRequest, db: Session = Depends(get_db)):
+    """Create a chapter so an expert video can be uploaded for it."""
+    title = payload.title.strip()
+    if not title:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Chapter title is required.",
         )
 
-    return response
+    if payload.course_id is not None:
+        course = db.execute(
+            select(Course).where(Course.id == str(payload.course_id))
+        ).scalar_one_or_none()
+        if course is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Course not found.")
+    else:
+        course_title = (payload.course_title or DEFAULT_EXPERT_UPLOAD_COURSE_TITLE).strip()
+        course = db.execute(
+            select(Course).where(Course.title == course_title)
+        ).scalar_one_or_none()
+        if course is None:
+            course = Course(
+                title=course_title,
+                description="Expert upload course for cutting practice.",
+            )
+            db.add(course)
+            db.flush()
+
+    chapter_order = payload.order
+    if chapter_order is None:
+        max_order = db.execute(
+            select(func.max(Chapter.chapter_order)).where(Chapter.course_id == course.id)
+        ).scalar_one_or_none()
+        chapter_order = int(max_order or 0) + 1
+
+    chapter = Chapter(
+        course_id=course.id,
+        title=title,
+        description=payload.description,
+        chapter_order=chapter_order,
+    )
+    db.add(chapter)
+    db.commit()
+    db.refresh(chapter)
+    return _chapter_detail(chapter)
 
 
 @router.get("/default/expert-video", response_model=ExpertVideoAssetOut)

@@ -42,6 +42,14 @@ class ExpertVideoUploadResponse(BaseModel):
     url: str
 
 
+class ChapterCreateRequest(BaseModel):
+    title: str
+    course_id: Optional[UUID] = None
+    course_title: Optional[str] = None
+    order: Optional[int] = None
+    description: Optional[str] = None
+
+
 class ChapterDetail(BaseModel):
     id: UUID
     course_id: UUID

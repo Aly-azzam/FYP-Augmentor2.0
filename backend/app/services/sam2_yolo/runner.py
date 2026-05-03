@@ -11,6 +11,7 @@ from typing import Any
 
 from app.services.sam2_yolo.region_metrics import compute_region_metrics
 from app.services.sam2_yolo.schemas import (
+    DEFAULT_TRAJECTORY_POINT_MODE,
     METRICS_FILENAME,
     MODEL_NAME,
     OVERLAY_FILENAME,
@@ -19,6 +20,7 @@ from app.services.sam2_yolo.schemas import (
     SUMMARY_FILENAME,
     TRACKING_POINT_TYPE,
     TRACKING_QUALITY_NOTE,
+    TRAJECTORY_POINT_MODES,
     regions_from_frames,
     trajectory_from_frames,
 )
@@ -43,6 +45,7 @@ def run_sam2_yolo_scissors_tracking(
     output_root: str | Path = DEFAULT_OUTPUT_ROOT,
     frame_stride: int = DEFAULT_FRAME_STRIDE,
     tracking_point_type: str = TRACKING_POINT_TYPE,
+    trajectory_point_mode: str = DEFAULT_TRAJECTORY_POINT_MODE,
     use_gpu: bool = True,
     save_debug: bool = False,
     run_id: str | None = None,
@@ -55,6 +58,8 @@ def run_sam2_yolo_scissors_tracking(
     video = Path(video_path).expanduser().resolve()
     if not video.is_file():
         raise FileNotFoundError(f"video_path does not exist: {video}")
+    if trajectory_point_mode not in TRAJECTORY_POINT_MODES:
+        raise ValueError(f"trajectory_point_mode must be one of {TRAJECTORY_POINT_MODES}")
 
     resolved_run_id = run_id or str(uuid.uuid4())
     run_dir = Path(output_root).expanduser().resolve() / resolved_run_id
@@ -73,6 +78,7 @@ def run_sam2_yolo_scissors_tracking(
             max_processed_frames=frame_cap,
             use_gpu=use_gpu,
             tracking_point_type=tracking_point_type,
+            trajectory_point_mode=trajectory_point_mode,
             save_debug=save_debug,
             roboflow_confidence=roboflow_confidence,
             sam2_checkpoint=sam2_checkpoint,
@@ -94,6 +100,8 @@ def run_sam2_yolo_scissors_tracking(
         str(frame_stride),
         "--tracking_point_type",
         tracking_point_type,
+        "--trajectory_point_mode",
+        trajectory_point_mode,
         "--roboflow_confidence",
         str(roboflow_confidence),
     ]

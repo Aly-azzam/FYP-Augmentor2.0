@@ -1,11 +1,11 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.core.database import engine, get_db
+from app.core.database import SessionLocal, engine, get_db
 from app.db.base import Base
 from app.api.routes import courses, chapters, uploads, evaluations, history, progress
 from app.api.routes import expert_mediapipe, expert_sam2, inspection, optical_flow
@@ -20,6 +20,12 @@ from app.models.video import Video
 from app.models.attempt import Attempt
 from app.models.evaluation import Evaluation
 from app.models.evaluation_feedback import EvaluationFeedback
+
+
+STRAIGHT_LINE_COURSE_ID = "11111111-1111-4111-8111-000000000001"
+STRAIGHT_LINE_CHAPTER_ID = "11111111-1111-4111-8111-111111111111"
+STRAIGHT_LINE_COURSE_TITLE = "Cut a straight line"
+STRAIGHT_LINE_CHAPTER_TITLE = "Straight Line Cutting Expert Demo"
 
 
 
@@ -58,6 +64,52 @@ app.mount("/storage", StaticFiles(directory=settings.STORAGE_ROOT), name="storag
 def ensure_database_tables() -> None:
     """Create core tables if the database is empty or freshly created."""
     Base.metadata.create_all(bind=engine)
+    ensure_straight_line_course()
+
+
+def ensure_straight_line_course() -> None:
+    """Ensure the uploadable straight-line cutting chapter exists."""
+    session = SessionLocal()
+    try:
+        course = session.execute(
+            select(Course).where(Course.id == STRAIGHT_LINE_COURSE_ID)
+        ).scalar_one_or_none()
+        if course is None:
+            course = Course(
+                id=STRAIGHT_LINE_COURSE_ID,
+                title=STRAIGHT_LINE_COURSE_TITLE,
+                description="Practice controlled straight-line cutting with scissors.",
+            )
+            session.add(course)
+            session.flush()
+        else:
+            course.title = STRAIGHT_LINE_COURSE_TITLE
+            course.description = "Practice controlled straight-line cutting with scissors."
+
+        chapter = session.execute(
+            select(Chapter).where(Chapter.id == STRAIGHT_LINE_CHAPTER_ID)
+        ).scalar_one_or_none()
+        if chapter is None:
+            chapter = Chapter(
+                id=STRAIGHT_LINE_CHAPTER_ID,
+                course_id=STRAIGHT_LINE_COURSE_ID,
+                title=STRAIGHT_LINE_CHAPTER_TITLE,
+                description="Upload the expert straight-line cutting video for comparison.",
+                chapter_order=1,
+            )
+            session.add(chapter)
+        else:
+            chapter.course_id = STRAIGHT_LINE_COURSE_ID
+            chapter.title = STRAIGHT_LINE_CHAPTER_TITLE
+            chapter.description = "Upload the expert straight-line cutting video for comparison."
+            chapter.chapter_order = 1
+
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
 
 
 @app.get("/health", tags=["Health"])

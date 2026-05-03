@@ -108,7 +108,7 @@ def run_sam2_video_tracking(
         ):
             processed_idx = int(processed_frame_idx)
             mask = _mask_for_object(object_ids, mask_logits, obj_id=1)
-            mask_area, mask_centroid, mask_bbox = mask_to_metrics(mask)
+            mask_area, mask_centroid, mask_bbox, mask_extreme_points = mask_to_metrics(mask)
             original_frame_idx = extracted.processed_to_original[processed_idx]
             timestamp_sec = extracted.processed_to_timestamp[processed_idx]
             masks_by_processed_frame[processed_idx] = mask
@@ -121,6 +121,7 @@ def run_sam2_video_tracking(
                     mask_bbox=mask_bbox,
                     mask_centroid=mask_centroid,
                     mask_area=mask_area,
+                    mask_extreme_points=mask_extreme_points,
                 )
             )
 

@@ -18,6 +18,7 @@ from app.models.video import Video
 from app.services.media_service import build_storage_url, normalize_storage_key
 from app.services.sam2_yolo.runner import DEFAULT_FRAME_STRIDE, run_sam2_yolo_scissors_tracking
 from app.services.sam2_yolo.schemas import (
+    DEFAULT_TRAJECTORY_POINT_MODE,
     METRICS_FILENAME,
     MODEL_NAME,
     OVERLAY_FILENAME,
@@ -45,6 +46,7 @@ class SAM2YoloLearnerRunRequest(BaseModel):
     stride: int = Field(default=DEFAULT_FRAME_STRIDE, ge=1)
     max_processed_frames: int | None = Field(default=None, ge=0)
     tracking_point_type: str = TRACKING_POINT_TYPE
+    trajectory_point_mode: str = DEFAULT_TRAJECTORY_POINT_MODE
     save_debug: bool = False
 
 
@@ -62,6 +64,7 @@ async def run_learner_sam2_yolo(
             output_root=SAM2_YOLO_RUNS_ROOT,
             frame_stride=body.stride or DEFAULT_FRAME_STRIDE,
             tracking_point_type=body.tracking_point_type,
+            trajectory_point_mode=body.trajectory_point_mode,
             use_gpu=True,
             save_debug=body.save_debug,
             max_processed_frames=body.max_processed_frames,
@@ -167,6 +170,9 @@ async def _parse_run_learner_request(request: Request) -> tuple[SAM2YoloLearnerR
             None,
         ),
         tracking_point_type=_optional_form_string(form.get("tracking_point_type")) or TRACKING_POINT_TYPE,
+        trajectory_point_mode=(
+            _optional_form_string(form.get("trajectory_point_mode")) or DEFAULT_TRAJECTORY_POINT_MODE
+        ),
         save_debug=_optional_form_bool(form.get("save_debug"), False),
     )
     return body, Path(settings.STORAGE_ROOT) / relative_path

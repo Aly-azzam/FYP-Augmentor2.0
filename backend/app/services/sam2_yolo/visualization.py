@@ -16,6 +16,7 @@ def write_sam2_yolo_overlay_video(
     output_path: Path,
     fps: float,
     trajectory_metrics: dict[str, Any],
+    trajectory_point_mode: str = "chosen_tracking_point",
 ) -> None:
     first_frame = cv2.imread(str(frame_dir / "000000.jpg"))
     if first_frame is None:
@@ -52,16 +53,24 @@ def write_sam2_yolo_overlay_video(
             _draw_mask_bbox(frame, frame_payload.get("mask_bbox"))
             _draw_region(frame, frame_payload.get("region"))
 
-            point = frame_payload.get("chosen_tracking_point")
+            _draw_named_point(frame, frame_payload.get("bbox_center"), (0, 255, 0), "bbox_center")
+            _draw_named_point(
+                frame,
+                frame_payload.get("blade_tip_candidate"),
+                (255, 255, 0),
+                "blade_tip",
+            )
+
+            point = _selected_overlay_point(frame_payload, trajectory_point_mode)
             if point is not None:
                 point_tuple = (int(round(point[0])), int(round(point[1])))
                 drawn_points.append(point_tuple)
-                _draw_trajectory(frame, drawn_points, fitted_line)
+                _draw_trajectory(frame, drawn_points, fitted_line, label=trajectory_point_mode)
                 _draw_deviation(frame, point_tuple, fitted_line)
 
             cv2.putText(
                 frame,
-                f"SAM2+YOLO frame={frame_payload['frame_index']} point=bbox_center",
+                f"SAM2+YOLO frame={frame_payload['frame_index']} point={trajectory_point_mode}",
                 (12, 28),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.7,
@@ -152,24 +161,26 @@ def _draw_trajectory(
     frame: np.ndarray,
     points: list[tuple[int, int]],
     fitted_line: dict[str, Any] | None,
+    *,
+    label: str,
 ) -> None:
     if len(points) >= 2:
         cv2.polylines(
             frame,
             [np.array(points, dtype=np.int32)],
             isClosed=False,
-            color=(255, 0, 255),
+            color=(0, 255, 255),
             thickness=2,
         )
 
     for point in points[-30:]:
-        cv2.circle(frame, point, 4, (255, 0, 255), -1)
+        cv2.circle(frame, point, 4, (0, 255, 255), -1)
 
     current = points[-1]
     cv2.circle(frame, current, 7, (0, 255, 255), -1)
     cv2.putText(
         frame,
-        "tracking point",
+        label,
         (current[0] + 8, max(24, current[1] - 8)),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.5,
@@ -192,6 +203,38 @@ def _draw_trajectory(
             2,
             cv2.LINE_AA,
         )
+
+
+def _selected_overlay_point(frame_payload: dict[str, Any], trajectory_point_mode: str) -> list[float] | None:
+    if not frame_payload.get("tracking_valid"):
+        return None
+    if trajectory_point_mode == "blade_tip_candidate":
+        return frame_payload.get("blade_tip_candidate")
+    if trajectory_point_mode == "bbox_center":
+        return frame_payload.get("bbox_center")
+    return frame_payload.get("chosen_tracking_point") or frame_payload.get("bbox_center")
+
+
+def _draw_named_point(
+    frame: np.ndarray,
+    point: Any,
+    color: tuple[int, int, int],
+    label: str,
+) -> None:
+    if not isinstance(point, list | tuple) or len(point) != 2 or point[0] is None or point[1] is None:
+        return
+    center = (int(round(float(point[0]))), int(round(float(point[1]))))
+    cv2.circle(frame, center, 6, color, -1)
+    cv2.putText(
+        frame,
+        label,
+        (center[0] + 8, max(20, center[1] - 8)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.45,
+        color,
+        1,
+        cv2.LINE_AA,
+    )
 
 
 def _draw_deviation(
