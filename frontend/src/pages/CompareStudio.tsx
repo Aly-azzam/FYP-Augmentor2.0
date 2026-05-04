@@ -47,10 +47,10 @@ import {
   useUIStore,
   useTimerStore,
 } from '../store';
-import { courses, getClipsForCourse } from '../services/mock/courses';
+import { fetchClipsForCourse, fetchCourse } from '../services/api/courses';
 import { getEvaluationResult, startEvaluation as startEvaluationApi } from '../api/evaluationApi';
 import { formatTime } from '../utils/helpers';
-import type { DrawingTool } from '../types';
+import type { DrawingTool, VideoClip } from '../types';
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -466,6 +466,7 @@ export default function CompareStudio() {
   const [isOpticalFlowProcessing, setIsOpticalFlowProcessing] = useState(false);
   const [opticalFlowError, setOpticalFlowError] = useState<string | null>(null);
   const [opticalFlowVideoVersion, setOpticalFlowVideoVersion] = useState(0);
+  const [clips, setClips] = useState<VideoClip[]>([]);
 
   // ── Refs ──────────────────────────────────────────────────────────────────
 
@@ -482,8 +483,6 @@ export default function CompareStudio() {
 
   const requestedCourseId = searchParams.get('courseId');
   const requestedClipId = searchParams.get('clipId');
-  const course = courses.find((c) => c.id === selectedCourse);
-  const clips = selectedCourse ? getClipsForCourse(selectedCourse) : [];
   const clip = clips.find((c) => c.id === selectedClip);
   const hasSelectedExpertReference = Boolean(selectedClip || requestedClipId);
 
@@ -505,6 +504,35 @@ export default function CompareStudio() {
     setSelectedCourse,
     setSelectedClip,
   ]);
+
+  useEffect(() => {
+    let isCancelled = false;
+
+    const loadSelectedCourse = async () => {
+      if (!selectedCourse) {
+        setClips([]);
+        return;
+      }
+
+      try {
+        const backendCourse = await fetchCourse(selectedCourse);
+        const backendClips = await fetchClipsForCourse(selectedCourse, backendCourse.thumbnail);
+        if (!isCancelled) {
+          setClips(backendClips);
+        }
+      } catch {
+        if (!isCancelled) {
+          setClips([]);
+        }
+      }
+    };
+
+    void loadSelectedCourse();
+
+    return () => {
+      isCancelled = true;
+    };
+  }, [selectedCourse]);
 
   useEffect(() => {
     setRobotMessage(
@@ -530,7 +558,7 @@ export default function CompareStudio() {
 
     const loadSelectedExpertVideo = async () => {
       try {
-        // 1) If selectedClip is a real chapter UUID, resolve chapter expert video first.
+        // 1) If selectedClip is a real backend chapter id, resolve chapter expert video first.
         // This ensures Compare Studio uses the latest backend expert reference,
         // not a stale static mock path.
         if (selectedClip) {
@@ -566,7 +594,7 @@ export default function CompareStudio() {
           return;
         }
 
-        // 3) Last-resort fallback for legacy mock clips.
+        // 3) Fallback to the expert URL already included in the backend chapter clip.
         if (clip?.expertVideoUrl) {
           if (!isCancelled) {
             setExpertVideoError(null);
@@ -579,13 +607,13 @@ export default function CompareStudio() {
         if (!isCancelled) {
           setExpertVideoUrl(null);
           setSelectedExpertVideoId(null);
-          setExpertVideoError('No expert video is linked yet. Upload one from Expert Upload.');
+          setExpertVideoError('No expert video is linked yet for the selected chapter.');
         }
       } catch {
         if (!isCancelled) {
           setExpertVideoUrl(null);
           setSelectedExpertVideoId(null);
-          setExpertVideoError('No expert video is linked yet. Upload one from Expert Upload.');
+          setExpertVideoError('No expert video is linked yet for the selected chapter.');
         }
       }
     };

@@ -50,6 +50,11 @@ class ChapterCreateRequest(BaseModel):
     description: Optional[str] = None
 
 
+class CourseCreateRequest(BaseModel):
+    title: str
+    description: Optional[str] = None
+
+
 class ChapterDetail(BaseModel):
     id: UUID
     course_id: UUID
@@ -66,6 +71,7 @@ class CourseOut(BaseModel):
     description: Optional[str] = None
     created_at: datetime
     updated_at: datetime
+    thumbnail_url: Optional[str] = None
 
     model_config = {"from_attributes": True}
 

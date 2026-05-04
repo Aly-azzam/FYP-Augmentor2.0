@@ -1,24 +1,15 @@
-import { useEffect, useMemo, useState } from 'react';
-import { Link } from 'react-router-dom';
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { Link, useNavigate } from 'react-router-dom';
 import { motion } from 'framer-motion';
-import { Search, SlidersHorizontal, BookOpen, PlayCircle } from 'lucide-react';
-import { courses } from '@/services/mock/courses';
-import type { Course } from '@/types';
+import { Search, BookOpen, ImagePlus } from 'lucide-react';
 
-type Difficulty = 'all' | Course['difficulty'];
-type SortKey = 'title' | 'difficulty' | 'progress';
-
-const difficulties: { value: Difficulty; label: string }[] = [
-  { value: 'all', label: 'All' },
-  { value: 'beginner', label: 'Beginner' },
-  { value: 'intermediate', label: 'Intermediate' },
-  { value: 'advanced', label: 'Advanced' },
-];
-
-const difficultyOrder: Record<Course['difficulty'], number> = {
-  beginner: 0,
-  intermediate: 1,
-  advanced: 2,
+type BackendCourse = {
+  id: string;
+  title: string;
+  description?: string | null;
+  created_at: string;
+  updated_at: string;
+  thumbnail_url?: string | null;
 };
 
 const cardVariants = {
@@ -31,41 +22,142 @@ const cardVariants = {
 };
 
 export default function Courses() {
+  const navigate = useNavigate();
   const [query, setQuery] = useState('');
-  const [difficulty, setDifficulty] = useState<Difficulty>('all');
-  const [sort, setSort] = useState<SortKey>('title');
-  const [expertVideoUrl, setExpertVideoUrl] = useState<string | null>(null);
-  const [expertVideoError, setExpertVideoError] = useState<string | null>(null);
+  const [courses, setCourses] = useState<BackendCourse[]>([]);
+  const [coursesLoading, setCoursesLoading] = useState(true);
+  const [coursesError, setCoursesError] = useState<string | null>(null);
+  const [newCourseTitle, setNewCourseTitle] = useState('');
+  const [newCourseDescription, setNewCourseDescription] = useState('');
+  const [creatingCourse, setCreatingCourse] = useState(false);
+  const [deletingCourseId, setDeletingCourseId] = useState<string | null>(null);
+  const [uploadingCourseImageId, setUploadingCourseImageId] = useState<string | null>(null);
+
+  const loadCourses = useCallback(async () => {
+    setCoursesLoading(true);
+    setCoursesError(null);
+    try {
+      const response = await fetch('/api/courses');
+      if (!response.ok) {
+        throw new Error('Failed to load courses');
+      }
+
+      const payload = (await response.json()) as BackendCourse[];
+      setCourses(payload);
+    } catch {
+      setCourses([]);
+      setCoursesError('Could not load courses. Make sure the backend is running.');
+    } finally {
+      setCoursesLoading(false);
+    }
+  }, []);
 
   useEffect(() => {
-    let cancelled = false;
+    void loadCourses();
+  }, [loadCourses]);
 
-    const loadExpertVideo = async () => {
-      try {
-        const response = await fetch('/api/chapters/default/expert-video');
-        if (!response.ok) {
-          throw new Error('Failed to load default expert video');
-        }
+  const handleCreateCourse = async () => {
+    const title = newCourseTitle.trim();
+    if (!title) {
+      setCoursesError('Course title is required.');
+      return;
+    }
 
-        const payload: { url: string } = await response.json();
-        if (!cancelled) {
-          setExpertVideoError(null);
-          setExpertVideoUrl(payload.url);
+    setCreatingCourse(true);
+    setCoursesError(null);
+    try {
+      const response = await fetch('/api/courses', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          title,
+          description: newCourseDescription.trim() || null,
+        }),
+      });
+      if (!response.ok) {
+        let message = 'Failed to create course.';
+        try {
+          const payload = (await response.json()) as { detail?: string };
+          message = payload.detail || message;
+        } catch {
+          // Keep generic message if response is not JSON.
         }
-      } catch {
-        if (!cancelled) {
-          setExpertVideoUrl(null);
-          setExpertVideoError('Expert video is unavailable. Start the AugMentor 2.0 backend on port 8001 and seed an expert video.');
-        }
+        throw new Error(message);
       }
-    };
 
-    void loadExpertVideo();
+      setNewCourseTitle('');
+      setNewCourseDescription('');
+      await loadCourses();
+    } catch (error) {
+      setCoursesError(error instanceof Error ? error.message : 'Failed to create course.');
+    } finally {
+      setCreatingCourse(false);
+    }
+  };
 
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+  const handleDeleteCourse = async (course: BackendCourse) => {
+    const confirmed = window.confirm(`Delete course "${course.title}"?`);
+    if (!confirmed) {
+      return;
+    }
+
+    setDeletingCourseId(course.id);
+    setCoursesError(null);
+    try {
+      const response = await fetch(`/api/courses/${encodeURIComponent(course.id)}`, {
+        method: 'DELETE',
+      });
+      if (!response.ok) {
+        let message = 'Failed to delete course.';
+        try {
+          const payload = (await response.json()) as { detail?: string };
+          message = payload.detail || message;
+        } catch {
+          // Keep generic message if response is not JSON.
+        }
+        throw new Error(message);
+      }
+
+      await loadCourses();
+    } catch (error) {
+      setCoursesError(error instanceof Error ? error.message : 'Failed to delete course.');
+    } finally {
+      setDeletingCourseId(null);
+    }
+  };
+
+  const handleCourseImageUpload = async (course: BackendCourse, file: File | null) => {
+    if (!file) return;
+
+    setUploadingCourseImageId(course.id);
+    setCoursesError(null);
+    try {
+      const formData = new FormData();
+      formData.append('file', file);
+      const response = await fetch(`/api/courses/${encodeURIComponent(course.id)}/thumbnail`, {
+        method: 'POST',
+        body: formData,
+      });
+      if (!response.ok) {
+        let message = response.status === 404
+          ? 'Course image upload endpoint was not found. Restart the backend server and try again.'
+          : 'Failed to upload course image.';
+        try {
+          const payload = (await response.json()) as { detail?: string };
+          message = response.status === 404 ? message : payload.detail || message;
+        } catch {
+          // Keep generic message if response is not JSON.
+        }
+        throw new Error(message);
+      }
+
+      await loadCourses();
+    } catch (error) {
+      setCoursesError(error instanceof Error ? error.message : 'Failed to upload course image.');
+    } finally {
+      setUploadingCourseImageId(null);
+    }
+  };
 
   const filtered = useMemo(() => {
     let result = [...courses];
@@ -75,24 +167,14 @@ export default function Courses() {
       result = result.filter(
         (c) =>
           c.title.toLowerCase().includes(q) ||
-          c.description.toLowerCase().includes(q) ||
-          c.instructor.toLowerCase().includes(q) ||
-          c.category.toLowerCase().includes(q),
+          (c.description ?? '').toLowerCase().includes(q),
       );
     }
 
-    if (difficulty !== 'all') {
-      result = result.filter((c) => c.difficulty === difficulty);
-    }
-
-    result.sort((a, b) => {
-      if (sort === 'title') return a.title.localeCompare(b.title);
-      if (sort === 'difficulty') return difficultyOrder[a.difficulty] - difficultyOrder[b.difficulty];
-      return b.progress - a.progress;
-    });
+    result.sort((a, b) => a.title.localeCompare(b.title));
 
     return result;
-  }, [query, difficulty, sort]);
+  }, [courses, query]);
 
   return (
     <div className="container" style={{ paddingBottom: 'var(--space-3xl)' }}>
@@ -102,86 +184,45 @@ export default function Courses() {
         <p className="page-subtitle">Browse our collection of expert-led craft courses</p>
       </div>
 
-      {/* ── Expert Demo Preview ─────────────────────────────────────────── */}
-      <motion.div
+      {/* ── Create Course ───────────────────────────────────────────────── */}
+      <div
         className="glass"
-        initial={{ opacity: 0, y: 20 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={{ duration: 0.4 }}
         style={{
-          display: 'grid',
-          gridTemplateColumns: 'minmax(0, 1.1fr) minmax(280px, 0.9fr)',
-          gap: 'var(--space-xl)',
-          padding: 'var(--space-xl)',
+          padding: 'var(--space-lg)',
           borderRadius: 'var(--radius-xl)',
           marginBottom: 'var(--space-xl)',
         }}
       >
-        <div>
-          <div
-            className="badge badge-blue"
-            style={{ display: 'inline-flex', marginBottom: 'var(--space-sm)' }}
-          >
-            Featured Expert Demo
-          </div>
-          <h2 className="heading-3" style={{ marginBottom: 'var(--space-sm)' }}>
-            Watch an expert technique before choosing your course
-          </h2>
-          <p
-            className="text-body"
-            style={{ color: 'var(--text-secondary)', marginBottom: 'var(--space-lg)' }}
-          >
-            This preview uses the current expert video stored in the backend so learners can
-            immediately see the kind of guided practice they will compare against later.
-          </p>
-          <div style={{ display: 'flex', gap: 'var(--space-sm)', flexWrap: 'wrap' }}>
-            <Link to="/courses/pottery-wheel" className="btn btn-primary">
-              <PlayCircle size={16} />
-              Explore Pottery Course
-            </Link>
-            <Link to="/compare" className="btn btn-secondary">
-              Open Compare Studio
-            </Link>
-            <Link to="/expert-videos" className="btn btn-ghost">
-              Manage Expert Videos
-            </Link>
-          </div>
-        </div>
-
-        <div
-          className="video-container"
-          style={{
-            aspectRatio: '16/9',
-            background: 'var(--bg-tertiary)',
-            borderRadius: 'var(--radius-lg)',
-            overflow: 'hidden',
-          }}
-        >
-          {expertVideoUrl ? (
-            <video
-              key={expertVideoUrl}
-              src={expertVideoUrl}
-              controls
-              preload="metadata"
-              playsInline
-              style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }}
-            />
-          ) : (
-            <div
-              className="flex-center"
-              style={{
-                width: '100%',
-                height: '100%',
-                color: 'var(--text-muted)',
-                padding: 'var(--space-lg)',
-                textAlign: 'center',
-              }}
+        <h2 className="heading-4" style={{ marginBottom: 'var(--space-sm)' }}>
+          Create Course
+        </h2>
+        <div style={{ display: 'grid', gap: 'var(--space-sm)' }}>
+          <input
+            className="input"
+            value={newCourseTitle}
+            onChange={(event) => setNewCourseTitle(event.target.value)}
+            placeholder="Course title"
+          />
+          <textarea
+            className="input"
+            value={newCourseDescription}
+            onChange={(event) => setNewCourseDescription(event.target.value)}
+            placeholder="Course description"
+            rows={3}
+            style={{ resize: 'vertical' }}
+          />
+          <div>
+            <button
+              type="button"
+              className="btn btn-primary"
+              onClick={() => void handleCreateCourse()}
+              disabled={creatingCourse}
             >
-              {expertVideoError ?? 'Expert video preview is loading...'}
-            </div>
-          )}
+              {creatingCourse ? 'Creating...' : 'Create Course'}
+            </button>
+          </div>
         </div>
-      </motion.div>
+      </div>
 
       {/* ── Search & Filters ────────────────────────────────────────────── */}
       <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-md)', marginBottom: 'var(--space-xl)' }}>
@@ -200,41 +241,11 @@ export default function Courses() {
           />
           <input
             className="input"
-            placeholder="Search courses, instructors, categories..."
+            placeholder="Search courses..."
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             style={{ paddingLeft: '2.5rem' }}
           />
-        </div>
-
-        {/* Filter row */}
-        <div className="flex-between" style={{ flexWrap: 'wrap', gap: 'var(--space-sm)' }}>
-          <div style={{ display: 'flex', gap: 'var(--space-xs)' }}>
-            {difficulties.map((d) => (
-              <button
-                key={d.value}
-                className={`btn ${difficulty === d.value ? 'btn-primary' : 'btn-ghost'}`}
-                onClick={() => setDifficulty(d.value)}
-                style={{ fontSize: '0.8125rem', padding: '0.375rem 0.875rem', borderRadius: '9999px' }}
-              >
-                {d.label}
-              </button>
-            ))}
-          </div>
-
-          <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)' }}>
-            <SlidersHorizontal size={14} style={{ color: 'var(--text-muted)' }} />
-            <select
-              className="input"
-              value={sort}
-              onChange={(e) => setSort(e.target.value as SortKey)}
-              style={{ width: 'auto', minWidth: 140, cursor: 'pointer' }}
-            >
-              <option value="title">Sort by Title</option>
-              <option value="difficulty">Sort by Difficulty</option>
-              <option value="progress">Sort by Progress</option>
-            </select>
-          </div>
         </div>
       </div>
 
@@ -249,51 +260,44 @@ export default function Courses() {
               initial="hidden"
               animate="visible"
             >
-              <Link
-                to={`/courses/${course.id}`}
+              <div
                 className="card card-hover"
+                role="button"
+                tabIndex={0}
+                onClick={() => navigate(`/courses/${course.id}`)}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter' || event.key === ' ') {
+                    event.preventDefault();
+                    navigate(`/courses/${course.id}`);
+                  }
+                }}
                 style={{
                   display: 'flex',
                   flexDirection: 'column',
                   overflow: 'hidden',
-                  textDecoration: 'none',
                   color: 'inherit',
                   height: '100%',
+                  cursor: 'pointer',
                 }}
               >
-                {/* Thumbnail */}
-                <div style={{ position: 'relative', aspectRatio: '16/9', background: 'var(--bg-tertiary)', overflow: 'hidden' }}>
-                  {course.id === 'pottery-wheel' && expertVideoUrl ? (
-                    <video
-                      src={expertVideoUrl}
-                      muted
-                      playsInline
-                      preload="metadata"
+                {/* Header */}
+                <div
+                  className="flex-center"
+                  style={{
+                    aspectRatio: '16/9',
+                    background: 'var(--bg-tertiary)',
+                    color: 'var(--text-muted)',
+                    overflow: 'hidden',
+                  }}
+                >
+                  {course.thumbnail_url ? (
+                    <img
+                      src={course.thumbnail_url}
+                      alt=""
                       style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }}
                     />
                   ) : (
-                    <img
-                      src={course.thumbnail}
-                      alt={course.title}
-                      style={{ width: '100%', height: '100%', objectFit: 'cover' }}
-                      onError={(e) => {
-                        (e.target as HTMLImageElement).style.display = 'none';
-                      }}
-                    />
-                  )}
-                  <span
-                    className={`difficulty-badge difficulty-${course.difficulty}`}
-                    style={{ position: 'absolute', top: 'var(--space-sm)', right: 'var(--space-sm)' }}
-                  >
-                    {course.difficulty}
-                  </span>
-                  {course.id === 'pottery-wheel' && expertVideoUrl && (
-                    <span
-                      className="badge badge-blue"
-                      style={{ position: 'absolute', top: 'var(--space-sm)', left: 'var(--space-sm)' }}
-                    >
-                      Real Expert Video
-                    </span>
+                    <BookOpen size={40} />
                   )}
                 </div>
 
@@ -311,27 +315,70 @@ export default function Courses() {
                       fontSize: '0.875rem',
                     }}
                   >
-                    {course.description}
+                    {course.description || 'No description has been added for this course yet.'}
                   </p>
 
                   <div style={{ marginTop: 'auto', paddingTop: 'var(--space-md)' }}>
                     <div className="flex-between" style={{ marginBottom: 'var(--space-sm)' }}>
                       <span className="text-small" style={{ color: 'var(--text-secondary)' }}>
-                        {course.instructor}
+                        Created
                       </span>
                       <span className="text-small" style={{ color: 'var(--text-muted)' }}>
-                        {course.estimatedTime}
+                        {new Date(course.created_at).toLocaleDateString()}
                       </span>
                     </div>
-
-                    {course.progress > 0 && (
-                      <div className="progress-bar">
-                        <div className="progress-bar-fill" style={{ width: `${course.progress}%` }} />
-                      </div>
-                    )}
+                    <div style={{ display: 'flex', gap: 'var(--space-sm)', flexWrap: 'wrap' }}>
+                      <Link
+                        to={`/courses/${course.id}`}
+                        className="btn btn-secondary"
+                        onClick={(event) => event.stopPropagation()}
+                      >
+                        View Course
+                      </Link>
+                      <button
+                        type="button"
+                        className="btn btn-secondary"
+                        disabled={uploadingCourseImageId === course.id}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          document.getElementById(`course-image-${course.id}`)?.click();
+                        }}
+                      >
+                        <ImagePlus size={16} />
+                        {uploadingCourseImageId === course.id
+                          ? 'Uploading...'
+                          : course.thumbnail_url
+                            ? 'Change Photo'
+                            : 'Add Photo'}
+                      </button>
+                      <input
+                        id={`course-image-${course.id}`}
+                        type="file"
+                        accept="image/jpeg,image/png,image/webp,image/gif"
+                        disabled={uploadingCourseImageId === course.id}
+                        onClick={(event) => event.stopPropagation()}
+                        onChange={(event) => {
+                          event.stopPropagation();
+                          void handleCourseImageUpload(course, event.target.files?.[0] ?? null);
+                          event.currentTarget.value = '';
+                        }}
+                        style={{ display: 'none' }}
+                      />
+                      <button
+                        type="button"
+                        className="btn btn-ghost"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          void handleDeleteCourse(course);
+                        }}
+                        disabled={deletingCourseId === course.id}
+                      >
+                        {deletingCourseId === course.id ? 'Deleting...' : 'Delete Course'}
+                      </button>
+                    </div>
                   </div>
                 </div>
-              </Link>
+              </div>
             </motion.div>
           ))}
         </div>
@@ -339,9 +386,11 @@ export default function Courses() {
         /* ── Empty State ──────────────────────────────────────────────── */
         <div className="empty-state">
           <BookOpen className="empty-state-icon" />
-          <h3 className="empty-state-title">No courses found</h3>
+          <h3 className="empty-state-title">
+            {coursesLoading ? 'Loading courses...' : 'No courses found'}
+          </h3>
           <p className="empty-state-description">
-            Try adjusting your search or filter to find what you're looking for.
+            {coursesError ?? "Try adjusting your search or filter to find what you're looking for."}
           </p>
         </div>
       )}

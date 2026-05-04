@@ -1,47 +1,25 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
+import type { FormEvent } from 'react';
 import { useParams, useNavigate, Link } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import {
-  Play,
-  Clock,
-  User,
   ChevronRight,
   AlertCircle,
+  BookOpen,
+  Play,
+  Plus,
+  Trash2,
+  X,
 } from 'lucide-react';
 import { useCourseStore, useUIStore } from '../store';
-import { courses, getClipsForCourse } from '../services/mock/courses';
-import { Progress } from '../components/ui/progress';
-import { formatDuration } from '../utils/helpers';
-
-type BackendChapterClip = {
-  id: string;
-  title: string;
-  duration: number;
-  description: string;
-  thumbnail: string;
-  keyPoints: string[];
-  expertVideoUrl?: string;
-};
-
-type BackendChapter = {
-  id: string;
-  course_id: string;
-  title: string;
-  order: number;
-  expert_video?: {
-    url: string;
-    file_path: string;
-  } | null;
-};
-
-type BackendCourse = {
-  id: string;
-  title: string;
-};
-
-const backendCourseTitleByMockId: Record<string, string> = {
-  'cut-a-straight-line': 'Cut a straight line',
-};
+import {
+  createBackendChapter,
+  deleteBackendChapter,
+  fetchBackendChapters,
+  fetchBackendCourseDetail,
+  type BackendChapter,
+  type BackendCourseDetail,
+} from '../services/api/courses';
 
 export default function CourseDetail() {
   const { courseId } = useParams<{ courseId: string }>();
@@ -49,32 +27,21 @@ export default function CourseDetail() {
   const setSelectedCourse = useCourseStore((s) => s.setSelectedCourse);
   const setSelectedClip = useCourseStore((s) => s.setSelectedClip);
   const setRobotMessage = useUIStore((s) => s.setRobotMessage);
-  const [backendClips, setBackendClips] = useState<BackendChapterClip[]>([]);
-
-  const course = useMemo(
-    () => courses.find((c) => c.id === courseId),
-    [courseId],
-  );
-
-  const mockClips = useMemo(() => (courseId ? getClipsForCourse(courseId) : []), [courseId]);
-
-  const clips = useMemo(() => {
-    if (
-      (courseId === 'pottery-wheel' || courseId === 'cut-a-straight-line') &&
-      backendClips.length > 0
-    ) {
-      return backendClips;
-    }
-    return mockClips;
-  }, [backendClips, courseId, mockClips]);
+  const [course, setCourse] = useState<BackendCourseDetail | null>(null);
+  const [chapters, setChapters] = useState<BackendChapter[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [showChapterForm, setShowChapterForm] = useState(false);
+  const [newChapterTitle, setNewChapterTitle] = useState('');
+  const [newChapterDescription, setNewChapterDescription] = useState('');
+  const [creatingChapter, setCreatingChapter] = useState(false);
+  const [deletingChapterId, setDeletingChapterId] = useState<string | null>(null);
 
   useEffect(() => {
     if (course) {
       setSelectedCourse(course.id);
       setRobotMessage(
-        course.progress > 0
-          ? `You're viewing "${course.title}". You've completed ${course.progress}% — keep going!`
-          : `Welcome to "${course.title}"! Pick a clip below to start learning.`,
+        `You're viewing "${course.title}". Pick a chapter with an expert video to compare.`,
       );
     }
     return () => {
@@ -82,78 +49,119 @@ export default function CourseDetail() {
     };
   }, [course, setSelectedCourse, setRobotMessage]);
 
+  const loadCourse = useCallback(async (showLoading = true) => {
+    if (!courseId) {
+      setLoading(false);
+      return;
+    }
+
+    if (showLoading) {
+      setLoading(true);
+    }
+    setError(null);
+    try {
+      const [backendCourse, backendChapters] = await Promise.all([
+        fetchBackendCourseDetail(courseId),
+        fetchBackendChapters(courseId),
+      ]);
+      setCourse(backendCourse);
+      setChapters(backendChapters);
+    } catch {
+      setCourse(null);
+      setChapters([]);
+      setError('Could not load course details. Make sure the backend is running.');
+    } finally {
+      if (showLoading) {
+        setLoading(false);
+      }
+    }
+  }, [courseId]);
+
   useEffect(() => {
     let cancelled = false;
 
-    const loadBackendChapterClips = async () => {
-      if (courseId !== 'pottery-wheel' && courseId !== 'cut-a-straight-line') {
-        setBackendClips([]);
-        return;
-      }
-
-      try {
-        let chaptersUrl = '/api/chapters';
-        const backendCourseTitle = courseId ? backendCourseTitleByMockId[courseId] : undefined;
-        if (backendCourseTitle) {
-          const coursesResponse = await fetch('/api/courses');
-          if (!coursesResponse.ok) {
-            throw new Error('Failed to load backend courses');
-          }
-
-          const backendCourses = (await coursesResponse.json()) as BackendCourse[];
-          const backendCourse = backendCourses.find(
-            (item) => item.title.toLowerCase() === backendCourseTitle.toLowerCase(),
-          );
-          if (backendCourse) {
-            chaptersUrl = `/api/chapters?course_id=${encodeURIComponent(backendCourse.id)}`;
-          }
-        }
-
-        const response = await fetch(chaptersUrl);
-        if (!response.ok) {
-          throw new Error('Failed to load chapters');
-        }
-
-        const payload = (await response.json()) as BackendChapter[];
-        const chapterClips: BackendChapterClip[] = payload.map((chapter) => ({
-          id: chapter.id,
-          title: chapter.title,
-          duration: courseId === 'cut-a-straight-line' ? 15 : 10,
-          description: chapter.expert_video
-            ? 'This chapter has a linked expert video from backend storage.'
-            : 'No expert video linked yet. Upload one from Expert Upload.',
-          thumbnail: course?.thumbnail ?? '/course-pottery.jpg',
-          expertVideoUrl: chapter.expert_video?.url,
-          keyPoints: chapter.expert_video
-            ? ['Chapter is linked to a real expert video', 'Open Compare Studio to use this exact expert reference']
-            : ['Upload an expert video for this chapter', 'Then return here and open Compare Studio'],
-        }));
-
-        chapterClips.sort((a, b) => a.title.localeCompare(b.title));
-        if (!cancelled) {
-          setBackendClips(chapterClips);
-        }
-      } catch {
-        if (!cancelled) {
-          setBackendClips([]);
-        }
-      }
+    const run = async () => {
+      await loadCourse();
+      if (cancelled) return;
     };
 
-    void loadBackendChapterClips();
+    void run();
 
     return () => {
       cancelled = true;
     };
-  }, [course?.thumbnail, courseId]);
+  }, [loadCourse]);
 
-  const handleClipClick = (clipId: string) => {
-    if (!course) return;
+  const openCompareStudio = (chapter: BackendChapter) => {
+    if (!courseId || !chapter.expert_video?.url) return;
 
-    setSelectedCourse(course.id);
-    setSelectedClip(clipId);
-    navigate(`/compare?courseId=${encodeURIComponent(course.id)}&clipId=${encodeURIComponent(clipId)}`);
+    setSelectedCourse(courseId);
+    setSelectedClip(chapter.id);
+    navigate(`/compare?courseId=${encodeURIComponent(courseId)}&clipId=${encodeURIComponent(chapter.id)}`);
   };
+
+  const handleCreateChapter = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!courseId) return;
+
+    const title = newChapterTitle.trim();
+    if (!title) {
+      setError('Chapter title is required.');
+      return;
+    }
+
+    setCreatingChapter(true);
+    setError(null);
+    try {
+      await createBackendChapter({
+        course_id: courseId,
+        title,
+        description: newChapterDescription.trim() || null,
+      });
+      setNewChapterTitle('');
+      setNewChapterDescription('');
+      setShowChapterForm(false);
+      await loadCourse(false);
+    } catch {
+      setError('Failed to create chapter.');
+    } finally {
+      setCreatingChapter(false);
+    }
+  };
+
+  const handleDeleteChapter = async (chapter: BackendChapter) => {
+    const confirmed = window.confirm(`Delete chapter "${chapter.title}"?`);
+    if (!confirmed) return;
+
+    setDeletingChapterId(chapter.id);
+    setError(null);
+    try {
+      await deleteBackendChapter(chapter.id);
+      await loadCourse(false);
+    } catch (error) {
+      setError(error instanceof Error ? error.message : 'Failed to delete chapter.');
+    } finally {
+      setDeletingChapterId(null);
+    }
+  };
+
+  if (loading) {
+    return (
+      <div className="container">
+        <motion.div
+          className="empty-state"
+          initial={{ opacity: 0, y: 20 }}
+          animate={{ opacity: 1, y: 0 }}
+        >
+          <BookOpen className="empty-state-icon" />
+          <h2 className="empty-state-title">Loading Course</h2>
+          <p className="empty-state-description">
+            Fetching the latest course data from the backend.
+          </p>
+        </motion.div>
+      </div>
+    );
+  }
 
   if (!course) {
     return (
@@ -213,18 +221,18 @@ export default function CourseDetail() {
           className="grid grid-cols-1 md:grid-cols-[280px_1fr]"
           style={{ gap: 'var(--space-2xl)' }}
         >
-          {/* Thumbnail */}
           <div
+            className="flex-center"
             style={{
               width: '100%',
               aspectRatio: '4/3',
               borderRadius: 'var(--radius-lg)',
               background: 'var(--bg-tertiary)',
-              backgroundImage: `url(${course.thumbnail})`,
-              backgroundSize: 'cover',
-              backgroundPosition: 'center',
+              color: 'var(--text-muted)',
             }}
-          />
+          >
+            <BookOpen size={52} />
+          </div>
 
           {/* Info */}
           <div
@@ -235,7 +243,9 @@ export default function CourseDetail() {
             }}
           >
             <h1 className="heading-2">{course.title}</h1>
-            <p className="text-body">{course.description}</p>
+            <p className="text-body">
+              {course.description || 'No description has been added for this course yet.'}
+            </p>
 
             <div
               style={{
@@ -245,72 +255,110 @@ export default function CourseDetail() {
                 alignItems: 'center',
               }}
             >
-              <span
-                className={`difficulty-badge difficulty-${course.difficulty}`}
-              >
-                {course.difficulty}
+              <span className="badge badge-blue">
+                {chapters.length} {chapters.length === 1 ? 'chapter' : 'chapters'}
               </span>
-              <span className="badge badge-blue">{course.category}</span>
-              <span
-                className="text-small"
-                style={{
-                  display: 'inline-flex',
-                  alignItems: 'center',
-                  gap: '0.25rem',
-                  color: 'var(--text-secondary)',
-                }}
-              >
-                <User size={14} /> {course.instructor}
-              </span>
-              <span
-                className="text-small"
-                style={{
-                  display: 'inline-flex',
-                  alignItems: 'center',
-                  gap: '0.25rem',
-                  color: 'var(--text-secondary)',
-                }}
-              >
-                <Clock size={14} /> {course.estimatedTime}
-              </span>
-            </div>
-
-            {/* Progress */}
-            <div>
-              <div
-                className="flex-between"
-                style={{ marginBottom: 'var(--space-xs)' }}
-              >
-                <span
-                  className="text-small"
-                  style={{ color: 'var(--text-secondary)' }}
-                >
-                  Progress
+              {course.created_at ? (
+                <span className="text-small" style={{ color: 'var(--text-secondary)' }}>
+                  Created {new Date(course.created_at).toLocaleDateString()}
                 </span>
-                <span className="text-small" style={{ fontWeight: 600 }}>
-                  {course.progress}%
-                </span>
-              </div>
-              <Progress value={course.progress} />
-            </div>
-
-            {/* CTA */}
-            <div>
-              <button
-                className="btn btn-primary"
-                onClick={() => {
-                  if (clips.length > 0) handleClipClick(clips[0].id);
-                }}
-              >
-                <Play size={16} />
-                {course.progress > 0 ? 'Continue Learning' : 'Start Course'}
-              </button>
+              ) : null}
             </div>
           </div>
         </div>
       </motion.div>
 
-      {/* Clips Section */}
+      {error ? (
+        <div
+          className="glass"
+          style={{
+            padding: 'var(--space-md)',
+            marginBottom: 'var(--space-xl)',
+            color: 'var(--danger, #ef4444)',
+          }}
+        >
+          {error}
+        </div>
+      ) : null}
+
+      <motion.section
+        initial={{ opacity: 0, y: 20 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ delay: 0.15 }}
+        className="glass"
+        style={{
+          padding: 'var(--space-xl)',
+          borderRadius: 'var(--radius-xl)',
+          marginBottom: 'var(--space-2xl)',
+        }}
+      >
+        <div className="flex-between" style={{ gap: 'var(--space-md)', flexWrap: 'wrap' }}>
+          <div>
+            <h2 className="heading-4" style={{ marginBottom: 'var(--space-xs)' }}>
+              Manage Chapters
+            </h2>
+            <p className="text-small" style={{ color: 'var(--text-secondary)' }}>
+              Add or remove chapters for this course.
+            </p>
+          </div>
+          <button
+            className={showChapterForm ? 'btn btn-secondary' : 'btn btn-primary'}
+            onClick={() => setShowChapterForm((value) => !value)}
+          >
+            {showChapterForm ? <X size={16} /> : <Plus size={16} />}
+            {showChapterForm ? 'Cancel' : 'Add Chapter'}
+          </button>
+        </div>
+
+        {showChapterForm ? (
+          <form
+            onSubmit={handleCreateChapter}
+            style={{
+              display: 'grid',
+              gap: 'var(--space-md)',
+              marginTop: 'var(--space-lg)',
+              maxWidth: 720,
+            }}
+          >
+            <input
+              value={newChapterTitle}
+              onChange={(event) => setNewChapterTitle(event.target.value)}
+              placeholder="Chapter title"
+              disabled={creatingChapter}
+              style={{
+                padding: '0.75rem 1rem',
+                borderRadius: 'var(--radius-md)',
+                border: '1px solid var(--border-color)',
+                background: 'var(--bg-secondary)',
+                color: 'var(--text-primary)',
+              }}
+            />
+            <textarea
+              value={newChapterDescription}
+              onChange={(event) => setNewChapterDescription(event.target.value)}
+              placeholder="Optional description"
+              disabled={creatingChapter}
+              rows={3}
+              style={{
+                padding: '0.75rem 1rem',
+                borderRadius: 'var(--radius-md)',
+                border: '1px solid var(--border-color)',
+                background: 'var(--bg-secondary)',
+                color: 'var(--text-primary)',
+                resize: 'vertical',
+              }}
+            />
+            <div>
+              <button className="btn btn-primary" type="submit" disabled={creatingChapter}>
+                <Plus size={16} />
+                {creatingChapter ? 'Creating...' : 'Create Chapter'}
+              </button>
+            </div>
+          </form>
+        ) : null}
+      </motion.section>
+
+      {/* Chapters Section */}
       <motion.section
         initial={{ opacity: 0, y: 20 }}
         animate={{ opacity: 1, y: 0 }}
@@ -320,122 +368,145 @@ export default function CourseDetail() {
           className="flex-between"
           style={{ marginBottom: 'var(--space-lg)' }}
         >
-          <h2 className="heading-3">Course Clips</h2>
+          <h2 className="heading-3">Chapters</h2>
           <span
             className="text-small"
             style={{ color: 'var(--text-secondary)' }}
           >
-            {clips.length} videos
+            {chapters.length} total
           </span>
         </div>
 
-        <div
-          className="horizontal-scroll"
-          style={{ paddingBottom: 'var(--space-md)' }}
-        >
-          {clips.map((clip, index) => (
-            <motion.div
-              key={clip.id}
-              initial={{ opacity: 0, y: 16 }}
-              animate={{ opacity: 1, y: 0 }}
-              transition={{ delay: 0.25 + index * 0.025 }}
-              className="card card-hover"
-              style={{ width: 200, cursor: 'pointer', overflow: 'hidden' }}
-              onClick={() => handleClipClick(clip.id)}
-            >
-              {/* Thumbnail with play overlay */}
-              <div
-                style={{
-                  position: 'relative',
-                  width: '100%',
-                  aspectRatio: '16/9',
-                  background: 'var(--bg-tertiary)',
-                  overflow: 'hidden',
-                }}
-              >
-                {clip.expertVideoUrl ? (
-                  <video
-                    src={clip.expertVideoUrl}
-                    muted
-                    playsInline
-                    preload="metadata"
-                    style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }}
-                  />
-                ) : (
-                  <div
-                    style={{
-                      width: '100%',
-                      height: '100%',
-                      backgroundImage: `url(${clip.thumbnail})`,
-                      backgroundSize: 'cover',
-                      backgroundPosition: 'center',
+        {chapters.length === 0 ? (
+          <div className="empty-state">
+            <BookOpen className="empty-state-icon" />
+            <h3 className="empty-state-title">No chapters yet.</h3>
+            <p className="empty-state-description">
+              Create expert chapters from the Expert Video Manager.
+            </p>
+          </div>
+        ) : (
+          <div className="grid-courses">
+            {chapters
+              .slice()
+              .sort((a, b) => a.order - b.order)
+              .map((chapter, index) => {
+                const hasExpertVideo = Boolean(chapter.expert_video?.url);
+
+                return (
+                  <motion.div
+                    key={chapter.id}
+                    initial={{ opacity: 0, y: 16 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    transition={{ delay: 0.25 + index * 0.025 }}
+                    className={`card ${hasExpertVideo ? 'card-hover' : ''}`}
+                    role={hasExpertVideo ? 'button' : undefined}
+                    tabIndex={hasExpertVideo ? 0 : undefined}
+                    onClick={() => {
+                      if (hasExpertVideo) openCompareStudio(chapter);
                     }}
-                  />
-                )}
-
-                <div
-                  className="flex-center"
-                  style={{
-                    position: 'absolute',
-                    inset: 0,
-                    background: 'rgba(0,0,0,0.4)',
-                    opacity: 0,
-                    transition: 'opacity var(--transition-fast)',
-                  }}
-                  onMouseEnter={(e) => {
-                    (e.currentTarget as HTMLElement).style.opacity = '1';
-                  }}
-                  onMouseLeave={(e) => {
-                    (e.currentTarget as HTMLElement).style.opacity = '0';
-                  }}
-                >
-                  <Play size={28} style={{ color: '#fff' }} />
-                </div>
-
-                {clip.expertVideoUrl && (
-                  <span
-                    className="badge badge-blue"
-                    style={{ position: 'absolute', top: 6, left: 6 }}
+                    onKeyDown={(event) => {
+                      if (hasExpertVideo && (event.key === 'Enter' || event.key === ' ')) {
+                        event.preventDefault();
+                        openCompareStudio(chapter);
+                      }
+                    }}
+                    style={{
+                      padding: 0,
+                      overflow: 'hidden',
+                      cursor: hasExpertVideo ? 'pointer' : 'default',
+                    }}
                   >
-                    Real Expert Video
-                  </span>
-                )}
+                    <div
+                      className="flex-center"
+                      style={{
+                        position: 'relative',
+                        width: '100%',
+                        aspectRatio: '16/9',
+                        background: 'var(--bg-tertiary)',
+                        color: 'var(--text-muted)',
+                      }}
+                    >
+                      {hasExpertVideo ? (
+                        <>
+                          <video
+                            src={chapter.expert_video?.url}
+                            muted
+                            playsInline
+                            preload="metadata"
+                            style={{
+                              width: '100%',
+                              height: '100%',
+                              objectFit: 'cover',
+                              display: 'block',
+                            }}
+                          />
+                          <div
+                            className="flex-center"
+                            style={{
+                              position: 'absolute',
+                              inset: 0,
+                              background: 'rgba(0,0,0,0.28)',
+                            }}
+                          >
+                            <Play size={32} style={{ color: '#fff' }} />
+                          </div>
+                        </>
+                      ) : (
+                        <BookOpen size={40} />
+                      )}
+                    </div>
 
-                <span
-                  style={{
-                    position: 'absolute',
-                    bottom: 4,
-                    right: 4,
-                    background: 'rgba(0,0,0,0.75)',
-                    color: '#fff',
-                    padding: '2px 6px',
-                    borderRadius: 'var(--radius-sm)',
-                    fontSize: '0.7rem',
-                    fontFamily: 'var(--font-mono)',
-                  }}
-                >
-                  {formatDuration(clip.duration)}
-                </span>
-              </div>
+                    <div style={{ padding: 'var(--space-lg)' }}>
+                      <div className="flex-between" style={{ gap: 'var(--space-sm)' }}>
+                        <h3 className="heading-4">{chapter.title}</h3>
+                        <span className="badge badge-blue">Chapter {chapter.order}</span>
+                      </div>
 
-              {/* Title */}
-              <div style={{ padding: 'var(--space-sm)' }}>
-                <p
-                  className="text-small"
-                  style={{
-                    fontWeight: 500,
-                    color: 'var(--text-primary)',
-                    overflow: 'hidden',
-                    textOverflow: 'ellipsis',
-                    whiteSpace: 'nowrap',
-                  }}
-                >
-                  {clip.title}
-                </p>
-              </div>
-            </motion.div>
-          ))}
-        </div>
+                      <div style={{ marginTop: 'var(--space-md)' }}>
+                        <span className={`badge ${hasExpertVideo ? 'badge-green' : 'badge-yellow'}`}>
+                          {hasExpertVideo ? 'Expert video linked' : 'No expert video'}
+                        </span>
+                      </div>
+
+                      <div
+                        style={{
+                          display: 'flex',
+                          gap: 'var(--space-sm)',
+                          flexWrap: 'wrap',
+                          marginTop: 'var(--space-md)',
+                        }}
+                      >
+                        {hasExpertVideo ? (
+                          <button
+                            className="btn btn-primary"
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              openCompareStudio(chapter);
+                            }}
+                          >
+                            <Play size={16} />
+                            Watch
+                          </button>
+                        ) : null}
+                        <button
+                          className="btn btn-secondary"
+                          disabled={deletingChapterId === chapter.id}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            void handleDeleteChapter(chapter);
+                          }}
+                        >
+                          <Trash2 size={16} />
+                          {deletingChapterId === chapter.id ? 'Deleting...' : 'Delete'}
+                        </button>
+                      </div>
+                    </div>
+                  </motion.div>
+                );
+              })}
+          </div>
+        )}
       </motion.section>
     </div>
   );

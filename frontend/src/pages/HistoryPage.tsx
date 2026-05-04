@@ -1,10 +1,8 @@
-import { useState, useMemo } from 'react';
+import { useEffect, useState, useMemo } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Search, ChevronDown, ChevronUp, FileText } from 'lucide-react';
 import { evaluationHistory, scoreColor } from '@/services/mock/evaluation';
-import { courses } from '@/services/mock/courses';
-
-const courseMap = Object.fromEntries(courses.map((c) => [c.id, c.title]));
+import { fetchCourses } from '@/services/api/courses';
 
 function clipLabel(clipId: string) {
   const match = clipId.match(/clip-(\d+)$/);
@@ -14,6 +12,30 @@ function clipLabel(clipId: string) {
 export default function HistoryPage() {
   const [search, setSearch] = useState('');
   const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [courseMap, setCourseMap] = useState<Record<string, string>>({});
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadCourses = async () => {
+      try {
+        const courses = await fetchCourses();
+        if (!cancelled) {
+          setCourseMap(Object.fromEntries(courses.map((course) => [course.id, course.title])));
+        }
+      } catch {
+        if (!cancelled) {
+          setCourseMap({});
+        }
+      }
+    };
+
+    void loadCourses();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const filtered = useMemo(() => {
     const q = search.toLowerCase();
@@ -23,7 +45,7 @@ export default function HistoryPage() {
         (courseMap[ev.courseId] ?? ev.courseId).toLowerCase().includes(q) ||
         clipLabel(ev.clipId).toLowerCase().includes(q),
     );
-  }, [search]);
+  }, [courseMap, search]);
 
   return (
     <div className="container section">

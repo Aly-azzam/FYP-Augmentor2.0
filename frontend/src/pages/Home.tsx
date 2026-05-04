@@ -4,8 +4,9 @@ import { motion, useScroll, useTransform } from 'framer-motion';
 import { Canvas } from '@react-three/fiber';
 import { Float, MeshDistortMaterial, OrbitControls } from '@react-three/drei';
 import { BookOpen, Play, Upload, Sparkles, ArrowRight, ChevronDown } from 'lucide-react';
-import { courses } from '@/services/mock/courses';
+import { fetchCourses } from '@/services/api/courses';
 import { useThemeStore } from '@/store';
+import type { Course } from '@/types';
 
 /* ─── 3D Wireframe Vase ────────────────────────────────────────────────────── */
 
@@ -106,12 +107,36 @@ const staggerChild = {
 export default function Home() {
   const heroRef = useRef<HTMLDivElement>(null);
   const isDark = useThemeStore((s) => s.isDark);
+  const [courses, setCourses] = useState<Course[]>([]);
   const { scrollYProgress } = useScroll({
     target: heroRef,
     offset: ['start start', 'end start'],
   });
   const heroOpacity = useTransform(scrollYProgress, [0, 1], [1, 0]);
   const heroScale = useTransform(scrollYProgress, [0, 1], [1, 0.92]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadCourses = async () => {
+      try {
+        const payload = await fetchCourses();
+        if (!cancelled) {
+          setCourses(payload);
+        }
+      } catch {
+        if (!cancelled) {
+          setCourses([]);
+        }
+      }
+    };
+
+    void loadCourses();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   return (
     <>

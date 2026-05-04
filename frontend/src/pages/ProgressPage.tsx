@@ -1,4 +1,4 @@
-import { useMemo } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { motion } from 'framer-motion';
 import {
   AreaChart,
@@ -16,7 +16,8 @@ import {
 } from 'recharts';
 import { TrendingUp, Target, Flame, Award } from 'lucide-react';
 import { userProfile, progressData } from '@/services/mock/user';
-import { courses } from '@/services/mock/courses';
+import { fetchCourses } from '@/services/api/courses';
+import type { Course } from '@/types';
 
 const ACCENT = '#2563EB';
 
@@ -33,6 +34,31 @@ const fadeUp = {
 };
 
 export default function ProgressPage() {
+  const [courses, setCourses] = useState<Course[]>([]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadCourses = async () => {
+      try {
+        const payload = await fetchCourses();
+        if (!cancelled) {
+          setCourses(payload);
+        }
+      } catch {
+        if (!cancelled) {
+          setCourses([]);
+        }
+      }
+    };
+
+    void loadCourses();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   const radarData = useMemo(() => {
     const n = progressData.length;
     const avg = (key: 'metric1' | 'metric2' | 'metric3' | 'metric4') =>

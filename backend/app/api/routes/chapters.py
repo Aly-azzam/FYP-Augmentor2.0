@@ -4,13 +4,17 @@ from pathlib import Path
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, or_, select
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session, selectinload
 
 from app.core.config import settings
 from app.core.database import get_db
+from app.models.attempt import Attempt
 from app.models.chapter import Chapter
 from app.models.course import Course
+from app.models.evaluation import Evaluation
+from app.models.evaluation_feedback import EvaluationFeedback
 from app.models.video import Video
 from app.schemas.course_schema import (
     ChapterCreateRequest,
@@ -30,6 +34,19 @@ from app.services.upload_service import UploadValidationError, save_upload_file,
 router = APIRouter(prefix="/api/chapters", tags=["Chapters"])
 
 DEFAULT_EXPERT_UPLOAD_COURSE_TITLE = "Cut a straight line"
+VIDEO_STORAGE_PATH_FIELDS = (
+    "file_path",
+    "mediapipe_source_path",
+    "mediapipe_detections_path",
+    "mediapipe_features_path",
+    "mediapipe_metadata_path",
+    "mediapipe_annotated_path",
+    "sam2_source_path",
+    "sam2_raw_path",
+    "sam2_summary_path",
+    "sam2_metadata_path",
+    "sam2_annotated_path",
+)
 
 
 def _chapter_detail(chapter: Chapter) -> ChapterDetail:
@@ -174,6 +191,114 @@ def get_chapter(chapter_id: UUID, db: Session = Depends(get_db)):
         order=chapter.chapter_order,
         expert_video=expert_video,
     )
+
+
+@router.delete("/{chapter_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_chapter(chapter_id: UUID, db: Session = Depends(get_db)):
+    """Delete a chapter and dependent practice/video records safely."""
+    chapter = db.execute(select(Chapter).where(Chapter.id == chapter_id)).scalar_one_or_none()
+    if chapter is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Chapter not found.")
+
+    storage_keys: list[str] = []
+    try:
+        attempts = db.execute(
+            select(Attempt).where(Attempt.chapter_id == str(chapter_id))
+        ).scalars().all()
+        attempt_ids = [str(attempt.id) for attempt in attempts]
+        learner_video_ids = [
+            str(attempt.learner_video_id)
+            for attempt in attempts
+            if attempt.learner_video_id is not None
+        ]
+
+        chapter_videos = db.execute(
+            select(Video).where(Video.chapter_id == str(chapter_id))
+        ).scalars().all()
+        video_ids = {str(video.id) for video in chapter_videos}
+        video_ids.update(learner_video_ids)
+
+        videos_to_delete = []
+        if video_ids:
+            videos_to_delete = db.execute(
+                select(Video).where(Video.id.in_(video_ids))
+            ).scalars().all()
+
+        for video in videos_to_delete:
+            for field_name in VIDEO_STORAGE_PATH_FIELDS:
+                storage_path_value = getattr(video, field_name, None)
+                if not storage_path_value:
+                    continue
+                try:
+                    storage_keys.append(normalize_storage_key(storage_path_value))
+                except ValueError:
+                    pass
+
+        evaluation_filters = []
+        if attempt_ids:
+            evaluation_filters.append(Evaluation.attempt_id.in_(attempt_ids))
+        if video_ids:
+            evaluation_filters.extend(
+                [
+                    Evaluation.expert_video_id.in_(video_ids),
+                    Evaluation.learner_video_id.in_(video_ids),
+                ]
+            )
+
+        evaluation_ids: list[str] = []
+        if evaluation_filters:
+            evaluation_ids = [
+                str(evaluation_id)
+                for evaluation_id in db.execute(
+                    select(Evaluation.id).where(or_(*evaluation_filters))
+                ).scalars().all()
+            ]
+
+        if evaluation_ids:
+            db.execute(
+                delete(EvaluationFeedback).where(
+                    EvaluationFeedback.evaluation_id.in_(evaluation_ids)
+                )
+            )
+            db.execute(delete(Evaluation).where(Evaluation.id.in_(evaluation_ids)))
+
+        if attempt_ids:
+            db.execute(delete(Attempt).where(Attempt.id.in_(attempt_ids)))
+
+        if video_ids:
+            db.execute(delete(Video).where(Video.id.in_(video_ids)))
+
+        db.delete(chapter)
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "Chapter could not be deleted because related records still reference it. "
+                "Delete dependent practice/evaluation data first."
+            ),
+        ) from exc
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Chapter deletion failed because of a database error.",
+        ) from exc
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Chapter deletion failed unexpectedly.",
+        ) from exc
+
+    for storage_key in storage_keys:
+        try:
+            storage_path = settings.STORAGE_ROOT / storage_key
+            if storage_path.exists():
+                storage_path.unlink()
+        except OSError:
+            pass
 
 
 @router.get("/{chapter_id}/expert-video", response_model=ExpertVideoOut)

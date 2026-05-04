@@ -13,7 +13,6 @@ import HistoryPage from './pages/HistoryPage';
 import AchievementsPage from './pages/AchievementsPage';
 import SettingsPage from './pages/SettingsPage';
 import ProfilePage from './pages/ProfilePage';
-import ExpertVideoManager from './pages/ExpertVideoManager';
 import NotFound from './pages/NotFound';
 
 export default function App() {
@@ -40,7 +39,6 @@ export default function App() {
             <Route path="/progress" element={<ProgressPage />} />
             <Route path="/history" element={<HistoryPage />} />
             <Route path="/achievements" element={<AchievementsPage />} />
-            <Route path="/expert-videos" element={<ExpertVideoManager />} />
             <Route path="/settings" element={<SettingsPage />} />
             <Route path="/profile" element={<ProfilePage />} />
             <Route path="*" element={<NotFound />} />
