@@ -24,10 +24,12 @@ REGION_RADIUS_PX = 45
 OVERLAY_FILENAME = "sam2_yolo_overlay.mp4"
 TRAJECTORY_LINE_OVERLAY_FILENAME = "sam2_yolo_trajectory_line_overlay.mp4"
 SMOOTH_POLYLINE_OVERLAY_FILENAME = "sam2_yolo_smooth_polyline_overlay.mp4"
+SMOOTHED_CUTTING_PATH_OVERLAY_FILENAME = "sam2_yolo_smoothed_cutting_path_overlay.mp4"
 RAW_FILENAME = "raw.json"
 METRICS_FILENAME = "metrics.json"
 SUMMARY_FILENAME = "summary.json"
 CLEANED_TRAJECTORY_FILENAME = "cleaned_trajectory.json"
+TRAJECTORY_SMOOTHED_FILENAME = "trajectory_smoothed.json"
 DEBUG_FIRST_FRAME_FILENAME = "debug_first_frame.jpg"
 TRACKING_QUALITY_NOTE = (
     "Mask may include hand, but trajectory remains usable because the tracked region follows "

@@ -25,6 +25,8 @@ import torch
 
 from app.services.sam2_yolo.cleaned_trajectory import (
     build_cleaned_trajectory_artifact,
+    smooth_trajectory,
+    write_smoothed_cutting_path_overlay_video,
     write_trajectory_line_overlay_video,
 )
 from app.services.sam2_yolo.region_metrics import compute_region_metrics
@@ -38,9 +40,11 @@ from app.services.sam2_yolo.schemas import (
     PROMPT_SOURCE,
     RAW_FILENAME,
     SUMMARY_FILENAME,
+    SMOOTHED_CUTTING_PATH_OVERLAY_FILENAME,
     SMOOTH_POLYLINE_OVERLAY_FILENAME,
     TRACKING_POINT_TYPE,
     TRACKING_QUALITY_NOTE,
+    TRAJECTORY_SMOOTHED_FILENAME,
     TRAJECTORY_POINT_MODES,
     ExtractedVideo,
     InitialPrompt,
@@ -117,7 +121,9 @@ def run_stable_yolo_sam2_tracking(
     summary_path = run_dir / SUMMARY_FILENAME
     overlay_path = run_dir / OVERLAY_FILENAME
     cleaned_trajectory_path = run_dir / CLEANED_TRAJECTORY_FILENAME
+    trajectory_smoothed_path = run_dir / TRAJECTORY_SMOOTHED_FILENAME
     smooth_polyline_overlay_path = run_dir / SMOOTH_POLYLINE_OVERLAY_FILENAME
+    smoothed_cutting_path_overlay_path = run_dir / SMOOTHED_CUTTING_PATH_OVERLAY_FILENAME
     debug_path = run_dir / DEBUG_FIRST_FRAME_FILENAME if save_debug else None
     frame_cap = _resolved_frame_cap(max_processed_frames)
 
@@ -323,6 +329,17 @@ def run_stable_yolo_sam2_tracking(
             output_path=smooth_polyline_overlay_path,
             fps=tracking_result.extracted_video.output_fps,
         )
+        smoothed_trajectory_payload = smooth_trajectory(
+            cleaned_json_path=str(cleaned_trajectory_path),
+            output_path=str(trajectory_smoothed_path),
+        )
+        write_smoothed_cutting_path_overlay_video(
+            frame_dir=tracking_result.extracted_video.frame_dir,
+            raw_frames=tracking_result.frames,
+            smoothed_trajectory=smoothed_trajectory_payload,
+            output_path=smoothed_cutting_path_overlay_path,
+            fps=tracking_result.extracted_video.output_fps,
+        )
         summary_payload.update(
             {
                 "cleaned_trajectory_json_path": str(cleaned_trajectory_path),
@@ -330,6 +347,12 @@ def run_stable_yolo_sam2_tracking(
                 "smooth_polyline_overlay_video_url": _storage_url_for(smooth_polyline_overlay_path),
                 "cleaned_trajectory_usable_for_corridor": bool(
                     cleaned_trajectory_payload.get("usable_for_corridor", False)
+                ),
+                "trajectory_smoothed_json_path": str(trajectory_smoothed_path),
+                "smoothed_cutting_path_overlay_video_path": str(smoothed_cutting_path_overlay_path),
+                "smoothed_cutting_path_overlay_video_url": _storage_url_for(smoothed_cutting_path_overlay_path),
+                "smoothed_trajectory_usable_for_corridor": bool(
+                    smoothed_trajectory_payload.get("usable_for_corridor", False)
                 ),
             }
         )
