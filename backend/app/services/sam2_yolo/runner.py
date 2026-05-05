@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -34,9 +35,11 @@ from app.services.sam2_yolo.stable_runner import run_stable_yolo_sam2_run
 BACKEND_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_FRAME_STRIDE = 5
 DEFAULT_OUTPUT_ROOT = BACKEND_ROOT / "storage" / "outputs" / "sam2_yolo" / "runs"
+EXPERTS_ROOT = BACKEND_ROOT / "storage" / "outputs" / "sam2_yolo" / "experts"
 DEFAULT_MAX_PROCESSED_FRAMES: int | None = None
 YOLO_FAILURE_REASON = "YOLO did not detect scissors in the scanned prompt frames"
 DEFAULT_RUN_MODE = os.getenv("SAM2_RUN_MODE", "subprocess").strip().lower()
+logger = logging.getLogger(__name__)
 
 
 def run_sam2_yolo_scissors_tracking(
@@ -54,6 +57,7 @@ def run_sam2_yolo_scissors_tracking(
     sam2_checkpoint: str | None = None,
     sam2_config: str | None = None,
     sam2_model_id: str | None = None,
+    expert_code: str | None = None,
 ) -> dict[str, Any]:
     video = Path(video_path).expanduser().resolve()
     if not video.is_file():
@@ -70,7 +74,7 @@ def run_sam2_yolo_scissors_tracking(
     summary_path = run_dir / SUMMARY_FILENAME
 
     if DEFAULT_RUN_MODE == "direct":
-        return run_stable_yolo_sam2_run(
+        summary = run_stable_yolo_sam2_run(
             video_path=video,
             output_root=output_root,
             run_id=resolved_run_id,
@@ -85,95 +89,192 @@ def run_sam2_yolo_scissors_tracking(
             sam2_config=sam2_config,
             sam2_model_id=sam2_model_id,
         )
+    else:
+        run_dir.mkdir(parents=True, exist_ok=False)
 
-    run_dir.mkdir(parents=True, exist_ok=False)
+        command = [
+            sys.executable,
+            "-m",
+            "app.services.sam2_yolo.stable_runner",
+            "--video_path",
+            str(video),
+            "--output_dir",
+            str(run_dir),
+            "--stride",
+            str(frame_stride),
+            "--tracking_point_type",
+            tracking_point_type,
+            "--trajectory_point_mode",
+            trajectory_point_mode,
+            "--roboflow_confidence",
+            str(roboflow_confidence),
+        ]
+        if frame_cap is not None:
+            command.extend(["--max_processed_frames", str(frame_cap if frame_cap > 0 else 0)])
+        if not use_gpu:
+            command.append("--no-gpu")
+        if save_debug:
+            command.append("--save_debug")
+        if sam2_checkpoint:
+            command.extend(["--sam2_checkpoint", sam2_checkpoint])
+        if sam2_config:
+            command.extend(["--sam2_config", sam2_config])
+        if sam2_model_id:
+            command.extend(["--sam2_model_id", sam2_model_id])
 
-    command = [
-        sys.executable,
-        "-m",
-        "app.services.sam2_yolo.stable_runner",
-        "--video_path",
-        str(video),
-        "--output_dir",
-        str(run_dir),
-        "--stride",
-        str(frame_stride),
-        "--tracking_point_type",
-        tracking_point_type,
-        "--trajectory_point_mode",
-        trajectory_point_mode,
-        "--roboflow_confidence",
-        str(roboflow_confidence),
-    ]
-    if frame_cap is not None:
-        command.extend(["--max_processed_frames", str(frame_cap if frame_cap > 0 else 0)])
-    if not use_gpu:
-        command.append("--no-gpu")
-    if save_debug:
-        command.append("--save_debug")
-    if sam2_checkpoint:
-        command.extend(["--sam2_checkpoint", sam2_checkpoint])
-    if sam2_config:
-        command.extend(["--sam2_config", sam2_config])
-    if sam2_model_id:
-        command.extend(["--sam2_model_id", sam2_model_id])
+        try:
+            completed = subprocess.run(  # noqa: S603 - argv is controlled by this backend
+                command,
+                cwd=BACKEND_ROOT,
+                capture_output=True,
+                text=True,
+                timeout=900,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            failure_reason = f"stable_runner timed out after {exc.timeout} seconds"
+            timeout_summary = _build_failed_summary(
+                run_id=resolved_run_id,
+                video_path=video,
+                run_dir=run_dir,
+                raw_path=run_dir / RAW_FILENAME,
+                metrics_path=run_dir / METRICS_FILENAME,
+                summary_path=summary_path,
+                overlay_path=run_dir / OVERLAY_FILENAME,
+                frame_stride=frame_stride,
+                device="unknown",
+                device_warning=None,
+                failure_reason=failure_reason,
+            )
+            timeout_summary["stage"] = "sam2_subprocess"
+            timeout_summary["device_attempted"] = "unknown"
+            timeout_summary["fallback_attempted"] = False
+            timeout_summary["max_processed_frames"] = frame_cap
+            _write_json(summary_path, timeout_summary)
+            return timeout_summary
+
+        if completed.stdout:
+            print(completed.stdout, end="", flush=True)
+        if completed.stderr:
+            print(completed.stderr, end="", file=sys.stderr, flush=True)
+
+        if summary_path.is_file():
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        else:
+            failure_reason = (
+                completed.stderr.strip()
+                or completed.stdout.strip()
+                or f"stable_runner exited with code {completed.returncode}"
+            )
+            fail_summary = _build_failed_summary(
+                run_id=resolved_run_id,
+                video_path=video,
+                run_dir=run_dir,
+                raw_path=run_dir / RAW_FILENAME,
+                metrics_path=run_dir / METRICS_FILENAME,
+                summary_path=summary_path,
+                overlay_path=run_dir / OVERLAY_FILENAME,
+                frame_stride=frame_stride,
+                device="unknown",
+                device_warning=None,
+                failure_reason=failure_reason[-1200:],
+            )
+            fail_summary["stage"] = "sam2_subprocess"
+            fail_summary["device_attempted"] = "unknown"
+            fail_summary["fallback_attempted"] = False
+            fail_summary["max_processed_frames"] = frame_cap
+            _write_json(summary_path, fail_summary)
+            return fail_summary
+
+    # ── Post-processing: corridor alignment ───────────────────────────────
+    if expert_code and summary.get("status") == "success":
+        summary = _apply_corridor_alignment(
+            summary=summary,
+            expert_code=expert_code,
+            summary_path=run_dir / SUMMARY_FILENAME,
+        )
+
+    return summary
+
+
+def _apply_corridor_alignment(
+    summary: dict[str, Any],
+    expert_code: str,
+    summary_path: Path,
+) -> dict[str, Any]:
+    """Run blade-tip translation + robust extension corridor alignment and merge into summary."""
+    from app.services.sam2_yolo.corridor_alignment import (  # noqa: PLC0415
+        align_corridor_blade_tip_with_extension,
+    )
+
+    trajectory_smoothed_path = summary.get("trajectory_smoothed_json_path")
+    if not trajectory_smoothed_path or not Path(trajectory_smoothed_path).is_file():
+        logger.warning(
+            "[corridor_alignment] trajectory_smoothed.json not found, skipping alignment"
+        )
+        return summary
+
+    learner_raw_path = summary.get("raw_json_path")
+    if not learner_raw_path or not Path(learner_raw_path).is_file():
+        logger.warning(
+            "[corridor_alignment] learner raw.json not found, skipping alignment"
+        )
+        return summary
+
+    expert_raw_path = EXPERTS_ROOT / expert_code / "raw.json"
+    if not expert_raw_path.is_file():
+        logger.warning(
+            "[corridor_alignment] Expert raw.json not found: %s", expert_raw_path
+        )
+        summary["aligned_corridor_warning"] = (
+            f"Expert raw.json not found for expert_code='{expert_code}'"
+        )
+        return summary
+
+    corridor_path = EXPERTS_ROOT / expert_code / "corridor.json"
+    if not corridor_path.is_file():
+        logger.warning(
+            "[corridor_alignment] Expert corridor not found: %s", corridor_path
+        )
+        summary["aligned_corridor_warning"] = (
+            f"Expert corridor not found for expert_code='{expert_code}'"
+        )
+        return summary
+
+    run_dir = Path(summary["run_dir"])
+    learner_video_path: str | None = summary.get("video_path")
 
     try:
-        completed = subprocess.run(  # noqa: S603 - argv is controlled by this backend
-            command,
-            cwd=BACKEND_ROOT,
-            capture_output=True,
-            text=True,
-            timeout=900,
-            check=False,
+        alignment = align_corridor_blade_tip_with_extension(
+            corridor_path=str(corridor_path),
+            expert_raw_path=str(expert_raw_path),
+            learner_raw_path=learner_raw_path,
+            learner_smoothed_path=trajectory_smoothed_path,
+            learner_run_id=summary["run_id"],
+            output_dir=str(run_dir),
+            expert_code=expert_code,
+            learner_video_path=learner_video_path,
         )
-    except subprocess.TimeoutExpired as exc:
-        failure_reason = f"stable_runner timed out after {exc.timeout} seconds"
-        summary = _build_failed_summary(
-            run_id=resolved_run_id,
-            video_path=video,
-            run_dir=run_dir,
-            raw_path=run_dir / RAW_FILENAME,
-            metrics_path=run_dir / METRICS_FILENAME,
-            summary_path=summary_path,
-            overlay_path=run_dir / OVERLAY_FILENAME,
-            frame_stride=frame_stride,
-            device="unknown",
-            device_warning=None,
-            failure_reason=failure_reason,
+        summary.update(
+            {
+                "aligned_corridor_json_path": alignment["aligned_corridor_json_path"],
+                "aligned_corridor_preview_path": alignment["aligned_corridor_preview_path"],
+                "aligned_corridor_preview_url": alignment["aligned_corridor_preview_url"],
+                "aligned_corridor_overlay_video_path": alignment[
+                    "aligned_corridor_overlay_video_path"
+                ],
+                "aligned_corridor_overlay_video_url": alignment[
+                    "aligned_corridor_overlay_video_url"
+                ],
+                "alignment_mode": "blade_tip_translation_with_robust_extension",
+                "alignment_expert_code": expert_code,
+            }
         )
-        summary["stage"] = "sam2_subprocess"
-        summary["device_attempted"] = "unknown"
-        summary["fallback_attempted"] = False
-        summary["max_processed_frames"] = frame_cap
         _write_json(summary_path, summary)
-        return summary
-    if summary_path.is_file():
-        return json.loads(summary_path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("[corridor_alignment] Corridor alignment failed")
+        summary["aligned_corridor_error"] = str(exc)
 
-    failure_reason = (
-        completed.stderr.strip()
-        or completed.stdout.strip()
-        or f"stable_runner exited with code {completed.returncode}"
-    )
-    summary = _build_failed_summary(
-        run_id=resolved_run_id,
-        video_path=video,
-        run_dir=run_dir,
-        raw_path=run_dir / RAW_FILENAME,
-        metrics_path=run_dir / METRICS_FILENAME,
-        summary_path=summary_path,
-        overlay_path=run_dir / OVERLAY_FILENAME,
-        frame_stride=frame_stride,
-        device="unknown",
-        device_warning=None,
-        failure_reason=failure_reason[-1200:],
-    )
-    summary["stage"] = "sam2_subprocess"
-    summary["device_attempted"] = "unknown"
-    summary["fallback_attempted"] = False
-    summary["max_processed_frames"] = frame_cap
-    _write_json(summary_path, summary)
     return summary
 
 

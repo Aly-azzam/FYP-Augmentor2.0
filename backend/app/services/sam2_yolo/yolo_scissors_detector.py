@@ -3,8 +3,8 @@ from __future__ import annotations
 import json
 import logging
 import os
-import tempfile
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -18,15 +18,19 @@ BACKEND_ROOT = Path(__file__).resolve().parents[3]
 load_dotenv(BACKEND_ROOT / ".env")
 logger = logging.getLogger(__name__)
 
-DEFAULT_ROBOFLOW_MODEL_ID = "scissors_ego_real/1"
-DEFAULT_ROBOFLOW_CONFIDENCE = float(os.getenv("ROBOFLOW_CONFIDENCE", "0.5"))
+DEFAULT_LOCAL_YOLO_WEIGHTS_PATH = BACKEND_ROOT / "models" / "yolo" / "best.pt"
+FALLBACK_LOCAL_YOLO_WEIGHTS_PATH = BACKEND_ROOT / "models" / "yolo" / "scissors_yolov8s_best.pt"
+DEFAULT_YOLO_CONFIDENCE = float(os.getenv("YOLO_LOCAL_CONFIDENCE", os.getenv("ROBOFLOW_CONFIDENCE", "0.5")))
+# Kept as a compatibility alias because runner/stable_runner still expose the old
+# CLI option name for existing callers. The detector itself is local-only.
+DEFAULT_ROBOFLOW_CONFIDENCE = DEFAULT_YOLO_CONFIDENCE
 DEFAULT_BBOX_SHRINK = float(os.getenv("SAM2_YOLO_BBOX_SHRINK", "0.65"))
 DEFAULT_YOLO_SCISSORS_OUTPUT_ROOT = BACKEND_ROOT / "storage" / "outputs" / "yolo_scissors"
 YOLO_SCISSORS_RAW_FILENAME = "yolo_scissors_raw.json"
 
 
 class YoloScissorsDetectionError(RuntimeError):
-    """Raised when Roboflow YOLO cannot produce a scissors prompt."""
+    """Raised when local YOLO cannot produce a scissors prompt."""
 
 
 @dataclass(slots=True)
@@ -179,7 +183,7 @@ def find_initial_yolo_prompt_frame(
                 continue
 
             try:
-                detection = detect_best_scissors_roboflow(
+                detection = detect_best_scissors_local(
                     frame=frame,
                     confidence_threshold=confidence_threshold,
                 )
@@ -239,7 +243,7 @@ def scan_yolo_scissors_video(
 
             timestamp = round(frame_index / max(fps, 1e-6), 6)
             try:
-                detection = detect_best_scissors_roboflow(
+                detection = detect_best_scissors_local(
                     frame=frame,
                     confidence_threshold=confidence_threshold,
                 )
@@ -293,6 +297,8 @@ def scan_yolo_scissors_video(
 
     return {
         "video_path": str(video),
+        "yolo_backend": "local_ultralytics",
+        "yolo_weights_path": str(resolve_local_yolo_weights_path()),
         "fps": fps,
         "width": width,
         "height": height,
@@ -321,8 +327,19 @@ def get_or_create_yolo_scissors_raw_artifact(
         payload = json.loads(output_path.read_text(encoding="utf-8"))
         existing_video_path = payload.get("video_path")
         if existing_video_path and Path(existing_video_path).expanduser().resolve() == video:
-            logger.info("Reusing YOLO scissors raw artifact at %s", output_path)
-            return payload, output_path, True
+            current_weights_path = resolve_local_yolo_weights_path()
+            existing_weights_path = payload.get("yolo_weights_path")
+            if (
+                payload.get("yolo_backend") == "local_ultralytics"
+                and existing_weights_path
+                and Path(existing_weights_path).expanduser().resolve() == current_weights_path
+            ):
+                logger.info("Reusing local YOLO scissors raw artifact at %s", output_path)
+                return payload, output_path, True
+            logger.info(
+                "Ignoring stale/non-local YOLO scissors artifact at %s",
+                output_path,
+            )
         logger.info(
             "Ignoring YOLO scissors artifact for different video at %s",
             output_path,
@@ -423,62 +440,129 @@ def read_video_frame(*, video_path: Path, frame_index: int) -> Any:
         cap.release()
 
 
+def detect_best_scissors_local(
+    *,
+    frame: Any,
+    confidence_threshold: float,
+) -> YoloScissorsDetection:
+    model_path = resolve_local_yolo_weights_path()
+    model = _load_local_yolo_model(str(model_path))
+    result = model.predict(
+        source=frame,
+        conf=float(confidence_threshold),
+        device=_select_yolo_device(),
+        verbose=False,
+    )[0]
+
+    boxes = getattr(result, "boxes", None)
+    if boxes is None or len(boxes) == 0:
+        raise YoloScissorsDetectionError("Local YOLO did not detect scissors on this frame")
+
+    candidates: list[YoloScissorsDetection] = []
+    scissors_candidates: list[YoloScissorsDetection] = []
+    names = getattr(result, "names", {})
+    for box in boxes:
+        confidence = float(box.conf.detach().cpu().item())
+        if confidence < confidence_threshold:
+            continue
+
+        xyxy = [float(value) for value in box.xyxy.detach().cpu().numpy()[0].tolist()]
+        class_id = (
+            int(box.cls.detach().cpu().item())
+            if getattr(box, "cls", None) is not None
+            else -1
+        )
+        class_name = names.get(class_id) if isinstance(names, dict) else None
+        class_name_text = str(class_name).strip() if class_name is not None else None
+        detection = YoloScissorsDetection(
+            bbox=xyxy,
+            confidence=confidence,
+            class_name=class_name_text or None,
+        )
+        candidates.append(detection)
+        if class_name_text and "scissor" in class_name_text.lower():
+            scissors_candidates.append(detection)
+
+    pool = scissors_candidates or candidates
+    if not pool:
+        raise YoloScissorsDetectionError("Local YOLO did not detect scissors on this frame")
+
+    return max(pool, key=lambda detection: detection.confidence)
+
+
 def detect_best_scissors_roboflow(
     *,
     frame: Any,
     confidence_threshold: float,
 ) -> YoloScissorsDetection:
-    from inference_sdk import InferenceHTTPClient  # noqa: PLC0415
+    """Compatibility wrapper. YOLO+SAM2 now uses local Ultralytics weights only."""
+    return detect_best_scissors_local(
+        frame=frame,
+        confidence_threshold=confidence_threshold,
+    )
 
-    api_key = os.getenv("ROBOFLOW_API_KEY", "").strip()
-    model_id = os.getenv("ROBOFLOW_MODEL_ID", DEFAULT_ROBOFLOW_MODEL_ID).strip()
-    if not api_key:
-        raise YoloScissorsDetectionError("Missing ROBOFLOW_API_KEY in .env")
-    if not model_id:
-        raise YoloScissorsDetectionError("Missing ROBOFLOW_MODEL_ID in .env")
 
-    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp_file:
-        frame_path = Path(tmp_file.name)
+def resolve_local_yolo_weights_path() -> Path:
+    configured = os.getenv("YOLO_LOCAL_WEIGHTS_PATH", "").strip()
+    candidates = (
+        [_resolve_configured_yolo_path(configured)]
+        if configured
+        else [DEFAULT_LOCAL_YOLO_WEIGHTS_PATH, FALLBACK_LOCAL_YOLO_WEIGHTS_PATH]
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            _log_local_yolo_weights(candidate)
+            return candidate
 
+    searched = ", ".join(str(path) for path in candidates)
+    raise YoloScissorsDetectionError(
+        "Local YOLO weights not found. Expected "
+        "backend/models/yolo/best.pt or backend/models/yolo/scissors_yolov8s_best.pt. "
+        f"Set YOLO_LOCAL_WEIGHTS_PATH to a valid .pt file. Searched: {searched}"
+    )
+
+
+def _resolve_configured_yolo_path(raw_path: str) -> Path:
+    path = Path(raw_path).expanduser()
+    if path.is_absolute():
+        return path.resolve()
+    if path.parts and path.parts[0].lower() == "backend":
+        return (BACKEND_ROOT.parent / path).resolve()
+    return (BACKEND_ROOT / path).resolve()
+
+
+@lru_cache(maxsize=1)
+def _load_local_yolo_model(model_path: str) -> Any:
+    from ultralytics import YOLO  # noqa: PLC0415
+
+    return YOLO(model_path)
+
+
+def _select_yolo_device() -> int | str:
     try:
-        if not cv2.imwrite(str(frame_path), frame):
-            raise RuntimeError("Could not write temp frame for Roboflow inference")
+        import torch  # type: ignore  # noqa: PLC0415
 
-        client = InferenceHTTPClient(
-            api_url="https://serverless.roboflow.com",
-            api_key=api_key,
-        )
-        result = client.infer(str(frame_path), model_id=model_id)
-    finally:
-        if frame_path.exists():
-            frame_path.unlink()
+        if torch.cuda.is_available():
+            return 0
+    except Exception:  # noqa: BLE001 - torch availability varies by environment.
+        pass
+    return "cpu"
 
-    predictions = result.get("predictions", []) if isinstance(result, dict) else []
-    if not isinstance(predictions, list) or not predictions:
-        raise YoloScissorsDetectionError("YOLO did not detect scissors on the first usable frame")
 
-    candidates: list[YoloScissorsDetection] = []
-    scissors_candidates: list[YoloScissorsDetection] = []
-    for prediction in predictions:
-        class_name = str(prediction.get("class", "")).strip()
-        confidence = float(prediction.get("confidence", 0.0))
-        if confidence < confidence_threshold:
-            continue
+_LOGGED_WEIGHTS_PATHS: set[Path] = set()
 
-        detection = YoloScissorsDetection(
-            bbox=_roboflow_xywh_to_xyxy(prediction),
-            confidence=confidence,
-            class_name=class_name or None,
-        )
-        candidates.append(detection)
-        if "scissor" in class_name.lower():
-            scissors_candidates.append(detection)
 
-    pool = scissors_candidates or candidates
-    if not pool:
-        raise YoloScissorsDetectionError("YOLO did not detect scissors on the first usable frame")
-
-    return max(pool, key=lambda detection: detection.confidence)
+def _log_local_yolo_weights(path: Path) -> None:
+    if path in _LOGGED_WEIGHTS_PATHS:
+        return
+    try:
+        display_path = path.resolve().relative_to(BACKEND_ROOT.parent.resolve()).as_posix()
+    except ValueError:
+        display_path = str(path)
+    message = f"Using local YOLO weights: {display_path}"
+    print(message, flush=True)
+    logger.info(message)
+    _LOGGED_WEIGHTS_PATHS.add(path)
 
 
 def save_debug_first_frame(
@@ -531,19 +615,6 @@ def save_debug_first_frame(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if not cv2.imwrite(str(output_path), debug_frame):
         raise RuntimeError(f"Could not write debug image: {output_path}")
-
-
-def _roboflow_xywh_to_xyxy(prediction: dict[str, Any]) -> list[float]:
-    x = float(prediction["x"])
-    y = float(prediction["y"])
-    width = float(prediction["width"])
-    height = float(prediction["height"])
-    return [
-        x - width / 2.0,
-        y - height / 2.0,
-        x + width / 2.0,
-        y + height / 2.0,
-    ]
 
 
 def shrink_bbox(bbox: list[float], shrink_factor: float = DEFAULT_BBOX_SHRINK) -> list[float]:

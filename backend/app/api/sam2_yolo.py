@@ -68,6 +68,7 @@ async def run_learner_sam2_yolo(
             use_gpu=True,
             save_debug=body.save_debug,
             max_processed_frames=body.max_processed_frames,
+            expert_code=body.expert_code or None,
         )
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
@@ -235,6 +236,31 @@ def _build_learner_response(*, summary: dict[str, Any], expert_code: str | None)
     response["metrics_json_url"] = _storage_url_for(response.get("metrics_json_path"))
     response["summary_json_url"] = _storage_url_for(response.get("summary_json_path"))
     response["overlay_video_url"] = _storage_url_for(response.get("overlay_video_path"))
+
+    # Aligned corridor fields — stored in summary by runner, surfaced here.
+    if response.get("aligned_corridor_json_path"):
+        response["aligned_corridor_json_url"] = _storage_url_for(
+            response.get("aligned_corridor_json_path")
+        )
+    if response.get("aligned_corridor_preview_path"):
+        response["aligned_corridor_preview_url"] = (
+            _storage_url_for(response.get("aligned_corridor_preview_path"))
+            or response.get("aligned_corridor_preview_url")
+        )
+    if response.get("aligned_corridor_progress_json_path"):
+        response["aligned_corridor_progress_json_url"] = _storage_url_for(
+            response.get("aligned_corridor_progress_json_path")
+        )
+    if response.get("aligned_corridor_progress_preview_path"):
+        response["aligned_corridor_progress_preview_url"] = (
+            _storage_url_for(response.get("aligned_corridor_progress_preview_path"))
+            or response.get("aligned_corridor_progress_preview_url")
+        )
+    if response.get("aligned_corridor_overlay_video_path"):
+        response["aligned_corridor_overlay_video_url"] = (
+            _storage_url_for(response.get("aligned_corridor_overlay_video_path"))
+            or response.get("aligned_corridor_overlay_video_url")
+        )
 
     expert_reference = _expert_reference_payload(expert_code)
     response.update(expert_reference)

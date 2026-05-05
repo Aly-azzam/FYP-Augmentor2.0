@@ -138,7 +138,7 @@ interface MediaPipeRunResult {
 
 type InspectionModel = 'mediapipe' | 'sam2' | 'optical_flow';
 
-const DEFAULT_SAM2_YOLO_EXPERT_CODE = 'expert_cutting_01';
+const DEFAULT_SAM2_YOLO_EXPERT_CODE = 'straight_line_v1';
 
 interface Sam2LearnerMediaPipeInfo {
   run_id: string;
@@ -253,6 +253,17 @@ interface Sam2LearnerResult {
   manual_init_prompt_preview?: unknown | null;
   mediapipe?: Sam2LearnerMediaPipeInfo | null;
   warnings: string[];
+  // Aligned corridor (Step 4 post-processing)
+  aligned_corridor_progress_json_path?: string | null;
+  aligned_corridor_progress_json_url?: string | null;
+  aligned_corridor_progress_preview_path?: string | null;
+  aligned_corridor_progress_preview_url?: string | null;
+  aligned_corridor_overlay_video_path?: string | null;
+  aligned_corridor_overlay_video_url?: string | null;
+  alignment_mode?: string | null;
+  alignment_expert_code?: string | null;
+  aligned_corridor_error?: string | null;
+  aligned_corridor_warning?: string | null;
 }
 
 interface OpticalFlowSummaryMetrics {
@@ -433,7 +444,7 @@ export default function CompareStudio() {
   // Learner overlay: show the raw uploaded video, the MediaPipe annotated
   // output, YOLO+SAM2 scissors overlay, or Optical Flow visualization.
   const [learnerOverlay, setLearnerOverlay] =
-    useState<'none' | 'mediapipe' | 'sam2' | 'optical_flow'>('none');
+    useState<'none' | 'mediapipe' | 'sam2' | 'optical_flow' | 'aligned_corridor'>('none');
 
   // YOLO+SAM2 learner scissors tracking state.
   const [sam2LearnerRun, setSam2LearnerRun] = useState<Sam2LearnerResult | null>(null);
@@ -1140,6 +1151,11 @@ export default function CompareStudio() {
     sam2LearnerRun?.overlay_video_path,
   );
 
+  const corridorOverlayBaseUrl = toPlayableStorageUrl(
+    sam2LearnerRun?.aligned_corridor_overlay_video_url,
+    sam2LearnerRun?.aligned_corridor_overlay_video_path,
+  );
+
   const sam2AnnotatedSource =
     (() => {
       const baseUrl =
@@ -1175,6 +1191,9 @@ export default function CompareStudio() {
     }
     if (learnerOverlay === 'optical_flow' && opticalFlowLearnerSource) {
       return opticalFlowLearnerSource;
+    }
+    if (learnerOverlay === 'aligned_corridor' && corridorOverlayBaseUrl) {
+      return corridorOverlayBaseUrl;
     }
     return userVideoUrl;
   })();
@@ -1470,6 +1489,7 @@ export default function CompareStudio() {
                 {(mediapipeRun?.annotated_video_url ||
                   sam2OverlayBaseUrl ||
                   sam2LearnerRun?.annotated_video_url ||
+                  corridorOverlayBaseUrl ||
                   opticalFlowVisualizationUrl) && (
                   <div
                     role="tablist"
@@ -1515,6 +1535,19 @@ export default function CompareStudio() {
                       >
                         <Hand size={12} style={{ marginRight: 4 }} />
                         YOLO+SAM2 Scissors
+                      </button>
+                    )}
+                    {corridorOverlayBaseUrl && (
+                      <button
+                        type="button"
+                        role="tab"
+                        aria-selected={learnerOverlay === 'aligned_corridor'}
+                        className={`btn ${learnerOverlay === 'aligned_corridor' ? 'btn-primary' : 'btn-ghost'}`}
+                        style={{ borderRadius: 0, fontSize: '0.75rem', padding: 'var(--space-xs) var(--space-sm)' }}
+                        onClick={() => setLearnerOverlay('aligned_corridor')}
+                      >
+                        <Hand size={12} style={{ marginRight: 4 }} />
+                        Aligned Expert Corridor
                       </button>
                     )}
                     {opticalFlowVisualizationUrl && (
@@ -1577,7 +1610,7 @@ export default function CompareStudio() {
                   key={learnerVideoSource ?? userVideoUrl}
                   ref={learnerVideoRef}
                   src={learnerVideoSource ?? undefined}
-                  controls={learnerOverlay === 'sam2' || learnerOverlay === 'optical_flow'}
+                  controls={learnerOverlay === 'sam2' || learnerOverlay === 'optical_flow' || learnerOverlay === 'aligned_corridor'}
                   onClick={handleLearnerTipClick}
                   muted={learnerMuted}
                   playsInline
@@ -1711,6 +1744,23 @@ export default function CompareStudio() {
                   >
                     <Hand size={10} />
                     YOLO+SAM2 Scissors
+                  </span>
+                )}
+                {learnerOverlay === 'aligned_corridor' && corridorOverlayBaseUrl && (
+                  <span
+                    className="badge badge-green"
+                    style={{
+                      position: 'absolute',
+                      top: 8,
+                      left: 8,
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: 4,
+                      fontSize: '0.65rem',
+                    }}
+                  >
+                    <Hand size={10} />
+                    Aligned Expert Corridor
                   </span>
                 )}
                 {learnerOverlay === 'sam2' && sam2OverlayVideoError && (

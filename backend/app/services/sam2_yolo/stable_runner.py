@@ -270,6 +270,10 @@ def run_stable_yolo_sam2_tracking(
         initial_prompt=initial_prompt,
         frames=tracking_result.frames,
     )
+    if yolo_payload.get("yolo_backend"):
+        raw_payload["yolo_backend"] = yolo_payload.get("yolo_backend")
+    if yolo_payload.get("yolo_weights_path"):
+        raw_payload["yolo_weights_path"] = yolo_payload.get("yolo_weights_path")
     metrics_payload = _build_metrics_payload(raw_payload)
     summary_payload = _build_success_summary(
         raw_payload=raw_payload,
