@@ -194,6 +194,13 @@ def run_sam2_yolo_scissors_tracking(
             summary_path=run_dir / SUMMARY_FILENAME,
         )
 
+    # ── Post-processing: trajectory error detection ────────────────────────
+    if summary.get("aligned_corridor_json_path"):
+        summary = _apply_trajectory_error_detection(
+            summary=summary,
+            summary_path=run_dir / SUMMARY_FILENAME,
+        )
+
     return summary
 
 
@@ -274,6 +281,58 @@ def _apply_corridor_alignment(
     except Exception as exc:  # noqa: BLE001
         logger.exception("[corridor_alignment] Corridor alignment failed")
         summary["aligned_corridor_error"] = str(exc)
+
+    return summary
+
+
+def _apply_trajectory_error_detection(
+    summary: dict[str, Any],
+    summary_path: Path,
+) -> dict[str, Any]:
+    """Run trajectory error detection after corridor alignment and merge into summary."""
+    from app.services.sam2_yolo.trajectory_errors import (  # noqa: PLC0415
+        detect_trajectory_errors,
+    )
+
+    aligned_corridor_path = summary.get("aligned_corridor_json_path")
+    raw_json_path = summary.get("raw_json_path")
+
+    if not aligned_corridor_path or not Path(aligned_corridor_path).is_file():
+        logger.warning(
+            "[trajectory_errors] aligned_corridor.json not found, skipping error detection"
+        )
+        return summary
+
+    if not raw_json_path or not Path(raw_json_path).is_file():
+        logger.warning(
+            "[trajectory_errors] raw.json not found, skipping error detection"
+        )
+        return summary
+
+    run_dir = Path(summary["run_dir"])
+
+    try:
+        result = detect_trajectory_errors(
+            aligned_corridor_path=str(aligned_corridor_path),
+            raw_json_path=str(raw_json_path),
+            output_dir=str(run_dir),
+        )
+        summary.update(
+            {
+                "trajectory_errors_json_path": str(
+                    run_dir / "trajectory_errors.json"
+                ),
+                "trajectory_errors_total": result["total_errors"],
+            }
+        )
+        if result.get("trajectory_errors_preview_path"):
+            summary["trajectory_errors_preview_path"] = result[
+                "trajectory_errors_preview_path"
+            ]
+        _write_json(summary_path, summary)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("[trajectory_errors] Trajectory error detection failed")
+        summary["trajectory_errors_error"] = str(exc)
 
     return summary
 
