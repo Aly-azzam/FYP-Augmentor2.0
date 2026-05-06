@@ -49,6 +49,8 @@ import {
 } from '../store';
 import { fetchClipsForCourse, fetchCourse } from '../services/api/courses';
 import { getEvaluationResult, startEvaluation as startEvaluationApi } from '../api/evaluationApi';
+import { runLearnerAngle, generateDtwPreview } from '../api/angleApi';
+import type { AngleDtwSummary } from '../api/angleApi';
 import { formatTime } from '../utils/helpers';
 import type { DrawingTool, VideoClip } from '../types';
 
@@ -136,7 +138,7 @@ interface MediaPipeRunResult {
   partial_errors?: string[];
 }
 
-type InspectionModel = 'mediapipe' | 'sam2' | 'optical_flow';
+type InspectionModel = 'mediapipe' | 'sam2' | 'optical_flow' | 'yolo_angle';
 
 const DEFAULT_SAM2_YOLO_EXPERT_CODE = 'straight_line_v1';
 
@@ -444,7 +446,7 @@ export default function CompareStudio() {
   // Learner overlay: show the raw uploaded video, the MediaPipe annotated
   // output, YOLO+SAM2 scissors overlay, or Optical Flow visualization.
   const [learnerOverlay, setLearnerOverlay] =
-    useState<'none' | 'mediapipe' | 'sam2' | 'optical_flow' | 'aligned_corridor'>('none');
+    useState<'none' | 'mediapipe' | 'sam2' | 'optical_flow' | 'aligned_corridor' | 'angle'>('none');
 
   // YOLO+SAM2 learner scissors tracking state.
   const [sam2LearnerRun, setSam2LearnerRun] = useState<Sam2LearnerResult | null>(null);
@@ -478,6 +480,25 @@ export default function CompareStudio() {
   const [opticalFlowError, setOpticalFlowError] = useState<string | null>(null);
   const [opticalFlowVideoVersion, setOpticalFlowVideoVersion] = useState(0);
   const [clips, setClips] = useState<VideoClip[]>([]);
+
+  // YOLO+Angle+DTW state.
+  const [isAngleProcessing, setIsAngleProcessing] = useState(false);
+  const [angleStatus, setAngleStatus] = useState<'idle' | 'extracting' | 'dtw' | 'done'>('idle');
+  const [angleDtwResult, setAngleDtwResult] = useState<{
+    normalized_dtw_distance: number | null;
+    mean_angle_difference: number | null;
+    high_error_frame_count: number | null;
+    medium_error_frame_count: number | null;
+    ok_frame_count: number | null;
+  } | null>(null);
+  const [angleError, setAngleError] = useState<string | null>(null);
+  // run_id returned by the backend for the most recent angle pipeline run.
+  const [angleRunId, setAngleRunId] = useState<string | null>(null);
+
+  // SYNC dialog + DTW preview state.
+  const [isSyncDialogOpen, setIsSyncDialogOpen] = useState(false);
+  const [isDtwPreviewGenerating, setIsDtwPreviewGenerating] = useState(false);
+  const [dtwPreviewUrl, setDtwPreviewUrl] = useState<string | null>(null);
 
   // ── Refs ──────────────────────────────────────────────────────────────────
 
@@ -948,6 +969,74 @@ export default function CompareStudio() {
     }
   }, [userVideo]);
 
+  // ── YOLO+Angle+DTW learner run ────────────────────────────────────────────
+  const runAngleDtw = useCallback(async () => {
+    if (!userVideo) {
+      toast.error('Upload a practice video first');
+      return;
+    }
+
+    const expertName = DEFAULT_SAM2_YOLO_EXPERT_CODE;
+
+    setIsAngleProcessing(true);
+    setAngleError(null);
+    setAngleDtwResult(null);
+    setAngleRunId(null);
+    setAngleStatus('extracting');
+
+    try {
+      setAngleStatus('dtw');
+      const result = await runLearnerAngle(userVideo, expertName);
+      setAngleDtwResult(result.summary);
+      setAngleRunId(result.run_id);
+      setAngleStatus('done');
+      toast.success('YOLO+Angle+DTW complete');
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : 'YOLO+Angle+DTW pipeline failed.';
+      setAngleError(message);
+      setAngleStatus('idle');
+      toast.error(message);
+    } finally {
+      setIsAngleProcessing(false);
+    }
+  }, [userVideo]);
+
+  // ── SYNC DTW preview ───────────────────────────────────────────────────────
+  const handleSyncToggleRequest = useCallback(
+    (wantOn: boolean) => {
+      if (!wantOn) {
+        setIsSynced(false);
+        setDtwPreviewUrl(null);
+        return;
+      }
+      // Opening sync: show confirmation dialog instead of enabling immediately.
+      setIsSyncDialogOpen(true);
+    },
+    [setIsSynced],
+  );
+
+  const handleSyncConfirm = useCallback(async () => {
+    setIsSyncDialogOpen(false);
+    if (!angleRunId) {
+      toast.error('Run the YOLO+Angle+DTW pipeline first before enabling SYNC');
+      return;
+    }
+    setIsDtwPreviewGenerating(true);
+    try {
+      const response = await generateDtwPreview(angleRunId);
+      setDtwPreviewUrl(`http://localhost:8001/${response.preview_path}`);
+      setIsSynced(true);
+      toast.success('DTW aligned preview ready');
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : 'DTW preview generation failed.';
+      toast.error(message);
+    } finally {
+      setIsDtwPreviewGenerating(false);
+    }
+  }, [angleRunId, setIsSynced]);
+
   const runTipTracking = useCallback(
     async (tipX: number, tipY: number) => {
       if (!sam2LearnerRun) return;
@@ -1326,10 +1415,74 @@ export default function CompareStudio() {
         initial={{ opacity: 0, y: -20 }}
         animate={{ opacity: 1, y: 0 }}
       >
-        <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)' }}>
+        <div
+          style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)' }}
+          title="⚠️ Generating aligned preview may take up to 7 minutes"
+        >
           <span className="label">Sync</span>
-          <Switch checked={isSynced} onCheckedChange={setIsSynced} />
+          <Switch checked={isSynced} onCheckedChange={handleSyncToggleRequest} />
+          {isDtwPreviewGenerating && (
+            <Loader2 size={14} style={{ animation: 'spin 1s linear infinite', color: 'var(--accent-primary)' }} />
+          )}
         </div>
+
+        {/* ── SYNC confirmation dialog ───────────────────────────────────── */}
+        {isSyncDialogOpen && (
+          <div
+            style={{
+              position: 'fixed',
+              inset: 0,
+              zIndex: 9999,
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              background: 'rgba(0,0,0,0.55)',
+            }}
+            onClick={() => setIsSyncDialogOpen(false)}
+          >
+            <div
+              className="card"
+              style={{
+                padding: 'var(--space-xl)',
+                maxWidth: 420,
+                width: '90vw',
+                display: 'flex',
+                flexDirection: 'column',
+                gap: 'var(--space-md)',
+              }}
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div style={{ display: 'flex', alignItems: 'flex-start', gap: 'var(--space-sm)' }}>
+                <span style={{ fontSize: '1.5rem', lineHeight: 1 }}>⚠️</span>
+                <div>
+                  <p style={{ margin: 0, fontWeight: 700, fontSize: '1rem' }}>
+                    Generate DTW Aligned Preview?
+                  </p>
+                  <p className="text-small" style={{ color: 'var(--text-muted)', marginTop: 6 }}>
+                    Generating the DTW aligned preview may take up to 7 minutes depending on
+                    video length. This will run the preview generation pipeline in the background.
+                  </p>
+                </div>
+              </div>
+              <div style={{ display: 'flex', gap: 'var(--space-sm)', justifyContent: 'flex-end' }}>
+                <button
+                  type="button"
+                  className="btn btn-ghost"
+                  onClick={() => setIsSyncDialogOpen(false)}
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-primary"
+                  onClick={() => void handleSyncConfirm()}
+                >
+                  Continue
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
 
         <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)' }}>
           <span className="label">Playback Rate</span>
@@ -1396,9 +1549,9 @@ export default function CompareStudio() {
               >
                 <video
                   ref={expertVideoRef}
-                  key={expertVideoUrl ?? 'missing-expert-video'}
-                  src={expertVideoUrl ?? undefined}
-                  poster={clip?.thumbnail}
+                  key={dtwPreviewUrl ?? expertVideoUrl ?? 'missing-expert-video'}
+                  src={dtwPreviewUrl ?? expertVideoUrl ?? undefined}
+                  poster={dtwPreviewUrl ? undefined : clip?.thumbnail}
                   preload="metadata"
                   playsInline
                   onTimeUpdate={() => {
@@ -1563,6 +1716,19 @@ export default function CompareStudio() {
                         Flow
                       </button>
                     )}
+                    {angleDtwResult && (
+                      <button
+                        type="button"
+                        role="tab"
+                        aria-selected={learnerOverlay === 'angle'}
+                        className={`btn ${learnerOverlay === 'angle' ? 'btn-primary' : 'btn-ghost'}`}
+                        style={{ borderRadius: 0, fontSize: '0.75rem', padding: 'var(--space-xs) var(--space-sm)' }}
+                        onClick={() => setLearnerOverlay((cur) => cur === 'angle' ? 'none' : 'angle')}
+                      >
+                        <Triangle size={12} style={{ marginRight: 4 }} />
+                        Angle Overlay
+                      </button>
+                    )}
                   </div>
                 )}
                 <input
@@ -1636,6 +1802,37 @@ export default function CompareStudio() {
                   }}
                   style={{ cursor: isSelectingTip ? 'crosshair' : 'default' }}
                 />
+
+                {/* DTW preview loading overlay */}
+                {isDtwPreviewGenerating && (
+                  <div
+                    style={{
+                      position: 'absolute',
+                      inset: 0,
+                      display: 'flex',
+                      flexDirection: 'column',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      gap: 'var(--space-sm)',
+                      background: 'rgba(0,0,0,0.6)',
+                      borderRadius: 'inherit',
+                    }}
+                  >
+                    <Loader2
+                      size={32}
+                      style={{ animation: 'spin 1s linear infinite', color: 'var(--accent-primary)' }}
+                    />
+                    <span
+                      className="text-small"
+                      style={{ color: '#fff', fontWeight: 600, textAlign: 'center', padding: '0 var(--space-md)' }}
+                    >
+                      Generating DTW aligned preview…
+                      <br />
+                      <span style={{ fontWeight: 400, opacity: 0.8 }}>This may take up to 7 minutes.</span>
+                    </span>
+                  </div>
+                )}
+
                 {(isManualSamInitMode ||
                   ((manualSamPrompt.box ||
                     manualSamPrompt.positive_points.length > 0 ||
@@ -2354,6 +2551,7 @@ export default function CompareStudio() {
                     <TabsTrigger value="mediapipe">MediaPipe</TabsTrigger>
                     <TabsTrigger value="sam2">YOLO+SAM2 Scissors</TabsTrigger>
                     <TabsTrigger value="optical_flow">Optical Flow</TabsTrigger>
+                    <TabsTrigger value="yolo_angle">YOLO+Angle+DTW</TabsTrigger>
                   </TabsList>
 
                   <TabsContent value="mediapipe">
@@ -3095,6 +3293,143 @@ export default function CompareStudio() {
                       }}
                     >
                       Optical Flow inspection is reserved for later and will appear here in the same panel.
+                    </div>
+                  </TabsContent>
+
+                  {/* ── YOLO+Angle+DTW card ───────────────────────────── */}
+                  <TabsContent value="yolo_angle">
+                    <div
+                      style={{
+                        display: 'flex',
+                        flexDirection: 'column',
+                        gap: 'var(--space-md)',
+                        marginTop: 'var(--space-sm)',
+                      }}
+                    >
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)' }}>
+                        <Triangle size={18} style={{ color: 'var(--accent-primary)' }} />
+                        <span className="text-small" style={{ fontWeight: 600 }}>
+                          Scissors Angle + DTW Alignment
+                        </span>
+                      </div>
+                      <p className="text-small" style={{ color: 'var(--text-muted)', margin: 0 }}>
+                        Run YOLO to detect scissors, extract blade angles frame-by-frame, then
+                        align learner and expert angle sequences with Dynamic Time Warping.
+                      </p>
+
+                      <button
+                        className="btn btn-primary"
+                        style={{
+                          width: '100%',
+                          display: 'inline-flex',
+                          alignItems: 'center',
+                          justifyContent: 'center',
+                          gap: 'var(--space-xs)',
+                        }}
+                        disabled={!userVideo || isAngleProcessing}
+                        onClick={() => void runAngleDtw()}
+                      >
+                        {isAngleProcessing ? (
+                          <>
+                            <Loader2 size={14} style={{ animation: 'spin 1s linear infinite' }} />
+                            {angleStatus === 'extracting'
+                              ? 'Extracting angles…'
+                              : angleStatus === 'dtw'
+                                ? 'Running DTW…'
+                                : 'Processing…'}
+                          </>
+                        ) : (
+                          <>
+                            <Triangle size={14} />
+                            {angleDtwResult ? 'Run YOLO+Angle+DTW Again' : 'Run YOLO+Angle+DTW'}
+                          </>
+                        )}
+                      </button>
+
+                      {!userVideo && (
+                        <p
+                          className="text-small"
+                          style={{ color: 'var(--text-muted)', textAlign: 'center', margin: 0 }}
+                        >
+                          Upload a practice video to enable YOLO+Angle+DTW.
+                        </p>
+                      )}
+
+                      {angleError && (
+                        <div
+                          className="text-small"
+                          style={{
+                            background: 'var(--bg-tertiary)',
+                            border: '1px solid var(--danger, #ef4444)',
+                            color: 'var(--danger, #ef4444)',
+                            borderRadius: 'var(--radius-md)',
+                            padding: 'var(--space-sm) var(--space-md)',
+                          }}
+                        >
+                          {angleError}
+                        </div>
+                      )}
+
+                      {angleDtwResult && (
+                        <>
+                          <div
+                            style={{
+                              display: 'grid',
+                              gridTemplateColumns: '1fr 1fr',
+                              gap: 'var(--space-sm)',
+                            }}
+                          >
+                            {[
+                              {
+                                label: 'DTW distance',
+                                value: angleDtwResult.normalized_dtw_distance,
+                              },
+                              {
+                                label: 'Mean angle diff',
+                                value: angleDtwResult.mean_angle_difference,
+                              },
+                              {
+                                label: '✓ OK frames',
+                                value: angleDtwResult.ok_frame_count,
+                              },
+                              {
+                                label: '⚠ Medium errors',
+                                value: angleDtwResult.medium_error_frame_count,
+                              },
+                              {
+                                label: '✗ High errors',
+                                value: angleDtwResult.high_error_frame_count,
+                              },
+                            ].map((metric) => (
+                              <div
+                                key={metric.label}
+                                className="stat-card"
+                                style={{ padding: 'var(--space-sm)' }}
+                              >
+                                <div className="stat-value" style={{ fontSize: '1.25rem' }}>
+                                  {formatMetricValue(metric.value)}
+                                </div>
+                                <div className="stat-label" style={{ fontSize: '0.7rem' }}>
+                                  {metric.label}
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+
+                          <button
+                            type="button"
+                            className={`btn ${learnerOverlay === 'angle' ? 'btn-primary' : 'btn-secondary'}`}
+                            style={{ width: '100%' }}
+                            onClick={() =>
+                              setLearnerOverlay((cur) => cur === 'angle' ? 'none' : 'angle')
+                            }
+                          >
+                            {learnerOverlay === 'angle'
+                              ? 'Show Original Learner Video'
+                              : 'Show Angle Overlay'}
+                          </button>
+                        </>
+                      )}
                     </div>
                   </TabsContent>
                 </Tabs>

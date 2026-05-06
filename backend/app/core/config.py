@@ -25,6 +25,9 @@ class Settings(BaseSettings):
     HAND_DETECTION_MIN_PRESENCE_CONFIDENCE: float = 0.5
     HAND_LANDMARKER_MODEL_PATH: Path = Path(__file__).resolve().parents[2] / "models" / "hand_landmarker.task"
 
+    # Angle pipeline outputs
+    ANGLES_OUTPUT_ROOT: Path = Path(__file__).resolve().parents[2] / "storage" / "outputs" / "angles"
+
     # YOLO + SAM2 scissors tracking
     ROBOFLOW_API_KEY: str | None = None
     ROBOFLOW_MODEL_ID: str = "scissors_ego_real/1"

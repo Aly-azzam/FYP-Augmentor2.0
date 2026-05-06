@@ -12,6 +12,7 @@ from app.api.routes import expert_mediapipe, expert_sam2, inspection, optical_fl
 from app.api import sam2_yolo
 from app.api.mediapipe import router as mediapipe_router
 from app.api.sam2 import router as sam2_router
+from app.api.routes.angle import router as angle_router
 from fastapi import Depends
 from app.models.user import User
 from app.models.course import Course
@@ -57,6 +58,7 @@ app.include_router(sam2_yolo.router)
 app.include_router(expert_mediapipe.router)
 app.include_router(expert_sam2.router)
 app.include_router(inspection.router)
+app.include_router(angle_router)
 app.mount("/storage", StaticFiles(directory=settings.STORAGE_ROOT), name="storage")
 
 

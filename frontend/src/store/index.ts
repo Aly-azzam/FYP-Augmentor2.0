@@ -37,7 +37,7 @@ interface VideoSyncState {
 }
 
 export const useVideoSyncStore = create<VideoSyncState>((set) => ({
-  isSynced: true,
+  isSynced: false,
   playbackRate: 1,
   isPlaying: false,
   currentTime: 0,
