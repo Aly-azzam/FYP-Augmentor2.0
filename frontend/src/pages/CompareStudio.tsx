@@ -64,6 +64,43 @@ const PIPELINE_STAGES = [
   'VLM Explanation',
 ];
 
+const EVAL_STEPS = [
+  'Uploading your video',
+  'Detecting scissors in your video',
+  'Tracking scissor path',
+  'Detecting trajectory errors',
+  'Analyzing cutting angles',
+  'Comparing angles to expert',
+  'Analysis complete',
+];
+
+const EVAL_HINTS = [
+  'Analyzing your cutting path frame by frame...',
+  'Comparing your trajectory to the expert...',
+  'Measuring your cutting angles...',
+  'Almost there...',
+];
+
+const SSE_STEP_INDEX: Record<string, number> = {
+  yolo: 1,
+  trajectory_init: 2,
+  trajectory_track: 2,
+  trajectory_errors: 3,
+  angle_init: 4,
+  angle_track: 5,
+  done: 6,
+};
+
+const SSE_PROGRESS: Record<string, number> = {
+  yolo: 20,
+  trajectory_init: 35,
+  trajectory_track: 50,
+  trajectory_errors: 60,
+  angle_init: 72,
+  angle_track: 86,
+  done: 100,
+};
+
 const DRAWING_TOOLS: {
   id: DrawingTool;
   label: string;
@@ -436,6 +473,17 @@ export default function CompareStudio() {
   const [learnerMuted, setLearnerMuted] = useState(false);
   const [apiEvaluationResult, setApiEvaluationResult] = useState<any | null>(null);
 
+  // ── Evaluate tab — new progress-UI state ─────────────────────────────────
+  type EvalPhase = 'idle' | 'uploading' | 'streaming' | 'done' | 'error';
+  const [evalPhase, setEvalPhase] = useState<EvalPhase>('idle');
+  const [evalStepIndex, setEvalStepIndex] = useState(0);
+  const [evalProgress, setEvalProgress] = useState(0);
+  const [evalHintIndex, setEvalHintIndex] = useState(0);
+  const [evalError, setEvalError] = useState<string | null>(null);
+  const [evalRunId, setEvalRunId] = useState<string | null>(null);
+  const [evalEvaluationId, setEvalEvaluationId] = useState<string | null>(null);
+  const evalEventSourceRef = useRef<EventSource | null>(null);
+
   // MediaPipe integration state.
   const [mediapipeRun, setMediapipeRun] = useState<MediaPipeRunResult | null>(null);
   const [isMediapipeProcessing, setIsMediapipeProcessing] = useState(false);
@@ -446,7 +494,12 @@ export default function CompareStudio() {
   // Learner overlay: show the raw uploaded video, the MediaPipe annotated
   // output, YOLO+SAM2 scissors overlay, or Optical Flow visualization.
   const [learnerOverlay, setLearnerOverlay] =
-    useState<'none' | 'mediapipe' | 'sam2' | 'optical_flow' | 'aligned_corridor' | 'angle'>('none');
+    useState<'none' | 'mediapipe' | 'sam2' | 'optical_flow' | 'aligned_corridor' | 'angle' | 'eval_corridor'>('none');
+
+  // Path Overlay (on-demand corridor overlay from evaluation run).
+  type PathOverlayState = 'disabled' | 'idle' | 'loading' | 'ready';
+  const [pathOverlayState, setPathOverlayState] = useState<PathOverlayState>('disabled');
+  const [evalCorridorOverlayUrl, setEvalCorridorOverlayUrl] = useState<string | null>(null);
 
   // YOLO+SAM2 learner scissors tracking state.
   const [sam2LearnerRun, setSam2LearnerRun] = useState<Sam2LearnerResult | null>(null);
@@ -519,6 +572,22 @@ export default function CompareStudio() {
   const hasSelectedExpertReference = Boolean(selectedClip || requestedClipId);
 
   // ── Effects ──────────────────────────────────────────────────────────────
+
+  // Rotate hint message while evaluation is streaming.
+  useEffect(() => {
+    if (evalPhase !== 'streaming') return;
+    const id = setInterval(() => {
+      setEvalHintIndex((prev) => (prev + 1) % EVAL_HINTS.length);
+    }, 4000);
+    return () => clearInterval(id);
+  }, [evalPhase]);
+
+  // Clean up any open SSE connection on unmount.
+  useEffect(() => {
+    return () => {
+      evalEventSourceRef.current?.close();
+    };
+  }, []);
 
   useEffect(() => {
     if (requestedCourseId && requestedCourseId !== selectedCourse) {
@@ -783,12 +852,21 @@ export default function CompareStudio() {
 
   const runEvaluation = useCallback(async () => {
     if (!selectedCourse || !selectedClip || !userVideo) return;
-    try {
-      setApiEvaluationResult(null);
-      startEvaluation();
-      setEvaluationStep(0);
-      setEvaluationProgress(20);
 
+    // Close any leftover SSE connection.
+    evalEventSourceRef.current?.close();
+    evalEventSourceRef.current = null;
+
+    setEvalPhase('uploading');
+    setEvalStepIndex(0);
+    setEvalProgress(8);
+    setEvalHintIndex(0);
+    setEvalError(null);
+    setEvalRunId(null);
+    setEvalEvaluationId(null);
+    setApiEvaluationResult(null);
+
+    try {
       const formData = new FormData();
       formData.append('file', userVideo);
       formData.append('course_id', selectedCourse);
@@ -798,7 +876,6 @@ export default function CompareStudio() {
       const started = await startEvaluationApi(formData);
 
       if (started?.status === 'out_of_context') {
-        resetEvaluation();
         setApiEvaluationResult({
           score: 0,
           status: 'out_of_context',
@@ -808,6 +885,7 @@ export default function CompareStudio() {
           explanation: null,
           key_error_moments: [],
         });
+        setEvalPhase('idle');
         toast.error('Video rejected: does not match the expert task');
         return;
       }
@@ -817,32 +895,67 @@ export default function CompareStudio() {
           ? started
           : started?.evaluation_id || started?.id;
 
-      if (!evaluationId) {
-        throw new Error('Missing evaluation_id from backend response');
-      }
+      if (!evaluationId) throw new Error('Missing evaluation_id from backend response');
 
-      setEvaluationStep(2);
-      setEvaluationProgress(70);
-      const result = await getEvaluationResult(evaluationId);
-      setEvaluationStep(4);
-      setEvaluationProgress(100);
-      setApiEvaluationResult(result);
-      resetEvaluation();
-      console.log('CompareStudio evaluation response:', result);
-      toast.success(`Evaluation complete! Score: ${result.score}/100`);
+      setEvalEvaluationId(evaluationId);
+      if (started?.run_id) setEvalRunId(started.run_id);
+
+      // Upload done — step 0 complete, step 1 running.
+      setEvalStepIndex(1);
+      setEvalProgress(14);
+      setEvalPhase('streaming');
+
+      const es = new EventSource(`/api/evaluations/${evaluationId}/status-stream`);
+      evalEventSourceRef.current = es;
+
+      es.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data as string) as {
+            step?: string;
+            progress?: number;
+            run_id?: string;
+          };
+
+          if (data.run_id) setEvalRunId(data.run_id);
+
+          const step = data.step ?? '';
+          const progress = data.progress ?? SSE_PROGRESS[step] ?? undefined;
+
+          if (step in SSE_STEP_INDEX) {
+            setEvalStepIndex(SSE_STEP_INDEX[step]);
+          }
+          if (progress !== undefined) {
+            setEvalProgress(progress);
+          }
+
+          if (step === 'done' || progress === 100) {
+            es.close();
+            evalEventSourceRef.current = null;
+            setEvalStepIndex(6);
+            setEvalProgress(100);
+            setEvalPhase('done');
+            setPathOverlayState('idle');
+          }
+        } catch {
+          // ignore malformed events
+        }
+      };
+
+      es.onerror = () => {
+        es.close();
+        evalEventSourceRef.current = null;
+        setEvalPhase('error');
+        setEvalError('Connection lost. Please try again.');
+      };
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Evaluation failed';
-      toast.error(message);
-      resetEvaluation();
+      setEvalError(message);
+      setEvalPhase('error');
     }
   }, [
     selectedCourse,
     selectedClip,
     userVideo,
-    startEvaluation,
-    setEvaluationStep,
-    setEvaluationProgress,
-    resetEvaluation,
   ]);
 
   // ── MediaPipe run ────────────────────────────────────────────────────────
@@ -1284,6 +1397,9 @@ export default function CompareStudio() {
     if (learnerOverlay === 'aligned_corridor' && corridorOverlayBaseUrl) {
       return corridorOverlayBaseUrl;
     }
+    if (learnerOverlay === 'eval_corridor' && evalCorridorOverlayUrl) {
+      return evalCorridorOverlayUrl;
+    }
     return userVideoUrl;
   })();
   const learnerVideoPixelWidth =
@@ -1518,6 +1634,53 @@ export default function CompareStudio() {
         <button className="btn btn-secondary" onClick={() => setOffset(0)}>
           Align Start
         </button>
+
+        {/* ── Path Overlay button ──────────────────────────────────────── */}
+        <button
+          className={`btn ${pathOverlayState === 'ready' ? 'btn-primary' : 'btn-secondary'}`}
+          title={pathOverlayState === 'disabled' ? 'Run evaluation first' : undefined}
+          disabled={pathOverlayState === 'disabled' || pathOverlayState === 'loading'}
+          style={pathOverlayState === 'disabled' ? { opacity: 0.4, cursor: 'not-allowed' } : undefined}
+          onClick={async () => {
+            if (pathOverlayState !== 'idle') return;
+            if (!evalEvaluationId || !evalRunId) return;
+            setPathOverlayState('loading');
+            console.log('[PATH OVERLAY] evaluation_id:', evalEvaluationId);
+            console.log('[PATH OVERLAY] run_id being sent:', evalRunId);
+            try {
+              const res = await fetch(
+                `/api/evaluations/${evalEvaluationId}/generate-corridor-overlay`,
+                {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ run_id: evalRunId }),
+                },
+              );
+              if (!res.ok) {
+                const err = await res.json().catch(() => ({}));
+                throw new Error((err as any).detail ?? `HTTP ${res.status}`);
+              }
+              const data = await res.json() as { status: string; overlay_video_url: string };
+              const fullUrl = data.overlay_video_url.startsWith('http')
+                ? data.overlay_video_url
+                : `http://localhost:8001${data.overlay_video_url}`;
+              setEvalCorridorOverlayUrl(fullUrl);
+              setPathOverlayState('ready');
+            } catch (err) {
+              setPathOverlayState('idle');
+              console.error('Path overlay generation failed:', err);
+            }
+          }}
+        >
+          {pathOverlayState === 'loading' ? (
+            <>
+              <Loader2 size={14} style={{ animation: 'spin 1s linear infinite' }} />
+              Generating...
+            </>
+          ) : (
+            'Path Overlay'
+          )}
+        </button>
       </motion.div>
 
       {/* ─── Main Grid: Expert | Learner | Sidebar ─────────────────────── */}
@@ -1639,10 +1802,11 @@ export default function CompareStudio() {
             </span>
             {userVideoUrl ? (
               <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)', flexWrap: 'wrap' }}>
-                {(mediapipeRun?.annotated_video_url ||
+                  {(mediapipeRun?.annotated_video_url ||
                   sam2OverlayBaseUrl ||
                   sam2LearnerRun?.annotated_video_url ||
                   corridorOverlayBaseUrl ||
+                  evalCorridorOverlayUrl ||
                   opticalFlowVisualizationUrl) && (
                   <div
                     role="tablist"
@@ -1701,6 +1865,19 @@ export default function CompareStudio() {
                       >
                         <Hand size={12} style={{ marginRight: 4 }} />
                         Aligned Expert Corridor
+                      </button>
+                    )}
+                    {evalCorridorOverlayUrl && (
+                      <button
+                        type="button"
+                        role="tab"
+                        aria-selected={learnerOverlay === 'eval_corridor'}
+                        className={`btn ${learnerOverlay === 'eval_corridor' ? 'btn-primary' : 'btn-ghost'}`}
+                        style={{ borderRadius: 0, fontSize: '0.75rem', padding: 'var(--space-xs) var(--space-sm)' }}
+                        onClick={() => setLearnerOverlay(learnerOverlay === 'eval_corridor' ? 'none' : 'eval_corridor')}
+                      >
+                        <Activity size={12} style={{ marginRight: 4 }} />
+                        Path Overlay
                       </button>
                     )}
                     {opticalFlowVisualizationUrl && (
@@ -1776,7 +1953,7 @@ export default function CompareStudio() {
                   key={learnerVideoSource ?? userVideoUrl}
                   ref={learnerVideoRef}
                   src={learnerVideoSource ?? undefined}
-                  controls={learnerOverlay === 'sam2' || learnerOverlay === 'optical_flow' || learnerOverlay === 'aligned_corridor'}
+                  controls={learnerOverlay === 'sam2' || learnerOverlay === 'optical_flow' || learnerOverlay === 'aligned_corridor' || learnerOverlay === 'eval_corridor'}
                   onClick={handleLearnerTipClick}
                   muted={learnerMuted}
                   playsInline
@@ -2229,8 +2406,9 @@ export default function CompareStudio() {
 
             {/* ── Tab: Evaluate ─────────────────────────────────────────── */}
             <TabsContent value="evaluate">
-              {/* Idle */}
-              {!isEvaluating && !apiEvaluationResult && (
+
+              {/* ── Idle: run button ─────────────────────────────────────── */}
+              {evalPhase === 'idle' && !apiEvaluationResult && (
                 <div
                   style={{
                     display: 'flex',
@@ -2240,14 +2418,8 @@ export default function CompareStudio() {
                     padding: 'var(--space-lg) 0',
                   }}
                 >
-                  <Sparkles
-                    size={48}
-                    style={{ color: 'var(--text-muted)' }}
-                  />
-                  <p
-                    className="text-body"
-                    style={{ textAlign: 'center' }}
-                  >
+                  <Sparkles size={48} style={{ color: 'var(--text-muted)' }} />
+                  <p className="text-body" style={{ textAlign: 'center' }}>
                     {userVideo
                       ? 'Ready to evaluate your practice!'
                       : 'Upload a practice video to get started.'}
@@ -2256,96 +2428,211 @@ export default function CompareStudio() {
                     className="btn btn-primary"
                     style={{ width: '100%' }}
                     disabled={!userVideo || !selectedClip}
-                    onClick={runEvaluation}
+                    onClick={() => void runEvaluation()}
                   >
                     Run Evaluation
                   </button>
                 </div>
               )}
 
-              {/* Evaluating */}
-              {isEvaluating && (
+              {/* ── Progress panel (uploading / streaming) ───────────────── */}
+              {(evalPhase === 'uploading' || evalPhase === 'streaming') && (
                 <div
                   style={{
                     display: 'flex',
                     flexDirection: 'column',
+                    gap: 'var(--space-md)',
+                    marginTop: 'var(--space-sm)',
+                  }}
+                >
+                  {/* Header */}
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)' }}>
+                    <Sparkles size={18} style={{ color: 'var(--accent-primary)' }} />
+                    <span className="text-small" style={{ fontWeight: 600 }}>
+                      Evaluating your practice
+                    </span>
+                  </div>
+
+                  {/* Vertical stepper */}
+                  <div
+                    style={{
+                      display: 'flex',
+                      flexDirection: 'column',
+                      gap: 6,
+                    }}
+                  >
+                    {EVAL_STEPS.map((label, i) => {
+                      const isDone    = i < evalStepIndex;
+                      const isRunning = i === evalStepIndex;
+                      const isWaiting = i > evalStepIndex;
+                      return (
+                        <div
+                          key={label}
+                          style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: 'var(--space-sm)',
+                            padding: '5px 0',
+                          }}
+                        >
+                          {/* Icon */}
+                          <span
+                            style={{
+                              width: 18,
+                              textAlign: 'center',
+                              fontSize: '0.8rem',
+                              flexShrink: 0,
+                              color: isDone
+                                ? 'var(--success, #22c55e)'
+                                : isRunning
+                                  ? 'var(--accent-primary)'
+                                  : 'var(--text-muted)',
+                            }}
+                          >
+                            {isDone ? '✓' : isRunning ? (
+                              <Loader2
+                                size={13}
+                                style={{ animation: 'spin 1s linear infinite', display: 'inline-block' }}
+                              />
+                            ) : '○'}
+                          </span>
+
+                          {/* Label */}
+                          <span
+                            className="text-small"
+                            style={{
+                              color: isDone
+                                ? 'var(--text-secondary)'
+                                : isRunning
+                                  ? 'var(--text-primary)'
+                                  : 'var(--text-muted)',
+                              fontWeight: isRunning ? 600 : 400,
+                              opacity: isWaiting ? 0.5 : 1,
+                            }}
+                          >
+                            {label}
+                          </span>
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  {/* Progress bar */}
+                  <Progress value={evalProgress} />
+
+                  {/* Rotating hint */}
+                  <p
+                    className="text-small"
+                    style={{
+                      color: 'var(--text-muted)',
+                      textAlign: 'center',
+                      margin: 0,
+                      minHeight: '1.2em',
+                    }}
+                  >
+                    {EVAL_HINTS[evalHintIndex]}
+                  </p>
+                </div>
+              )}
+
+              {/* ── Done: review button ───────────────────────────────────── */}
+              {evalPhase === 'done' && (
+                <div
+                  style={{
+                    display: 'flex',
+                    flexDirection: 'column',
+                    alignItems: 'center',
+                    gap: 'var(--space-lg)',
+                    padding: 'var(--space-lg) 0',
+                  }}
+                >
+                  <Sparkles size={40} style={{ color: 'var(--accent-primary)' }} />
+                  <p className="text-body" style={{ textAlign: 'center', fontWeight: 600 }}>
+                    Analysis complete!
+                  </p>
+                  <button
+                    className="btn btn-primary"
+                    style={{
+                      width: '100%',
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      gap: 'var(--space-xs)',
+                    }}
+                    onClick={() => {
+                      // Show learner video in the left panel using blob URL already in state.
+                      if (userVideoUrl) {
+                        setUserVideoUrl(userVideoUrl);
+                      }
+                    }}
+                  >
+                    Review Your Results →
+                  </button>
+                  <button
+                    className="btn btn-secondary"
+                    style={{ width: '100%' }}
+                    onClick={() => {
+                      setEvalPhase('idle');
+                      setEvalStepIndex(0);
+                      setEvalProgress(0);
+                      setEvalError(null);
+                    }}
+                  >
+                    <RotateCcw size={14} />
+                    Run Again
+                  </button>
+                </div>
+              )}
+
+              {/* ── Error ────────────────────────────────────────────────── */}
+              {evalPhase === 'error' && (
+                <div
+                  style={{
+                    display: 'flex',
+                    flexDirection: 'column',
+                    alignItems: 'center',
                     gap: 'var(--space-md)',
                     padding: 'var(--space-lg) 0',
                   }}
                 >
                   <div
                     style={{
+                      width: 56,
+                      height: 56,
+                      borderRadius: '50%',
+                      border: '3px solid #ef4444',
                       display: 'flex',
-                      flexDirection: 'column',
-                      gap: 'var(--space-sm)',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      boxShadow: '0 0 16px #ef444430',
                     }}
                   >
-                    {PIPELINE_STAGES.map((stage, i) => (
-                      <div
-                        key={stage}
-                        style={{
-                          display: 'flex',
-                          alignItems: 'center',
-                          gap: 'var(--space-sm)',
-                        }}
-                      >
-                        <div
-                          style={{
-                            width: 8,
-                            height: 8,
-                            borderRadius: '50%',
-                            background:
-                              i < evaluationStep
-                                ? 'var(--success)'
-                                : i === evaluationStep
-                                  ? 'var(--accent-primary)'
-                                  : 'var(--bg-tertiary)',
-                            transition: 'background var(--transition-fast)',
-                          }}
-                        />
-                        <span
-                          className="text-small"
-                          style={{
-                            color:
-                              i <= evaluationStep
-                                ? 'var(--text-primary)'
-                                : 'var(--text-muted)',
-                            fontWeight: i === evaluationStep ? 600 : 400,
-                          }}
-                        >
-                          {stage}
-                        </span>
-                        {i < evaluationStep && (
-                          <span
-                            style={{
-                              color: 'var(--success)',
-                              fontSize: '0.75rem',
-                              marginLeft: 'auto',
-                            }}
-                          >
-                            ✓
-                          </span>
-                        )}
-                      </div>
-                    ))}
+                    <span style={{ fontSize: '1.5rem', lineHeight: 1 }}>!</span>
                   </div>
-
-                  <Progress value={evaluationProgress} />
-
                   <p
                     className="text-small"
-                    style={{
-                      color: 'var(--text-muted)',
-                      textAlign: 'center',
+                    style={{ textAlign: 'center', color: 'var(--text-secondary)', maxWidth: 280 }}
+                  >
+                    {evalError ?? 'Something went wrong. Please try again.'}
+                  </p>
+                  <button
+                    className="btn btn-secondary"
+                    style={{ width: '100%' }}
+                    onClick={() => {
+                      setEvalPhase('idle');
+                      setEvalStepIndex(0);
+                      setEvalProgress(0);
+                      setEvalError(null);
                     }}
                   >
-                    Processing... Step {evaluationStep + 1} of {PIPELINE_STAGES.length}
-                  </p>
+                    <RotateCcw size={14} />
+                    Try Again
+                  </button>
                 </div>
               )}
 
-              {/* Out of context rejection */}
-              {apiEvaluationResult?.status === 'out_of_context' && !isEvaluating && (
+              {/* ── Out-of-context rejection (existing flow) ─────────────── */}
+              {evalPhase === 'idle' && apiEvaluationResult?.status === 'out_of_context' && (
                 <div
                   style={{
                     display: 'flex',
@@ -2369,10 +2656,7 @@ export default function CompareStudio() {
                   >
                     <span style={{ fontSize: '2rem' }}>0</span>
                   </div>
-                  <p
-                    className="heading-4"
-                    style={{ textAlign: 'center', color: '#ef4444' }}
-                  >
+                  <p className="heading-4" style={{ textAlign: 'center', color: '#ef4444' }}>
                     Out of Context
                   </p>
                   <p
@@ -2399,141 +2683,6 @@ export default function CompareStudio() {
                 </div>
               )}
 
-              {/* Complete */}
-              {apiEvaluationResult && apiEvaluationResult.status !== 'out_of_context' && !isEvaluating && (
-                <div
-                  style={{
-                    display: 'flex',
-                    flexDirection: 'column',
-                    gap: 'var(--space-md)',
-                    padding: 'var(--space-md) 0',
-                  }}
-                >
-                  {/* Score circle */}
-                  <div className="flex-center">
-                    <div
-                      style={{
-                        width: 100,
-                        height: 100,
-                        borderRadius: '50%',
-                        border: `4px solid ${scoreColor(apiEvaluationResult.score)}`,
-                        display: 'flex',
-                        flexDirection: 'column',
-                        alignItems: 'center',
-                        justifyContent: 'center',
-                        boxShadow: `0 0 20px ${scoreColor(apiEvaluationResult.score)}40`,
-                      }}
-                    >
-                      <span
-                        style={{
-                          fontSize: '2rem',
-                          fontWeight: 700,
-                          color: scoreColor(apiEvaluationResult.score),
-                        }}
-                      >
-                        {apiEvaluationResult.score}
-                      </span>
-                      <span className="label">{scoreLabel(apiEvaluationResult.score)}</span>
-                    </div>
-                  </div>
-
-                  {/* Metric cards */}
-                  <div
-                    style={{
-                      display: 'grid',
-                      gridTemplateColumns: '1fr 1fr',
-                      gap: 'var(--space-sm)',
-                    }}
-                  >
-                    {(
-                      [
-                        {
-                          label: 'Angle Dev.',
-                          value: apiEvaluationResult.metrics?.angle_deviation,
-                          unit: '',
-                        },
-                        {
-                          label: 'Trajectory',
-                          value: apiEvaluationResult.metrics?.trajectory_deviation,
-                          unit: '',
-                        },
-                        {
-                          label: 'Velocity',
-                          value: apiEvaluationResult.metrics?.velocity_difference,
-                          unit: '',
-                        },
-                        {
-                          label: 'Tool Align.',
-                          value: apiEvaluationResult.metrics?.tool_alignment_deviation,
-                          unit: '',
-                        },
-                      ] as const
-                    ).map((m) => (
-                      <div
-                        key={m.label}
-                        className="stat-card"
-                        style={{ padding: 'var(--space-sm)' }}
-                      >
-                        <div
-                          className="stat-value"
-                          style={{ fontSize: '1.25rem' }}
-                        >
-                          {typeof m.value === 'number' ? m.value : 0}
-                          {m.unit}
-                        </div>
-                        <div
-                          className="stat-label"
-                          style={{ fontSize: '0.7rem' }}
-                        >
-                          {m.label}
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-
-                  {/* AI explanation */}
-                  <div
-                    style={{
-                      background: 'var(--bg-tertiary)',
-                      borderRadius: 'var(--radius-md)',
-                      padding: 'var(--space-md)',
-                    }}
-                  >
-                    <p
-                      className="text-small"
-                      style={{ color: 'var(--text-secondary)' }}
-                    >
-                      {apiEvaluationResult.explanation?.explanation ?? ''}
-                    </p>
-                    {Array.isArray(apiEvaluationResult.key_error_moments) &&
-                      apiEvaluationResult.key_error_moments.length > 0 && (
-                        <div style={{ marginTop: 'var(--space-sm)' }}>
-                          {apiEvaluationResult.key_error_moments.map((error: any, index: number) => (
-                            <p
-                              key={`${error.error_type ?? 'error'}-${index}`}
-                              className="text-small"
-                              style={{ color: 'var(--text-secondary)' }}
-                            >
-                              - {error.semantic_label || error.label}
-                            </p>
-                          ))}
-                        </div>
-                      )}
-                  </div>
-
-                  <button
-                    className="btn btn-secondary"
-                    style={{ width: '100%' }}
-                    onClick={() => {
-                      resetEvaluation();
-                      setApiEvaluationResult(null);
-                    }}
-                  >
-                    <RotateCcw size={14} />
-                    Run Again
-                  </button>
-                </div>
-              )}
             </TabsContent>
 
             {/* ── Tab: MediaPipe ───────────────────────────────────────── */}

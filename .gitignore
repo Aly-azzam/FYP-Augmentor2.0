@@ -91,3 +91,6 @@ backend/runs/
 !backend/models/
 !backend/models/yolo/
 !backend/models/yolo/best.pt
+
+backend/storage/evaluation/
+backend/storage/uploads/compare_tmp/

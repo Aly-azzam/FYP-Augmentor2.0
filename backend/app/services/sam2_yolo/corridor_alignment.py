@@ -19,6 +19,8 @@ from urllib.parse import quote
 import cv2
 import numpy as np
 
+from app.services.sam2_yolo.visualization import _convert_to_web_mp4
+
 logger = logging.getLogger(__name__)
 
 BACKEND_ROOT = Path(__file__).resolve().parents[3]
@@ -64,6 +66,7 @@ def align_corridor_blade_tip_with_extension(
     output_dir: str,
     expert_code: str,
     learner_video_path: str | None = None,
+    generate_overlay_video: bool = True,
 ) -> dict[str, Any]:
     """Align pre-built expert corridor via blade-tip translation + safe axis extension.
 
@@ -284,28 +287,31 @@ def align_corridor_blade_tip_with_extension(
 
     # ── Overlay video ──────────────────────────────────────────────────────
     overlay_path = out_dir / ALIGNED_CORRIDOR_OVERLAY_FILENAME
-    _render_blade_tip_overlay(
-        learner_video_path=learner_video_path,
-        aligned_centerline=adapted_cl,
-        aligned_polygon=adapted_polygon,
-        aligned_left_edge=adapted_left,
-        aligned_right_edge=adapted_right,
-        learner_points=learner_points,
-        frame_checks=frame_checks,
-        learner_anchor=learner_anchor,
-        output_path=overlay_path,
-    )
+    if generate_overlay_video:
+        _render_blade_tip_overlay(
+            learner_video_path=learner_video_path,
+            aligned_centerline=adapted_cl,
+            aligned_polygon=adapted_polygon,
+            aligned_left_edge=adapted_left,
+            aligned_right_edge=adapted_right,
+            learner_points=learner_points,
+            frame_checks=frame_checks,
+            learner_anchor=learner_anchor,
+            output_path=overlay_path,
+        )
+        print(f"[corridor_alignment] Overlay video: {overlay_path}", flush=True)
+    else:
+        print("[corridor_alignment] Overlay video skipped (generate_overlay_video=False)", flush=True)
 
     print(f"[corridor_alignment] Aligned corridor JSON: {aligned_json_path}", flush=True)
     print(f"[corridor_alignment] Preview image: {preview_path}", flush=True)
-    print(f"[corridor_alignment] Overlay video: {overlay_path}", flush=True)
 
     return {
         "aligned_corridor_json_path": str(aligned_json_path),
         "aligned_corridor_preview_path": str(preview_path),
         "aligned_corridor_preview_url": _storage_url_for(preview_path),
-        "aligned_corridor_overlay_video_path": str(overlay_path),
-        "aligned_corridor_overlay_video_url": _storage_url_for(overlay_path),
+        "aligned_corridor_overlay_video_path": str(overlay_path) if generate_overlay_video else None,
+        "aligned_corridor_overlay_video_url": _storage_url_for(overlay_path) if generate_overlay_video else None,
     }
 
 
@@ -959,8 +965,10 @@ def _render_blade_tip_overlay(
         h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
 
+    _tmp_path = output_path.with_suffix(".tmp.mp4")
+    _web_tmp_path = output_path.with_suffix(".web.tmp.mp4")
     writer = cv2.VideoWriter(
-        str(output_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h)
+        str(_tmp_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h)
     )
 
     def _draw(frame: np.ndarray) -> None:
@@ -1004,6 +1012,13 @@ def _render_blade_tip_overlay(
                 writer.write(frame)
     finally:
         writer.release()
+    if output_path.exists():
+        output_path.unlink()
+    if _convert_to_web_mp4(_tmp_path, _web_tmp_path):
+        _tmp_path.unlink(missing_ok=True)
+        _web_tmp_path.replace(output_path)
+    else:
+        _tmp_path.replace(output_path)
 
 
 # ── Archive: expert-axis-preserving alignment (kept for reference) ────────────
@@ -1613,8 +1628,10 @@ def _render_expert_axis_overlay(
         h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
 
+    _tmp_path = output_path.with_suffix(".tmp.mp4")
+    _web_tmp_path = output_path.with_suffix(".web.tmp.mp4")
     writer = cv2.VideoWriter(
-        str(output_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h)
+        str(_tmp_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h)
     )
 
     def _draw(frame: np.ndarray) -> None:
@@ -1640,6 +1657,13 @@ def _render_expert_axis_overlay(
                 writer.write(frame)
     finally:
         writer.release()
+    if output_path.exists():
+        output_path.unlink()
+    if _convert_to_web_mp4(_tmp_path, _web_tmp_path):
+        _tmp_path.unlink(missing_ok=True)
+        _web_tmp_path.replace(output_path)
+    else:
+        _tmp_path.replace(output_path)
 
 
 # ── Archive: translation-only (kept for reference, not the default) ──────────
@@ -2124,8 +2148,10 @@ def _render_translation_overlay(
         h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
 
+    _tmp_path = output_path.with_suffix(".tmp.mp4")
+    _web_tmp_path = output_path.with_suffix(".web.tmp.mp4")
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(str(output_path), fourcc, fps, (w, h))
+    writer = cv2.VideoWriter(str(_tmp_path), fourcc, fps, (w, h))
 
     def _draw(frame: np.ndarray) -> None:
         _draw_translation_corridor(
@@ -2150,6 +2176,13 @@ def _render_translation_overlay(
                 writer.write(frame)
     finally:
         writer.release()
+    if output_path.exists():
+        output_path.unlink()
+    if _convert_to_web_mp4(_tmp_path, _web_tmp_path):
+        _tmp_path.unlink(missing_ok=True)
+        _web_tmp_path.replace(output_path)
+    else:
+        _tmp_path.replace(output_path)
 
 
 # ── Archive: frame-0 bbox anchor + scale (kept, not used by default) ─────────
@@ -2933,8 +2966,10 @@ def _render_frame0_overlay_video(
         h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
 
+    _tmp_path = output_path.with_suffix(".tmp.mp4")
+    _web_tmp_path = output_path.with_suffix(".web.tmp.mp4")
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(str(output_path), fourcc, fps, (w, h))
+    writer = cv2.VideoWriter(str(_tmp_path), fourcc, fps, (w, h))
 
     try:
         if cap is not None:
@@ -2971,6 +3006,13 @@ def _render_frame0_overlay_video(
                 writer.write(frame)
     finally:
         writer.release()
+    if output_path.exists():
+        output_path.unlink()
+    if _convert_to_web_mp4(_tmp_path, _web_tmp_path):
+        _tmp_path.unlink(missing_ok=True)
+        _web_tmp_path.replace(output_path)
+    else:
+        _tmp_path.replace(output_path)
 
 
 def _render_overlay_video(
@@ -2998,8 +3040,10 @@ def _render_overlay_video(
         h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
 
+    _tmp_path = output_path.with_suffix(".tmp.mp4")
+    _web_tmp_path = output_path.with_suffix(".web.tmp.mp4")
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(str(output_path), fourcc, fps, (w, h))
+    writer = cv2.VideoWriter(str(_tmp_path), fourcc, fps, (w, h))
 
     try:
         if cap is not None:
@@ -3035,6 +3079,13 @@ def _render_overlay_video(
                 writer.write(frame)
     finally:
         writer.release()
+    if output_path.exists():
+        output_path.unlink()
+    if _convert_to_web_mp4(_tmp_path, _web_tmp_path):
+        _tmp_path.unlink(missing_ok=True)
+        _web_tmp_path.replace(output_path)
+    else:
+        _tmp_path.replace(output_path)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
