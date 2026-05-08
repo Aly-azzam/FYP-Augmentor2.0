@@ -41,8 +41,9 @@ PROGRESS_STEPS: dict[str, dict] = {
     "trajectory_init":   {"step": "trajectory_init",   "label": "Initializing trajectory tracking", "progress": 25},
     "trajectory_track":  {"step": "trajectory_track",  "label": "Tracking scissor path",            "progress": 40},
     "trajectory_errors": {"step": "trajectory_errors", "label": "Detecting trajectory errors",      "progress": 55},
-    "angle_init":        {"step": "angle_init",        "label": "Analyzing cutting angles",         "progress": 70},
-    "angle_track":       {"step": "angle_track",       "label": "Comparing angles to expert",       "progress": 85},
+    "angle_init":        {"step": "angle_init",        "label": "Analyzing cutting angles",         "progress": 68},
+    "angle_track":       {"step": "angle_track",       "label": "Comparing angles to expert",       "progress": 82},
+    "angle_errors":      {"step": "angle_errors",      "label": "Detecting angle errors",           "progress": 92},
     "done":              {"step": "done",               "label": "Analysis complete",                "progress": 100},
 }
 
@@ -203,6 +204,20 @@ async def stream_evaluation_status(evaluation_id: str):
             "Connection": "keep-alive",
         },
     )
+
+
+# ── Unified errors ────────────────────────────────────────────────────────────
+
+@router.get("/{evaluation_id}/errors")
+async def get_unified_errors(evaluation_id: str, run_id: str):
+    """Return the merged trajectory + angle error list for a completed run."""
+    errors_path = (
+        Path(settings.STORAGE_ROOT) / "evaluation" / run_id / "score" / "unified_errors.json"
+    )
+    if not errors_path.exists():
+        raise HTTPException(status_code=404, detail="Unified errors not found for this run.")
+    with open(errors_path) as fh:
+        return json.load(fh)
 
 
 # ── Remaining read-only DB endpoints (untouched) ──────────────────────────────

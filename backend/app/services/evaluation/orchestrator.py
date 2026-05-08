@@ -165,6 +165,30 @@ def run_evaluation_pipeline(
     #   learner_comparison_output.mp4
 
     emit_progress("angle_track")
+
+    emit_progress("angle_errors")
+    from app.services.angle.angle_errors import detect_angle_errors  # noqa: PLC0415
+
+    t0 = time.time()
+    angle_errors_result = detect_angle_errors(
+        dtw_alignment_path=str(Path(dirs["angle"]) / "dtw_alignment.json"),
+        aligned_corridor_path=str(Path(dirs["trajectory"]) / "aligned_corridor.json"),
+        output_dir=dirs["angle"],
+    )
+    print(f"[TIMING] Angle errors: {time.time() - t0:.1f}s")
+    # saves: angle/angle_errors.json
+
+    from app.services.evaluation.merge_errors import merge_errors  # noqa: PLC0415
+
+    t0 = time.time()
+    unified = merge_errors(
+        trajectory_errors_path=f"{dirs['trajectory']}/trajectory_errors.json",
+        angle_errors_path=f"{dirs['angle']}/angle_errors.json",
+        output_dir=dirs["score"],
+    )
+    print(f"[TIMING] Merge errors: {time.time() - t0:.1f}s")
+    # saves: score/unified_errors.json
+
     emit_progress("done")
 
     print("[EVALUATE] Step 3/3 — Angle + DTW pipeline complete")
@@ -174,9 +198,11 @@ def run_evaluation_pipeline(
     return {
         "run_id": run_id,
         "dirs": dirs,
-        "yolo_detections_path": f"{dirs['root']}/yolo_detections.json",
+        "yolo_detections_path":   f"{dirs['root']}/yolo_detections.json",
         "trajectory_errors_path": f"{dirs['trajectory']}/trajectory_errors.json",
-        "dtw_alignment_path": f"{dirs['angle']}/dtw_alignment.json",
+        "dtw_alignment_path":     f"{dirs['angle']}/dtw_alignment.json",
+        "angle_errors_path":      f"{dirs['angle']}/angle_errors.json",
+        "unified_errors_path":    f"{dirs['score']}/unified_errors.json",
         "sam2_result": {
             "status": sam2_result.get("status"),
             "raw_json_path": raw_json_path,
