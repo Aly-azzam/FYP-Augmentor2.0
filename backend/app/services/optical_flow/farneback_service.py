@@ -9,9 +9,13 @@ import cv2
 import numpy as np
 
 from .feature_extractor import extract_frame_flow_features
-from .raft_flow_service import _check_raft_available, compute_raft_flow
+from .raft_flow_service import _check_raft_available, compute_raft_flow, compute_raft_flow_batch
 from .schemas import FrameFlowFeatures, VideoMetadata
 
+
+# Number of frame pairs accumulated before a single batched RAFT forward pass.
+# Increase for higher GPU utilisation; decrease if you run out of VRAM.
+_RAFT_BATCH_SIZE: int = 8
 
 ROISource = Literal["none", "mediapipe_hand", "yolo_scissors", "yolo_scissors_expanded"]
 
@@ -218,7 +222,12 @@ def compute_video_optical_flow_features(
     config: FarnebackConfig | None = None,
 ) -> tuple[VideoMetadata, List[FrameFlowFeatures]]:
     """
-    Compute frame-by-frame Farneback optical flow summary features for one video.
+    Compute frame-by-frame optical flow summary features for one video.
+
+    When RAFT is available, frame pairs are accumulated into batches of
+    ``_RAFT_BATCH_SIZE`` and dispatched to the GPU in a single forward pass,
+    significantly reducing per-frame kernel-launch overhead.  Farneback is
+    used as a per-frame fallback when RAFT is unavailable or a batch fails.
 
     Returns:
         (video_metadata, frame_features)
@@ -253,10 +262,12 @@ def compute_video_optical_flow_features(
                 or DEFAULT_LOCAL_YOLO_SCISSORS_MODEL_PATH
             ),
         )
+        _yolo_t0 = time.perf_counter()
         yolo_detections = collect_yolo_scissors_detections_for_video(
             video_path=path,
             config=yolo_config,
         )
+        print(f"[OF] yolo_prepass_sec={time.perf_counter() - _yolo_t0:.2f}", flush=True)
 
     cap = cv2.VideoCapture(str(path))
     if not cap.isOpened():
@@ -289,7 +300,7 @@ def compute_video_optical_flow_features(
     extraction_start = time.perf_counter()
 
     if active_roi_source == "mediapipe_hand":
-        from .hand_roi import HandROIDetector
+        from .hand_roi import HandROIDetector  # noqa: PLC0415
 
         effective_roi_padding_px = max(
             int(config.roi_padding_px),
@@ -303,6 +314,108 @@ def compute_video_optical_flow_features(
             lock_max_center_distance_ratio=config.roi_lock_max_center_distance_ratio,
             lock_strict=config.roi_lock_strict,
         )
+
+    # ── Batch-flush helper ────────────────────────────────────────────────────
+    def _flush(pending: list[dict]) -> None:
+        """Compute flows for all pending items (one batched RAFT call) and
+        extract features.  Updates the outer-scope counters via nonlocal."""
+        nonlocal processed_count, yolo_roi_frames
+
+        if not pending:
+            return
+
+        pairs = [(item["prev_input"], item["curr_input"]) for item in pending]
+
+        if _check_raft_available():
+            try:
+                flows = compute_raft_flow_batch(pairs)
+            except Exception as exc:  # noqa: BLE001
+                print(
+                    f"[OF] RAFT batch failed ({exc}), retrying per-frame with Farneback",
+                    flush=True,
+                )
+                flows = [_compute_flow(p, c, config) for p, c in pairs]
+        else:
+            flows = [_compute_flow(p, c, config) for p, c in pairs]
+
+        for item, raw_flow in zip(pending, flows):
+            roi = item["roi"]
+            fi = item["frame_index"]
+            yolo_debug = item["yolo_debug"]
+
+            if roi is not None:
+                h_full, w_full = item["curr_gray_shape"]
+                full_flow = embed_roi_flow_in_canvas(
+                    roi_flow=raw_flow, roi=roi, height=h_full, width=w_full
+                )
+                feature_flow = (
+                    raw_flow
+                    if active_roi_source == "yolo_scissors_expanded"
+                    else full_flow
+                )
+            else:
+                feature_flow = raw_flow
+
+            features = extract_frame_flow_features(
+                flow=feature_flow,
+                frame_index=fi,
+                timestamp_sec=item["timestamp_sec"],
+                motion_threshold=config.motion_threshold,
+                roi_used=item["roi_used"],
+                roi_source=item["frame_roi_source"],  # type: ignore[arg-type]
+                roi_found=roi is not None,
+                original_scissors_bbox=item["original_scissors_bbox"],
+                yolo_scissors_bbox=item["yolo_scissors_bbox"],
+                expanded_roi_bbox=item["expanded_roi_bbox"],
+                expanded_optical_flow_roi=item["expanded_optical_flow_roi"],
+                expanded_roi_bbox_raw=item["expanded_roi_bbox_raw"],
+                expanded_roi_bbox_smoothed=item["expanded_roi_bbox_smoothed"],
+                detection_confidence=item["detection_confidence"],
+                roi_reused_from_previous=item["roi_reused_from_previous"],
+                fallback_used=item["fallback_used"],
+                fallback_reason=item["fallback_reason"],
+                roi_area_ratio=item["roi_area_ratio"],
+            )
+            features.vibration_delta = (
+                round(abs(features.mean_magnitude - frame_features[-1].mean_magnitude), 6)
+                if frame_features
+                else 0.0
+            )
+            frame_features.append(features)
+
+            # Per-frame YOLO-OF log
+            if yolo_debug is not None:
+                yolo_detected = bool(yolo_debug.get("yolo_detected", False))
+                print(
+                    "[YOLO-OF] "
+                    f"Frame {fi}/{metadata.frame_count} | "
+                    f"roi_source={item['frame_roi_source']} | "
+                    f"detected={yolo_detected} | "
+                    f"conf={item['detection_confidence']} | "
+                    f"bbox={item['original_scissors_bbox']} | "
+                    f"roi={item['expanded_optical_flow_roi']} | "
+                    f"mean_mag={features.mean_magnitude:.6f}",
+                    flush=True,
+                )
+
+            if item["uses_yolo_roi"]:
+                yolo_roi_frames += 1
+
+            processed_count += 1
+            if processed_count % 25 == 0:
+                elapsed = time.perf_counter() - extraction_start
+                speed = processed_count / max(elapsed, 1e-6)
+                print(
+                    f"[OF] processed frame {fi}/{metadata.frame_count} | "
+                    f"processed={processed_count} | "
+                    f"yolo_roi_frames={yolo_roi_frames} | "
+                    f"elapsed={elapsed:.1f}s | "
+                    f"speed={speed:.2f} fps",
+                    flush=True,
+                )
+
+    # ── Main extraction loop ──────────────────────────────────────────────────
+    pending: list[dict] = []
 
     print("[OF] feature extraction started", flush=True)
     try:
@@ -320,11 +433,13 @@ def compute_video_optical_flow_features(
 
             prev_for_flow = _blur_gray_for_flow(prev_gray, config.gaussian_blur_kernel)
             curr_for_flow = _blur_gray_for_flow(curr_gray, config.gaussian_blur_kernel)
-            roi_used = False
+
             roi = None
             yolo_debug: dict | None = None
+            uses_yolo_roi = False
+
             if active_roi_source == "yolo_scissors_expanded" and yolo_detections is not None:
-                yolo_roi_frames += 1
+                uses_yolo_roi = True
                 yolo_detection = yolo_detections.get(frame_index)
                 if (
                     yolo_detection is not None
@@ -333,7 +448,7 @@ def compute_video_optical_flow_features(
                     and yolo_detection.expanded_roi is not None
                 ):
                     held_yolo_detection = yolo_detection
-                    roi = tuple(int(value) for value in yolo_detection.expanded_roi)
+                    roi = tuple(int(v) for v in yolo_detection.expanded_roi)
                     yolo_debug = {
                         "original_scissors_bbox": yolo_detection.bbox,
                         "expanded_roi_bbox": yolo_detection.expanded_roi,
@@ -347,8 +462,11 @@ def compute_video_optical_flow_features(
                         "detection_class_name": yolo_detection.class_name,
                         "yolo_detected": True,
                     }
-                elif held_yolo_detection is not None and held_yolo_detection.expanded_roi is not None:
-                    roi = tuple(int(value) for value in held_yolo_detection.expanded_roi)
+                elif (
+                    held_yolo_detection is not None
+                    and held_yolo_detection.expanded_roi is not None
+                ):
+                    roi = tuple(int(v) for v in held_yolo_detection.expanded_roi)
                     yolo_debug = {
                         "original_scissors_bbox": None,
                         "expanded_roi_bbox": held_yolo_detection.expanded_roi,
@@ -363,8 +481,8 @@ def compute_video_optical_flow_features(
                         "yolo_detected": False,
                     }
                 else:
-                    height, width = curr_gray.shape[:2]
-                    roi = (0, 0, int(width), int(height))
+                    h_fb, w_fb = curr_gray.shape[:2]
+                    roi = (0, 0, int(w_fb), int(h_fb))
                     yolo_debug = {
                         "original_scissors_bbox": None,
                         "expanded_roi_bbox": list(roi),
@@ -381,26 +499,20 @@ def compute_video_optical_flow_features(
             elif roi_detector is not None:
                 roi = roi_detector.detect(curr_frame)
 
+            # Determine the actual inputs passed to the flow model
             if roi is not None:
-                roi_prev = crop_to_roi(prev_for_flow, roi)
-                roi_curr = crop_to_roi(curr_for_flow, roi)
-                roi_flow = _compute_flow(roi_prev, roi_curr, config)
-                height, width = curr_gray.shape[:2]
-                flow = embed_roi_flow_in_canvas(
-                    roi_flow=roi_flow,
-                    roi=roi,
-                    height=height,
-                    width=width,
-                )
+                prev_input = crop_to_roi(prev_for_flow, roi)
+                curr_input = crop_to_roi(curr_for_flow, roi)
                 roi_used = True
-                feature_flow = roi_flow if active_roi_source == "yolo_scissors_expanded" else flow
             else:
-                flow = _compute_flow(prev_for_flow, curr_for_flow, config)
-                feature_flow = flow
+                prev_input = prev_for_flow
+                curr_input = curr_for_flow
+                roi_used = False
 
+            # Resolve per-frame metadata (mirrors original extraction block)
             timestamp_sec = frame_index / fps
             fallback_used = bool(active_roi_source != "none" and roi is None)
-            fallback_reason = "roi_not_found" if fallback_used else None
+            fallback_reason: str | None = "roi_not_found" if fallback_used else None
             original_scissors_bbox = None
             yolo_scissors_bbox = None
             expanded_roi_bbox = list(roi) if roi is not None else None
@@ -410,15 +522,14 @@ def compute_video_optical_flow_features(
             detection_confidence = None
             roi_reused_from_previous = False
             frame_roi_source = active_roi_source if roi is not None else "none"
+
             if yolo_debug is not None:
                 original_scissors_bbox = yolo_debug.get("original_scissors_bbox")
                 yolo_scissors_bbox = original_scissors_bbox
                 expanded_roi_bbox = yolo_debug.get("expanded_roi_bbox")
                 expanded_optical_flow_roi = expanded_roi_bbox
                 expanded_roi_bbox_raw = yolo_debug.get("expanded_roi_bbox_raw")
-                expanded_roi_bbox_smoothed = yolo_debug.get(
-                    "expanded_roi_bbox_smoothed"
-                )
+                expanded_roi_bbox_smoothed = yolo_debug.get("expanded_roi_bbox_smoothed")
                 detection_confidence = yolo_debug.get("detection_confidence")
                 frame_roi_source = str(yolo_debug.get("roi_source") or frame_roi_source)
                 roi_reused_from_previous = bool(
@@ -436,70 +547,42 @@ def compute_video_optical_flow_features(
                         f"[OF] YOLO failed frame={frame_index} reason={fallback_reason}",
                         flush=True,
                     )
-                elif yolo_roi_frames % 25 == 0:
-                    print(
-                        "[OF] YOLO detected scissors "
-                        f"frame={frame_index} conf={detection_confidence}",
-                        flush=True,
-                    )
 
-            features = extract_frame_flow_features(
-                flow=feature_flow,
-                frame_index=frame_index,
-                timestamp_sec=timestamp_sec,
-                motion_threshold=config.motion_threshold,
-                roi_used=roi_used,
-                roi_source=frame_roi_source,  # type: ignore[arg-type]
-                roi_found=roi is not None,
-                original_scissors_bbox=original_scissors_bbox,
-                yolo_scissors_bbox=yolo_scissors_bbox,
-                expanded_roi_bbox=expanded_roi_bbox,
-                expanded_optical_flow_roi=expanded_optical_flow_roi,
-                expanded_roi_bbox_raw=expanded_roi_bbox_raw,
-                expanded_roi_bbox_smoothed=expanded_roi_bbox_smoothed,
-                detection_confidence=detection_confidence,
-                roi_reused_from_previous=roi_reused_from_previous,
-                fallback_used=fallback_used,
-                fallback_reason=fallback_reason,
-                roi_area_ratio=_roi_area_ratio(roi, curr_gray.shape),
-            )
-            if frame_features:
-                features.vibration_delta = round(
-                    abs(features.mean_magnitude - frame_features[-1].mean_magnitude),
-                    6,
-                )
-            else:
-                features.vibration_delta = 0.0
-            frame_features.append(features)
-            if yolo_debug is not None:
-                yolo_detected = bool(yolo_debug.get("yolo_detected", False))
-                print(
-                    "[YOLO-OF] "
-                    f"Frame {frame_index}/{metadata.frame_count} | "
-                    f"roi_source={frame_roi_source} | "
-                    f"detected={yolo_detected} | "
-                    f"conf={detection_confidence} | "
-                    f"bbox={original_scissors_bbox} | "
-                    f"roi={expanded_optical_flow_roi} | "
-                    f"mean_mag={features.mean_magnitude:.6f}",
-                    flush=True,
-                )
-            processed_count += 1
+            pending.append({
+                "prev_input": prev_input,
+                "curr_input": curr_input,
+                "roi": roi,
+                "roi_used": roi_used,
+                "uses_yolo_roi": uses_yolo_roi,
+                "frame_index": frame_index,
+                "timestamp_sec": timestamp_sec,
+                "curr_gray_shape": curr_gray.shape[:2],
+                "yolo_debug": yolo_debug,
+                "fallback_used": fallback_used,
+                "fallback_reason": fallback_reason,
+                "original_scissors_bbox": original_scissors_bbox,
+                "yolo_scissors_bbox": yolo_scissors_bbox,
+                "expanded_roi_bbox": expanded_roi_bbox,
+                "expanded_optical_flow_roi": expanded_optical_flow_roi,
+                "expanded_roi_bbox_raw": expanded_roi_bbox_raw,
+                "expanded_roi_bbox_smoothed": expanded_roi_bbox_smoothed,
+                "detection_confidence": detection_confidence,
+                "roi_reused_from_previous": roi_reused_from_previous,
+                "frame_roi_source": frame_roi_source,
+                "roi_area_ratio": _roi_area_ratio(roi, curr_gray.shape),
+            })
 
-            if processed_count % 25 == 0:
-                elapsed = time.perf_counter() - extraction_start
-                speed = processed_count / max(elapsed, 1e-6)
-                print(
-                    f"[OF] processed frame {frame_index}/{metadata.frame_count} | "
-                    f"processed={processed_count} | "
-                    f"yolo_roi_frames={yolo_roi_frames} | "
-                    f"elapsed={elapsed:.1f}s | "
-                    f"speed={speed:.2f} fps",
-                    flush=True,
-                )
+            if len(pending) >= _RAFT_BATCH_SIZE:
+                _flush(pending)
+                pending.clear()
 
             prev_gray = curr_gray
             frame_index += 1
+
+        # Flush any remaining frames
+        _flush(pending)
+        pending.clear()
+
     finally:
         cap.release()
         if roi_detector is not None:
@@ -533,7 +616,7 @@ def compute_video_optical_flow_features(
             flush=True,
         )
     print(
-        f"[OF] feature_extraction_time_sec={feature_extraction_time_sec:.2f}",
+        f"[OF] feature_extraction_sec={feature_extraction_time_sec:.2f}",
         flush=True,
     )
 

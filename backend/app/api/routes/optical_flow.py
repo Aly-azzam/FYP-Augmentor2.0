@@ -175,6 +175,7 @@ async def process_learner_optical_flow(
         created_visualization_path: Path | None = None
         if save_visualization:
             print("[OF] visualization started", flush=True)
+            _vis_t0 = time.perf_counter()
             created_visualization_path = visualize_video_optical_flow_hsv(
                 video_path=learner_video_path,
                 output_video_path=visualization_video_path,
@@ -183,6 +184,7 @@ async def process_learner_optical_flow(
                 frame_features=frames,
             )
             _make_browser_compatible_mp4(created_visualization_path)
+            print(f"[OF] visualization_sec={time.perf_counter() - _vis_t0:.2f}", flush=True)
             print(f"[OF] visualization finished: {created_visualization_path}", flush=True)
 
         common_payload = {
@@ -210,15 +212,19 @@ async def process_learner_optical_flow(
         }
 
         print(f"[OF] saving raw JSON: {raw_json_path}", flush=True)
+        _raw_t0 = time.perf_counter()
         raw_json_path.write_text(
             json.dumps(raw_payload, indent=2),
             encoding="utf-8",
         )
+        print(f"[OF] raw_json_save_sec={time.perf_counter() - _raw_t0:.2f}", flush=True)
         print(f"[OF] saving summary JSON: {summary_json_path}", flush=True)
+        _sum_t0 = time.perf_counter()
         summary_json_path.write_text(
             json.dumps(common_payload, indent=2),
             encoding="utf-8",
         )
+        print(f"[OF] summary_json_save_sec={time.perf_counter() - _sum_t0:.2f}", flush=True)
         print("[OF] JSON saved", flush=True)
         total_processing_time_sec = time.perf_counter() - request_start
         print("[OF] learner Optical Flow finished successfully", flush=True)

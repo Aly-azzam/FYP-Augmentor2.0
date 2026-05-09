@@ -267,3 +267,129 @@ def compute_raft_flow(
         flow_np = _cv2.resize(flow_np, (W, H), interpolation=_cv2.INTER_LINEAR)
 
     return flow_np
+
+
+def compute_raft_flow_batch(
+    frame_pairs: list[tuple[np.ndarray, np.ndarray]],
+    max_height: int = 320,
+    max_width: int = 320,
+) -> list[np.ndarray]:
+    """Run RAFT small on multiple frame pairs in a single GPU forward pass.
+
+    Each pair may have different spatial dimensions.  Every pair is resized
+    independently to ≤ (max_height × max_width), then all resized tensors are
+    padded to a common canvas whose size is the per-batch maximum rounded up to
+    the nearest multiple of 8.  One batched forward pass is executed and each
+    result is then unpadded and scaled back to the original frame resolution.
+
+    Args:
+        frame_pairs: List of (prev_gray, curr_gray) uint8 (H, W) numpy arrays.
+        max_height:  Per-pair resize cap on H.  Default 320.
+        max_width:   Per-pair resize cap on W.  Default 320.
+
+    Returns:
+        List of (H_i, W_i, 2) float32 flow arrays — one per input pair, in the
+        same order as the input list.
+
+    Raises:
+        RuntimeError: if RAFT is unavailable.
+    """
+    if not _check_raft_available():
+        raise RuntimeError(
+            "[RAFT] RAFT is not available: CUDA is missing or torchvision "
+            "is not installed. Use compute_raft_flow or Farneback instead."
+        )
+    if not frame_pairs:
+        return []
+    if len(frame_pairs) == 1:
+        p, c = frame_pairs[0]
+        return [compute_raft_flow(p, c, max_height=max_height, max_width=max_width)]
+
+    import cv2 as _cv2  # noqa: PLC0415
+    import torch  # type: ignore  # noqa: PLC0415
+    import torch.nn.functional as F  # type: ignore  # noqa: PLC0415
+
+    model, preprocess, device = _get_raft_model()
+
+    # ── Step 1: resize each pair to ≤ (max_height × max_width) ──────────────
+    # Store (prev_r, curr_r, orig_H, orig_W, new_h, new_w, scale) per pair.
+    resized: list[tuple[Any, Any, int, int, int, int, float]] = []
+    for prev_gray, curr_gray in frame_pairs:
+        H, W = prev_gray.shape
+        scale: float = min(max_height / H, max_width / W, 1.0)
+        if scale < 1.0:
+            new_h = max(128, int(round(H * scale)))
+            new_w = max(128, int(round(W * scale)))
+            prev_r = _cv2.resize(prev_gray, (new_w, new_h), interpolation=_cv2.INTER_AREA)
+            curr_r = _cv2.resize(curr_gray, (new_w, new_h), interpolation=_cv2.INTER_AREA)
+        else:
+            new_h, new_w = H, W
+            prev_r, curr_r = prev_gray, curr_gray
+        resized.append((prev_r, curr_r, H, W, new_h, new_w, scale))
+
+    # ── Step 2: common padded canvas — nearest multiple-of-8 ≥ batch max ────
+    H_max = max(r[4] for r in resized)
+    W_max = max(r[5] for r in resized)
+    H_pad = H_max + (8 - H_max % 8) % 8
+    W_pad = W_max + (8 - W_max % 8) % 8
+
+    # ── Step 3: preprocess each pair → pad → stack into batch tensors ────────
+    def _gray_to_rgb(gray: np.ndarray) -> Any:
+        rgb = np.stack([gray, gray, gray], axis=0)  # (3, h, w) uint8
+        return torch.from_numpy(rgb).to(device)
+
+    batch_prev: list[Any] = []
+    batch_curr: list[Any] = []
+    for prev_r, curr_r, _H, _W, new_h, new_w, _scale in resized:
+        t1_pre, t2_pre = preprocess(_gray_to_rgb(prev_r), _gray_to_rgb(curr_r))
+        ph = H_pad - new_h
+        pw = W_pad - new_w
+        if ph > 0 or pw > 0:
+            # F.pad order: (left, right, top, bottom)
+            t1_pre = F.pad(t1_pre.unsqueeze(0), (0, pw, 0, ph), mode="replicate").squeeze(0)
+            t2_pre = F.pad(t2_pre.unsqueeze(0), (0, pw, 0, ph), mode="replicate").squeeze(0)
+        batch_prev.append(t1_pre)
+        batch_curr.append(t2_pre)
+
+    B1 = torch.stack(batch_prev, dim=0)  # (B, 3, H_pad, W_pad)
+    B2 = torch.stack(batch_curr, dim=0)
+
+    # ── Step 4: single GPU forward pass ──────────────────────────────────────
+    if device == "cuda":
+        torch.cuda.empty_cache()
+
+    amp_ctx = (
+        torch.autocast(device_type="cuda", dtype=torch.float16)  # type: ignore[attr-defined]
+        if device == "cuda"
+        else torch.no_grad()
+    )
+
+    t_start = time.perf_counter()
+    with torch.no_grad(), amp_ctx:
+        flow_predictions = model(B1, B2)
+    elapsed_ms = (time.perf_counter() - t_start) * 1000
+    print(
+        f"[RAFT] batch={len(frame_pairs)} inference_ms={elapsed_ms:.1f}",
+        flush=True,
+    )
+
+    flow_batch: Any = flow_predictions[-1]  # (B, 2, H_pad, W_pad)
+
+    # ── Step 5: unpad, scale, resize back for each result ────────────────────
+    results: list[np.ndarray] = []
+    for i, (prev_r, curr_r, H, W, new_h, new_w, scale) in enumerate(resized):
+        flow_i = flow_batch[i : i + 1, :, :new_h, :new_w].float()  # (1, 2, new_h, new_w)
+        flow_np: np.ndarray = (
+            flow_i.squeeze(0).permute(1, 2, 0).cpu().numpy().astype(np.float32)
+        )  # (new_h, new_w, 2)
+
+        if scale < 1.0:
+            scale_h = new_h / H
+            scale_w = new_w / W
+            flow_np[..., 0] /= scale_w  # dx
+            flow_np[..., 1] /= scale_h  # dy
+            flow_np = _cv2.resize(flow_np, (W, H), interpolation=_cv2.INTER_LINEAR)
+
+        results.append(flow_np)
+
+    return results
