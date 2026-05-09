@@ -484,6 +484,46 @@ export default function CompareStudio() {
   const [evalEvaluationId, setEvalEvaluationId] = useState<string | null>(null);
   const evalEventSourceRef = useRef<EventSource | null>(null);
 
+  // ── Game phase state ───────────────────────────────────────────────────────
+  type GamePhase = 'idle' | 'processing' | 'game' | 'result';
+  type MarkType = 'trajectory' | 'angle';
+  interface UserMark {
+    id: string;
+    mark_type: MarkType;
+    x: number;
+    y: number;
+    timestamp_sec: number;
+    video_width: number;
+    video_height: number;
+  }
+  interface ScoreResult {
+    run_id: string;
+    total_real_errors: number;
+    correct_marks: number;
+    false_alarms: number;
+    missed_errors: number;
+    score_pct: number;
+    mark_results: Array<{
+      mark_type: string;
+      x: number;
+      y: number;
+      timestamp_sec: number | null;
+      result: 'correct' | 'false_alarm';
+      matched_error_id: number | null;
+    }>;
+    missed_error_details: Array<{
+      error_id: number;
+      error_type: string;
+      timestamp_start_sec: number;
+      timestamp_end_sec: number;
+      peak_location: { x: number; y: number };
+    }>;
+  }
+  const [gamePhase, setGamePhase] = useState<GamePhase>('idle');
+  const [activeMarkType, setActiveMarkType] = useState<MarkType | null>(null);
+  const [userMarks, setUserMarks] = useState<UserMark[]>([]);
+  const [scoreResult, setScoreResult] = useState<ScoreResult | null>(null);
+
   // MediaPipe integration state.
   const [mediapipeRun, setMediapipeRun] = useState<MediaPipeRunResult | null>(null);
   const [isMediapipeProcessing, setIsMediapipeProcessing] = useState(false);
@@ -865,6 +905,10 @@ export default function CompareStudio() {
     setEvalRunId(null);
     setEvalEvaluationId(null);
     setApiEvaluationResult(null);
+    setGamePhase('processing');
+    setActiveMarkType(null);
+    setUserMarks([]);
+    setScoreResult(null);
 
     try {
       const formData = new FormData();
@@ -935,6 +979,7 @@ export default function CompareStudio() {
             setEvalProgress(100);
             setEvalPhase('done');
             setPathOverlayState('idle');
+            setGamePhase('game');
           }
         } catch {
           // ignore malformed events
@@ -1199,6 +1244,26 @@ export default function CompareStudio() {
 
   const handleLearnerTipClick = useCallback(
     (event: React.MouseEvent<HTMLVideoElement>) => {
+      // Game mark placement takes priority
+      if (gamePhase === 'game' && activeMarkType) {
+        const rect = event.currentTarget.getBoundingClientRect();
+        const x = event.clientX - rect.left;
+        const y = event.clientY - rect.top;
+        const video = event.currentTarget;
+        setUserMarks((prev) => [
+          ...prev,
+          {
+            id: crypto.randomUUID(),
+            mark_type: activeMarkType,
+            x,
+            y,
+            timestamp_sec: video.currentTime,
+            video_width: rect.width,
+            video_height: rect.height,
+          },
+        ]);
+        return;
+      }
       if (!isSelectingTip || !sam2LearnerRun || !learnerVideoRef.current) return;
       const video = learnerVideoRef.current;
       const rect = video.getBoundingClientRect();
@@ -1208,7 +1273,7 @@ export default function CompareStudio() {
       const y = Math.max(0, Math.min(1, ny)) * (video.videoHeight || sam2LearnerRun.metadata?.height || 1);
       void runTipTracking(x, y);
     },
-    [isSelectingTip, sam2LearnerRun, runTipTracking],
+    [gamePhase, activeMarkType, isSelectingTip, sam2LearnerRun, runTipTracking],
   );
 
   const eventToVideoPixels = useCallback(
@@ -1977,7 +2042,7 @@ export default function CompareStudio() {
                       );
                     }
                   }}
-                  style={{ cursor: isSelectingTip ? 'crosshair' : 'default' }}
+                  style={{ cursor: (gamePhase === 'game' && activeMarkType) || isSelectingTip ? 'crosshair' : 'default' }}
                 />
 
                 {/* DTW preview loading overlay */}
@@ -2007,6 +2072,102 @@ export default function CompareStudio() {
                       <br />
                       <span style={{ fontWeight: 400, opacity: 0.8 }}>This may take up to 7 minutes.</span>
                     </span>
+                  </div>
+                )}
+
+                {/* ── Game marks overlay ───────────────────────────────── */}
+                {(gamePhase === 'game' || gamePhase === 'result') && (
+                  <div
+                    style={{
+                      position: 'absolute',
+                      inset: 0,
+                      pointerEvents: 'none',
+                      overflow: 'hidden',
+                    }}
+                  >
+                    {/* User-placed marks */}
+                    {userMarks.map((mark, markIdx) => {
+                      const resultEntry = scoreResult?.mark_results[markIdx];
+                      const isCorrect = resultEntry?.result === 'correct';
+                      const isFalseAlarm = resultEntry?.result === 'false_alarm';
+                      const color =
+                        gamePhase === 'result'
+                          ? isCorrect
+                            ? '#22c55e'
+                            : isFalseAlarm
+                              ? '#ef4444'
+                              : '#ef4444'
+                          : '#ef4444';
+                      return (
+                        <span
+                          key={mark.id}
+                          title={gamePhase === 'result' ? (isCorrect ? 'Correct!' : 'False alarm') : 'Click to remove'}
+                          onClick={
+                            gamePhase === 'game'
+                              ? () => setUserMarks((prev) => prev.filter((m) => m.id !== mark.id))
+                              : undefined
+                          }
+                          style={{
+                            position: 'absolute',
+                            left: mark.x,
+                            top: mark.y,
+                            transform: 'translate(-50%, -50%)',
+                            fontSize: mark.mark_type === 'trajectory' ? 28 : 36,
+                            lineHeight: 1,
+                            color,
+                            textShadow: '0 0 3px #fff, 0 0 6px #fff',
+                            pointerEvents: gamePhase === 'game' ? 'auto' : 'none',
+                            cursor: gamePhase === 'game' ? 'pointer' : 'default',
+                            userSelect: 'none',
+                            width: 40,
+                            height: 40,
+                            display: 'inline-flex',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            textDecoration: isFalseAlarm && gamePhase === 'result' ? 'line-through' : 'none',
+                          }}
+                        >
+                          {mark.mark_type === 'trajectory' ? '✕' : '○'}
+                        </span>
+                      );
+                    })}
+
+                    {/* Missed errors shown in result phase */}
+                    {gamePhase === 'result' &&
+                      scoreResult?.missed_error_details.map((e) => {
+                        const vw = learnerVideoRef.current?.offsetWidth ?? 0;
+                        const vh = learnerVideoRef.current?.offsetHeight ?? 0;
+                        if (!vw || !vh) return null;
+                        const dx = e.peak_location.x * (vw / 1920);
+                        const dy = e.peak_location.y * (vh / 1080);
+                        return (
+                          <span
+                            key={`missed-${e.error_id}`}
+                            title="Missed"
+                            style={{
+                              position: 'absolute',
+                              left: dx,
+                              top: dy,
+                              transform: 'translate(-50%, -50%)',
+                              fontSize: e.error_type === 'trajectory' ? 28 : 36,
+                              lineHeight: 1,
+                              color: 'rgba(156,163,175,0.85)',
+                              textShadow: '0 0 3px #000',
+                              pointerEvents: 'none',
+                              userSelect: 'none',
+                              display: 'inline-flex',
+                              flexDirection: 'column',
+                              alignItems: 'center',
+                              gap: 2,
+                            }}
+                          >
+                            {e.error_type === 'trajectory' ? '✕' : '○'}
+                            <span style={{ fontSize: 9, fontWeight: 600, color: 'rgba(209,213,219,0.9)', lineHeight: 1 }}>
+                              missed
+                            </span>
+                          </span>
+                        );
+                      })}
                   </div>
                 )}
 
@@ -2408,7 +2569,7 @@ export default function CompareStudio() {
             <TabsContent value="evaluate">
 
               {/* ── Idle: run button ─────────────────────────────────────── */}
-              {evalPhase === 'idle' && !apiEvaluationResult && (
+              {gamePhase === 'idle' && evalPhase === 'idle' && !apiEvaluationResult && (
                 <div
                   style={{
                     display: 'flex',
@@ -2535,47 +2696,170 @@ export default function CompareStudio() {
                 </div>
               )}
 
-              {/* ── Done: review button ───────────────────────────────────── */}
-              {evalPhase === 'done' && (
+              {/* ── Game: mark the errors ────────────────────────────────── */}
+              {gamePhase === 'game' && (
                 <div
                   style={{
                     display: 'flex',
                     flexDirection: 'column',
-                    alignItems: 'center',
-                    gap: 'var(--space-lg)',
-                    padding: 'var(--space-lg) 0',
+                    gap: 'var(--space-md)',
+                    padding: 'var(--space-sm) 0',
                   }}
                 >
-                  <Sparkles size={40} style={{ color: 'var(--accent-primary)' }} />
-                  <p className="text-body" style={{ textAlign: 'center', fontWeight: 600 }}>
-                    Analysis complete!
-                  </p>
+                  <div>
+                    <p className="text-body" style={{ fontWeight: 600, marginBottom: 2 }}>
+                      Mark the errors you spotted
+                    </p>
+                    <p className="text-small" style={{ color: 'var(--text-muted)', margin: 0 }}>
+                      Watch the video and click where you noticed mistakes
+                    </p>
+                  </div>
+
+                  {/* Toggle buttons */}
+                  <div style={{ display: 'flex', gap: 'var(--space-sm)' }}>
+                    {(['trajectory', 'angle'] as const).map((type) => (
+                      <button
+                        key={type}
+                        className={activeMarkType === type ? 'btn btn-primary' : 'btn btn-secondary'}
+                        style={{ flex: 1, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: 6 }}
+                        onClick={() => setActiveMarkType((prev) => (prev === type ? null : type))}
+                      >
+                        <span style={{ fontSize: 16 }}>{type === 'trajectory' ? '✕' : '○'}</span>
+                        {type === 'trajectory' ? 'Path' : 'Angle'}
+                      </button>
+                    ))}
+                  </div>
+
+                  {/* Mark counts */}
+                  <div className="text-small" style={{ color: 'var(--text-muted)', display: 'flex', flexDirection: 'column', gap: 2 }}>
+                    <span>Marks placed: {userMarks.filter((m) => m.mark_type === 'trajectory').length} trajectory</span>
+                    <span style={{ paddingLeft: 70 }}>{userMarks.filter((m) => m.mark_type === 'angle').length} angle</span>
+                  </div>
+
+                  <hr style={{ border: 'none', borderTop: '1px solid var(--border-subtle)', margin: 0 }} />
+
                   <button
                     className="btn btn-primary"
-                    style={{
-                      width: '100%',
-                      display: 'inline-flex',
-                      alignItems: 'center',
-                      justifyContent: 'center',
-                      gap: 'var(--space-xs)',
-                    }}
-                    onClick={() => {
-                      // Show learner video in the left panel using blob URL already in state.
-                      if (userVideoUrl) {
-                        setUserVideoUrl(userVideoUrl);
+                    style={{ width: '100%' }}
+                    disabled={userMarks.length === 0}
+                    onClick={async () => {
+                      if (!evalEvaluationId || !evalRunId) return;
+                      try {
+                        const res = await fetch(`/api/evaluations/${evalEvaluationId}/score`, {
+                          method: 'POST',
+                          headers: { 'Content-Type': 'application/json' },
+                          body: JSON.stringify({ run_id: evalRunId, marks: userMarks }),
+                        });
+                        if (!res.ok) throw new Error(`Score API error: ${res.status}`);
+                        const data = await res.json() as ScoreResult;
+                        setScoreResult(data);
+                        setGamePhase('result');
+                      } catch (err) {
+                        toast.error('Failed to score your marks. Please try again.');
+                        console.error(err);
                       }
                     }}
                   >
-                    Review Your Results →
+                    Get Your Result
                   </button>
+
                   <button
                     className="btn btn-secondary"
                     style={{ width: '100%' }}
                     onClick={() => {
+                      setGamePhase('idle');
                       setEvalPhase('idle');
                       setEvalStepIndex(0);
                       setEvalProgress(0);
                       setEvalError(null);
+                      setActiveMarkType(null);
+                      setUserMarks([]);
+                      setScoreResult(null);
+                    }}
+                  >
+                    <RotateCcw size={14} />
+                    Run Again
+                  </button>
+                </div>
+              )}
+
+              {/* ── Result: score display ─────────────────────────────────── */}
+              {gamePhase === 'result' && scoreResult && (
+                <div
+                  style={{
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: 'var(--space-md)',
+                    padding: 'var(--space-sm) 0',
+                  }}
+                >
+                  <p className="text-body" style={{ fontWeight: 600, margin: 0 }}>Your Score</p>
+
+                  {/* Big score */}
+                  <div style={{ textAlign: 'center', padding: 'var(--space-sm) 0' }}>
+                    <span
+                      style={{
+                        fontSize: '3rem',
+                        fontWeight: 700,
+                        color: 'var(--accent-primary)',
+                        lineHeight: 1,
+                      }}
+                    >
+                      {scoreResult.score_pct}%
+                    </span>
+                  </div>
+
+                  {/* Summary rows */}
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                    <div className="text-small" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                      <span style={{ color: '#22c55e', fontWeight: 700, width: 14, textAlign: 'center' }}>✓</span>
+                      <span>{scoreResult.correct_marks} error{scoreResult.correct_marks !== 1 ? 's' : ''} found</span>
+                    </div>
+                    <div className="text-small" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                      <span style={{ color: '#ef4444', fontWeight: 700, width: 14, textAlign: 'center' }}>✕</span>
+                      <span>{scoreResult.false_alarms} false alarm{scoreResult.false_alarms !== 1 ? 's' : ''}</span>
+                    </div>
+                    <div className="text-small" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                      <span style={{ color: 'var(--text-muted)', width: 14, textAlign: 'center' }}>○</span>
+                      <span>{scoreResult.missed_errors} error{scoreResult.missed_errors !== 1 ? 's' : ''} missed</span>
+                    </div>
+                  </div>
+
+                  <hr style={{ border: 'none', borderTop: '1px solid var(--border-subtle)', margin: 0 }} />
+
+                  {/* Breakdown by type */}
+                  {(['trajectory', 'angle'] as const).map((type) => {
+                    const totalReal = scoreResult.missed_error_details.filter((e) => e.error_type === type).length
+                      + scoreResult.mark_results.filter((m) => m.mark_type === type && m.result === 'correct').length;
+                    const found = scoreResult.mark_results.filter((m) => m.mark_type === type && m.result === 'correct').length;
+                    return (
+                      <div
+                        key={type}
+                        className="text-small"
+                        style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}
+                      >
+                        <span style={{ textTransform: 'capitalize', color: 'var(--text-secondary)' }}>
+                          {type === 'trajectory' ? 'Trajectory' : 'Angle'}
+                        </span>
+                        <span style={{ color: 'var(--text-muted)' }}>
+                          {totalReal} real &nbsp;|&nbsp; {found} found
+                        </span>
+                      </div>
+                    );
+                  })}
+
+                  <button
+                    className="btn btn-primary"
+                    style={{ width: '100%', marginTop: 'var(--space-xs)' }}
+                    onClick={() => {
+                      setGamePhase('idle');
+                      setEvalPhase('idle');
+                      setEvalStepIndex(0);
+                      setEvalProgress(0);
+                      setEvalError(null);
+                      setActiveMarkType(null);
+                      setUserMarks([]);
+                      setScoreResult(null);
                     }}
                   >
                     <RotateCcw size={14} />
@@ -2623,6 +2907,7 @@ export default function CompareStudio() {
                       setEvalStepIndex(0);
                       setEvalProgress(0);
                       setEvalError(null);
+                      setGamePhase('idle');
                     }}
                   >
                     <RotateCcw size={14} />
@@ -2632,7 +2917,7 @@ export default function CompareStudio() {
               )}
 
               {/* ── Out-of-context rejection (existing flow) ─────────────── */}
-              {evalPhase === 'idle' && apiEvaluationResult?.status === 'out_of_context' && (
+              {gamePhase === 'idle' && evalPhase === 'idle' && apiEvaluationResult?.status === 'out_of_context' && (
                 <div
                   style={{
                     display: 'flex',
