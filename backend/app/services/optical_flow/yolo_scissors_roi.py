@@ -112,10 +112,10 @@ def expand_scissors_bbox_to_hand_roi(
     if bw <= 0 or bh <= 0:
         raise ValueError("YOLO scissors bbox must have positive width and height.")
 
-    clamped_x1 = max(0, int(float(x1) - 0.7 * bw))
-    clamped_x2 = min(int(frame_width), int(float(x2) + 0.7 * bw))
-    clamped_y1 = max(0, int(float(y1) - 0.3 * bh))
-    clamped_y2 = min(int(frame_height), int(float(y2) + 1.5 * bh))
+    clamped_x1 = max(0, int(float(x1) - 0.2 * bw))
+    clamped_x2 = min(int(frame_width), int(float(x2) + 0.2 * bw))
+    clamped_y1 = max(0, int(float(y1) - 0.1 * bh))
+    clamped_y2 = min(int(frame_height), int(float(y2) + 0.4 * bh))
 
     if clamped_x2 <= clamped_x1 or clamped_y2 <= clamped_y1:
         raise ValueError("Expanded YOLO scissors ROI is empty after clamping.")

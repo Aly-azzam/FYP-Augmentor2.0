@@ -162,6 +162,16 @@ class FrameFlowFeatures(BaseModel):
         ge=0,
         description="Absolute frame-to-frame change in mean magnitude when available",
     )
+    direction_variance: float = Field(
+        default=0.0,
+        ge=0,
+        description="Sum of std of sin and cos weighted components of angle, measuring direction spread",
+    )
+    magnitude_spatial_std: float = Field(
+        default=0.0,
+        ge=0,
+        description="Standard deviation of per-pixel flow magnitude within the frame",
+    )
 
 
 class VideoFlowSummary(BaseModel):
@@ -310,6 +320,42 @@ class VideoFlowSummary(BaseModel):
         ge=0,
         le=1,
         description="Exponential smoothing alpha used for YOLO Optical Flow ROI",
+    )
+    dominant_vibration_freq_hz: float = Field(
+        default=0.0,
+        ge=0,
+        description="Dominant vibration frequency in Hz from FFT of magnitude signal",
+    )
+    vibration_freq_amplitude: float = Field(
+        default=0.0,
+        ge=0,
+        description="FFT amplitude at the dominant vibration frequency",
+    )
+    vibration_freq_confidence: float = Field(
+        default=0.0,
+        ge=0,
+        le=1,
+        description="Ratio of dominant vibration amplitude to total FFT amplitude",
+    )
+    vibration_windows: List[dict] = Field(
+        default_factory=list,
+        description="Per-window FFT vibration results from the windowed FFT analysis",
+    )
+    vibration_consistency_score: float = Field(
+        default=0.0,
+        ge=0,
+        le=1,
+        description="Ratio of the longest streak of consistent vibration windows to total windows",
+    )
+    consistent_freq_hz: float = Field(
+        default=0.0,
+        ge=0,
+        description="Dominant frequency Hz during the longest consistent vibration streak",
+    )
+    max_consecutive_windows: int = Field(
+        default=0,
+        ge=0,
+        description="Length of the longest streak of windows with consistent vibration frequency",
     )
 
 
