@@ -220,6 +220,118 @@ async def get_unified_errors(evaluation_id: str, run_id: str):
         return json.load(fh)
 
 
+# ── POST /{evaluation_id}/score ────────────────────────────────────────────────
+
+NATIVE_W = 1920
+NATIVE_H = 1080
+
+
+def _scale_mark(mark: dict) -> tuple[float, float]:
+    vw = mark.get("video_width") or NATIVE_W
+    vh = mark.get("video_height") or NATIVE_H
+    return mark["x"] * (NATIVE_W / vw), mark["y"] * (NATIVE_H / vh)
+
+
+def _mark_hits_error(sx: float, sy: float, mark_type: str, error: dict) -> bool:
+    if error["error_type"] != mark_type:
+        return False
+    bb = error.get("bounding_box")
+    if bb is None:
+        return False
+    return bb["x_min"] <= sx <= bb["x_max"] and bb["y_min"] <= sy <= bb["y_max"]
+
+
+@router.post("/{evaluation_id}/score")
+async def score_evaluation(evaluation_id: str, body: dict = Body(...)):
+    """Score the learner's X-mark game attempt against the stored unified errors.
+
+    Body: { "run_id": "...", "marks": [ { mark_type, x, y, timestamp_sec,
+            video_width, video_height }, ... ] }
+    """
+    run_id: str | None = body.get("run_id")
+    marks: list[dict] = body.get("marks", [])
+    if not run_id:
+        raise HTTPException(status_code=400, detail="run_id is required")
+
+    errors_path = (
+        Path(settings.STORAGE_ROOT) / "evaluation" / run_id / "score" / "unified_errors.json"
+    )
+    if not errors_path.exists():
+        raise HTTPException(status_code=404, detail="unified_errors.json not found for this run")
+
+    with open(errors_path) as fh:
+        unified = json.load(fh)
+    errors: list[dict] = unified.get("all_errors", [])
+
+    matched_error_ids: set[int] = set()
+    mark_results: list[dict] = []
+
+    for mark in marks:
+        sx, sy = _scale_mark(mark)
+        hit_error: dict | None = None
+        for error in errors:
+            if error["error_id"] in matched_error_ids:
+                continue
+            if _mark_hits_error(sx, sy, mark["mark_type"], error):
+                hit_error = error
+                break
+
+        if hit_error:
+            matched_error_ids.add(hit_error["error_id"])
+            mark_results.append({
+                "mark_type": mark["mark_type"],
+                "x": mark["x"],
+                "y": mark["y"],
+                "timestamp_sec": mark.get("timestamp_sec"),
+                "result": "correct",
+                "matched_error_id": hit_error["error_id"],
+            })
+        else:
+            mark_results.append({
+                "mark_type": mark["mark_type"],
+                "x": mark["x"],
+                "y": mark["y"],
+                "timestamp_sec": mark.get("timestamp_sec"),
+                "result": "false_alarm",
+                "matched_error_id": None,
+            })
+
+    missed_errors = [e for e in errors if e["error_id"] not in matched_error_ids]
+    total_real = len(errors)
+    correct = sum(1 for m in mark_results if m["result"] == "correct")
+    false_alarms = sum(1 for m in mark_results if m["result"] == "false_alarm")
+    missed = len(missed_errors)
+    score_pct = round(100 * correct / total_real) if total_real > 0 else 0
+
+    result = {
+        "run_id": run_id,
+        "total_real_errors": total_real,
+        "correct_marks": correct,
+        "false_alarms": false_alarms,
+        "missed_errors": missed,
+        "score_pct": score_pct,
+        "mark_results": mark_results,
+        "missed_error_details": [
+            {
+                "error_id": e["error_id"],
+                "error_type": e["error_type"],
+                "timestamp_start_sec": e["timestamp_start_sec"],
+                "timestamp_end_sec": e["timestamp_end_sec"],
+                "peak_location": e.get("peak_location"),
+            }
+            for e in missed_errors
+        ],
+    }
+
+    score_path = (
+        Path(settings.STORAGE_ROOT) / "evaluation" / run_id / "score" / "score_result.json"
+    )
+    with open(score_path, "w") as fh:
+        json.dump(result, fh, indent=2)
+
+    return result
+
+
 # ── Remaining read-only DB endpoints (untouched) ──────────────────────────────
 
 @router.get("/{evaluation_id}/status", response_model=EvaluationStatusResponse)

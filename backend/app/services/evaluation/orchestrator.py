@@ -184,6 +184,7 @@ def run_evaluation_pipeline(
     unified = merge_errors(
         trajectory_errors_path=f"{dirs['trajectory']}/trajectory_errors.json",
         angle_errors_path=f"{dirs['angle']}/angle_errors.json",
+        aligned_corridor_path=f"{dirs['trajectory']}/aligned_corridor.json",
         output_dir=dirs["score"],
     )
     print(f"[TIMING] Merge errors: {time.time() - t0:.1f}s")

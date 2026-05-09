@@ -4,6 +4,7 @@ Inputs
 ------
 storage/evaluation/{run_id}/trajectory/trajectory_errors.json
 storage/evaluation/{run_id}/angle/angle_errors.json
+storage/evaluation/{run_id}/trajectory/aligned_corridor.json
 
 Output
 ------
@@ -17,9 +18,76 @@ import os
 from pathlib import Path
 
 
+def compute_trajectory_bbox(error: dict, frame_checks: list[dict], padding: int = 80) -> dict:
+    """Find all frame_checks whose frame_index falls between
+    error.frame_start and error.frame_end, then compute bbox
+    of their learner_x/learner_y with padding.
+    """
+    points_in_window = [
+        fc for fc in frame_checks
+        if error["frame_start"] <= fc["frame_index"] <= error["frame_end"]
+        and fc.get("learner_x") is not None
+        and fc.get("learner_y") is not None
+    ]
+    if not points_in_window:
+        px = error["peak_location"]["x"]
+        py = error["peak_location"]["y"]
+        return {
+            "x_min": round(px - 60, 2),
+            "y_min": round(py - 60, 2),
+            "x_max": round(px + 60, 2),
+            "y_max": round(py + 60, 2),
+        }
+
+    xs = [fc["learner_x"] for fc in points_in_window]
+    ys = [fc["learner_y"] for fc in points_in_window]
+
+    return {
+        "x_min": round(min(xs) - padding, 2),
+        "y_min": round(min(ys) - padding, 2),
+        "x_max": round(max(xs) + padding, 2),
+        "y_max": round(max(ys) + padding, 2),
+    }
+
+
+def compute_angle_bbox(error: dict, frame_checks: list[dict], padding: int = 80) -> dict:
+    """Bounding box around inside-corridor frames during the angle error window.
+
+    These are the red-dot positions — scissors inside the corridor but holding
+    the wrong angle.
+    """
+    points_in_window = [
+        fc for fc in frame_checks
+        if error["frame_start"] <= fc["frame_index"] <= error["frame_end"]
+        and not fc.get("outside", True)
+        and fc.get("learner_x") is not None
+        and fc.get("learner_y") is not None
+    ]
+    if not points_in_window:
+        px = error["peak_location"]["x"]
+        py = error["peak_location"]["y"]
+        return {
+            "x_min": round(px - 100, 2),
+            "y_min": round(py - 100, 2),
+            "x_max": round(px + 100, 2),
+            "y_max": round(py + 100, 2),
+        }
+
+    xs = [fc["learner_x"] for fc in points_in_window]
+    ys = [fc["learner_y"] for fc in points_in_window]
+
+    return {
+        "x_min": round(min(xs) - padding, 2),
+        "y_min": round(min(ys) - padding, 2),
+        "x_max": round(max(xs) + padding, 2),
+        "y_max": round(max(ys) + padding, 2),
+    }
+
+
 def merge_errors(
     trajectory_errors_path: str,
     angle_errors_path: str,
+    aligned_corridor_path: str,
     output_dir: str,
 ) -> dict:
     """Merge trajectory and angle error events into one sorted unified list.
@@ -30,6 +98,9 @@ def merge_errors(
         Path to ``trajectory_errors.json``.
     angle_errors_path:
         Path to ``angle_errors.json``.
+    aligned_corridor_path:
+        Path to ``aligned_corridor.json`` — used to compute bounding boxes for
+        trajectory errors from actual learner positions.
     output_dir:
         Directory where ``unified_errors.json`` is written
         (typically ``storage/evaluation/{run_id}/score/``).
@@ -44,11 +115,19 @@ def merge_errors(
     with open(angle_errors_path) as fh:
         angle = json.load(fh)
 
+    corridor_available = Path(aligned_corridor_path).exists()
+    frame_checks: list[dict] = []
+    if corridor_available:
+        with open(aligned_corridor_path) as f:
+            corridor = json.load(f)
+        frame_checks = corridor.get("frame_checks", [])
+
     all_errors: list[dict] = []
 
     for e in traj["error_events"]:
+        bbox = compute_trajectory_bbox(e, frame_checks, padding=80) if corridor_available else None
         all_errors.append({
-            "error_id": None,            # assigned after sorting
+            "error_id": None,
             "error_type": "trajectory",
             "frame_start": e["frame_start"],
             "frame_end": e["frame_end"],
@@ -56,8 +135,8 @@ def merge_errors(
             "timestamp_end_sec": e["timestamp_end_sec"],
             "duration_sec": e["duration_sec"],
             "peak_location": e["peak_location"],
-            "area_radius_px": None,       # trajectory errors use a path band
-            "path_band_width_px": 120,    # wide band for user to click on path
+            "bounding_box": bbox,
+            "area_radius_px": None,
             "direction": e.get("direction"),
             "peak_deviation_px": e.get("peak_deviation_px"),
             "peak_angle_diff_deg": None,
@@ -65,6 +144,7 @@ def merge_errors(
         })
 
     for e in angle["error_events"]:
+        bbox = compute_angle_bbox(e, frame_checks, padding=80) if corridor_available else None
         all_errors.append({
             "error_id": None,
             "error_type": "angle",
@@ -74,8 +154,8 @@ def merge_errors(
             "timestamp_end_sec": e["timestamp_end_sec"],
             "duration_sec": e["duration_sec"],
             "peak_location": e["peak_location"],
-            "area_radius_px": e["area_radius_px"],
-            "path_band_width_px": None,
+            "bounding_box": bbox,
+            "area_radius_px": None,
             "direction": None,
             "peak_deviation_px": None,
             "peak_angle_diff_deg": e.get("peak_angle_diff_deg"),
@@ -103,16 +183,25 @@ def merge_errors(
     with open(output_path, "w") as fh:
         json.dump(output, fh, indent=2)
 
+    traj_count = len(traj["error_events"])
+    angle_count = len(angle["error_events"])
+    bbox_label = "with bounding boxes" if corridor_available else "no corridor data"
+
     print("\n=== UNIFIED ERROR SUMMARY ===")
-    print(f"Trajectory errors: {len(traj['error_events'])}")
-    print(f"Angle errors:      {len(angle['error_events'])}")
-    print(f"Total errors:      {len(all_errors)}")
+    print(f"Trajectory errors: {traj_count} ({bbox_label})")
+    print(f"Angle errors: {angle_count} ({bbox_label})")
+    print(f"Total errors: {len(all_errors)}")
     for e in all_errors:
-        print(
-            f"  Error {e['error_id']} [{e['error_type']}]: "
-            f"frames {e['frame_start']}-{e['frame_end']} | "
-            f"{e['timestamp_start_sec']}s-{e['timestamp_end_sec']}s"
-        )
+        bb = e["bounding_box"]
+        tag = f"[{e['error_type']}]".ljust(14)
+        if bb:
+            print(
+                f"  Error {e['error_id']} {tag} "
+                f"bbox ({bb['x_min']}, {bb['y_min']})-({bb['x_max']}, {bb['y_max']})"
+            )
+        else:
+            loc = e["peak_location"]
+            print(f"  Error {e['error_id']} {tag} peak at ({loc['x']}, {loc['y']}) (no bbox)")
     print(f"Saved: {output_path}")
 
     return output
