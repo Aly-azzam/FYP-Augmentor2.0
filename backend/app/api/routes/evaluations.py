@@ -173,6 +173,64 @@ async def generate_corridor_overlay(
     return {"status": "done", "overlay_video_url": overlay_url}
 
 
+# ── On-demand visualization generation ────────────────────────────────────────
+
+@router.post("/{evaluation_id}/generate-visualization")
+async def generate_visualization(
+    evaluation_id: str,
+    body: dict = Body(...),
+):
+    """Generate the mask-based visualization video on demand for a completed evaluation run.
+
+    Body: { "run_id": "<uuid>", "expert_id": "<uuid>" }
+    Returns: { "status": "done", "visualization_url": "/storage/evaluation/{run_id}/visualization/visualization.mp4" }
+    """
+    run_id: str | None = body.get("run_id")
+    expert_id: str | None = body.get("expert_id")
+    if not run_id:
+        raise HTTPException(status_code=400, detail="run_id is required in the request body.")
+    if not expert_id:
+        raise HTTPException(status_code=400, detail="expert_id is required in the request body.")
+
+    eval_base_dir = settings.STORAGE_ROOT / "evaluation"
+    run_dir = eval_base_dir / run_id
+
+    yolo_path = run_dir / "yolo_detections.json"
+    if not yolo_path.is_file():
+        raise HTTPException(status_code=404, detail="yolo_detections.json not found for this run.")
+
+    with open(yolo_path) as fh:
+        yolo_data = json.load(fh)
+    learner_video_path: str | None = yolo_data.get("video_path")
+    if not learner_video_path or not Path(learner_video_path).is_file():
+        raise HTTPException(status_code=404, detail="Learner video path not found or file missing.")
+
+    output_dir = run_dir / "visualization"
+
+    try:
+        from app.services.evaluation.visualization import render_visualization  # noqa: PLC0415
+
+        out_path = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: render_visualization(
+                learner_video_path=learner_video_path,
+                expert_id=expert_id,
+                run_id=run_id,
+                output_dir=str(output_dir),
+            ),
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Visualization generation failed: {exc}",
+        ) from exc
+
+    visualization_url = f"/storage/evaluation/{run_id}/visualization/visualization.mp4"
+    return {"status": "done", "visualization_url": visualization_url}
+
+
 # ── SSE stream ─────────────────────────────────────────────────────────────────
 
 @router.get("/{evaluation_id}/status-stream")

@@ -534,12 +534,17 @@ export default function CompareStudio() {
   // Learner overlay: show the raw uploaded video, the MediaPipe annotated
   // output, YOLO+SAM2 scissors overlay, or Optical Flow visualization.
   const [learnerOverlay, setLearnerOverlay] =
-    useState<'none' | 'mediapipe' | 'sam2' | 'optical_flow' | 'aligned_corridor' | 'angle' | 'eval_corridor'>('none');
+    useState<'none' | 'mediapipe' | 'sam2' | 'optical_flow' | 'aligned_corridor' | 'angle' | 'eval_corridor' | 'visualization'>('none');
 
   // Path Overlay (on-demand corridor overlay from evaluation run).
   type PathOverlayState = 'disabled' | 'idle' | 'loading' | 'ready';
   const [pathOverlayState, setPathOverlayState] = useState<PathOverlayState>('disabled');
   const [evalCorridorOverlayUrl, setEvalCorridorOverlayUrl] = useState<string | null>(null);
+
+  // Visualization (corridor lines + ghost scissor overlay).
+  type VizState = 'idle' | 'loading' | 'ready';
+  const [vizState, setVizState] = useState<VizState>('idle');
+  const [vizUrl, setVizUrl] = useState<string | null>(null);
 
   // YOLO+SAM2 learner scissors tracking state.
   const [sam2LearnerRun, setSam2LearnerRun] = useState<Sam2LearnerResult | null>(null);
@@ -1465,6 +1470,9 @@ export default function CompareStudio() {
     if (learnerOverlay === 'eval_corridor' && evalCorridorOverlayUrl) {
       return evalCorridorOverlayUrl;
     }
+    if (learnerOverlay === 'visualization' && vizUrl) {
+      return vizUrl;
+    }
     return userVideoUrl;
   })();
   const learnerVideoPixelWidth =
@@ -1945,6 +1953,30 @@ export default function CompareStudio() {
                         Path Overlay
                       </button>
                     )}
+                    {vizUrl && (
+                      <>
+                        <button
+                          type="button"
+                          role="tab"
+                          aria-selected={learnerOverlay !== 'visualization'}
+                          className={`btn ${learnerOverlay !== 'visualization' ? 'btn-primary' : 'btn-ghost'}`}
+                          style={{ borderRadius: 0, fontSize: '0.75rem', padding: 'var(--space-xs) var(--space-sm)' }}
+                          onClick={() => setLearnerOverlay('none')}
+                        >
+                          Original
+                        </button>
+                        <button
+                          type="button"
+                          role="tab"
+                          aria-selected={learnerOverlay === 'visualization'}
+                          className={`btn ${learnerOverlay === 'visualization' ? 'btn-primary' : 'btn-ghost'}`}
+                          style={{ borderRadius: 0, fontSize: '0.75rem', padding: 'var(--space-xs) var(--space-sm)' }}
+                          onClick={() => setLearnerOverlay('visualization')}
+                        >
+                          Visualization
+                        </button>
+                      </>
+                    )}
                     {opticalFlowVisualizationUrl && (
                       <button
                         type="button"
@@ -2018,7 +2050,7 @@ export default function CompareStudio() {
                   key={learnerVideoSource ?? userVideoUrl}
                   ref={learnerVideoRef}
                   src={learnerVideoSource ?? undefined}
-                  controls={learnerOverlay === 'sam2' || learnerOverlay === 'optical_flow' || learnerOverlay === 'aligned_corridor' || learnerOverlay === 'eval_corridor'}
+                  controls={learnerOverlay === 'sam2' || learnerOverlay === 'optical_flow' || learnerOverlay === 'aligned_corridor' || learnerOverlay === 'eval_corridor' || learnerOverlay === 'visualization'}
                   onClick={handleLearnerTipClick}
                   muted={learnerMuted}
                   playsInline
@@ -2864,6 +2896,49 @@ export default function CompareStudio() {
                   >
                     <RotateCcw size={14} />
                     Run Again
+                  </button>
+
+                  <button
+                    className={`btn ${vizState === 'ready' ? 'btn-primary' : 'btn-secondary'}`}
+                    style={{ width: '100%' }}
+                    disabled={vizState === 'loading'}
+                    onClick={async () => {
+                      if (vizState !== 'idle') return;
+                      if (!evalEvaluationId || !evalRunId || !selectedClip) return;
+                      setVizState('loading');
+                      try {
+                        const res = await fetch(
+                          `/api/evaluations/${evalEvaluationId}/generate-visualization`,
+                          {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ run_id: evalRunId, expert_id: selectedClip }),
+                          },
+                        );
+                        if (!res.ok) {
+                          const err = await res.json().catch(() => ({}));
+                          throw new Error((err as any).detail ?? `HTTP ${res.status}`);
+                        }
+                        const data = await res.json() as { status: string; visualization_url: string };
+                        const fullUrl = data.visualization_url.startsWith('http')
+                          ? data.visualization_url
+                          : `http://localhost:8001${data.visualization_url}`;
+                        setVizUrl(fullUrl);
+                        setVizState('ready');
+                      } catch (err) {
+                        setVizState('idle');
+                        console.error('Visualization generation failed:', err);
+                      }
+                    }}
+                  >
+                    {vizState === 'loading' ? (
+                      <>
+                        <Loader2 size={14} style={{ animation: 'spin 1s linear infinite' }} />
+                        Generating...
+                      </>
+                    ) : (
+                      'Visualization'
+                    )}
                   </button>
                 </div>
               )}
