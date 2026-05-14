@@ -32,6 +32,8 @@ def _call_vlm(messages: list) -> str:
             model="meta-llama/llama-4-scout-17b-16e-instruct",
             messages=messages,
             max_tokens=1000,
+            temperature=0.2,
+            seed=42,
         )
         return r.choices[0].message.content
 
@@ -107,11 +109,13 @@ def generate_feedback(run_id: str, expert_id: str, output_dir: str) -> str:
     with open(eval_dir / "angle" / "angle_errors.json", encoding="utf-8") as fh:
         angle_data = json.load(fh)
     angle_peak_lookup: dict[tuple[int, int], int] = {}
+    angle_event_lookup: dict[tuple[int, int], dict] = {}
     for evt in angle_data.get("error_events", []):
         fs, fe = evt["frame_start"], evt["frame_end"]
         angle_peak_lookup[(fs, fe)] = evt.get(
             "peak_frame", (fs + fe) // 2
         )
+        angle_event_lookup[(fs, fe)] = evt
 
     # ── Load DTW alignment for expert frame mapping ───────────────────────────
     with open(eval_dir / "angle" / "dtw_alignment.json", encoding="utf-8") as fh:
@@ -175,13 +179,26 @@ def generate_feedback(run_id: str, expert_id: str, output_dir: str) -> str:
                 (frame_start, frame_end), (frame_start + frame_end) // 2
             )
             peak_deg = error.get("peak_angle_diff_deg") or 0.0
-            error_desc = f"Blade angle was {peak_deg:.0f}° off the expert angle"
+            correction = (
+                f"The learner's blade was {peak_deg:.0f}° off from the expert angle. "
+                "Look at the two lines in the image — the white line is the learner, the cyan line is the expert. "
+                "Describe which direction (clockwise or counter-clockwise, left or right) the learner needed to "
+                "rotate their blade to match the expert."
+            )
+            error_desc = f"Blade angle was {peak_deg:.0f}° off the expert angle\n{correction}"
             t_start = error.get("timestamp_start_sec", round(frame_start / 30, 1))
             t_end = error.get("timestamp_end_sec", round(frame_end / 30, 1))
             label = f"Angle error (from {t_start}s to {t_end}s)"
         else:
             peak_frame = (frame_start + frame_end) // 2
-            error_desc = "Scissors drifted from the expert cutting path"
+            deviation = error.get("peak_deviation_px") or 0.0
+            drift_dir = "right" if deviation > 0 else "left"
+            correct_dir = "left" if deviation > 0 else "right"
+            error_desc = (
+                f"Scissors drifted from the expert cutting path\n"
+                f"The scissors drifted {drift_dir} of the expert path. To self-correct, "
+                f"the learner needed to steer back {correct_dir} toward the cutting line."
+            )
             t_start = round(frame_start / 30, 1)
             t_end = round(frame_end / 30, 1)
             label = f"Trajectory error (from {t_start}s to {t_end}s)"
@@ -207,27 +224,29 @@ def generate_feedback(run_id: str, expert_id: str, output_dir: str) -> str:
         user_content.append({"type": "text", "text": error_desc + "\n\n"})
 
     write_prompt = (
-        'Write feedback as "Your Crafting Coach". Use this exact structure:\n\n'
+        'Write feedback as "Your Crafting Coach". You MUST follow this exact structure, no deviations:\n\n'
         "🎯 **Overall**\n"
-        "2-3 sentences about the full attempt.\n\n"
+        '[2-3 sentences about the full attempt — mention timing e.g. "in the first few seconds"]\n\n'
     )
     for n in range(1, len(errors_sorted) + 1):
         write_prompt += (
-            f"⚠️ **Issue {n} — {{short descriptive title you invent}}**\n"
-            "2-3 sentences explaining what you see visually — compare learner to expert. "
-            "Be specific about what the hands/tool did. Reference what you see in the frames.\n"
-            "✅ **What to do next time:** 1-2 sentences of concrete actionable advice.\n\n"
+            f"⚠️ **Issue {n} — [short title you invent]**\n"
+            '[2-3 sentences — describe what you see visually, reference the time range e.g. "around the 3-second mark". '
+            "Compare learner frame to expert frame. Be specific. Include the specific correction needed in that moment "
+            '(e.g. "you needed to rotate your blade X° to the right" or "you needed to steer back left to recover the line").]\n'
+            "✅ **What to do next time:** [1-2 sentences of concrete advice.]\n\n"
         )
     write_prompt += (
-        "🏆 **Priority fix:** The single most important thing to fix, one sentence.\n"
-        "💪 **What you did well:** One genuine positive observation.\n\n"
-        "Rules:\n"
-        "- Write like a human coach, not a report\n"
-        '- Never use technical terms like "deviation", "DTW", "corridor", "pixel", "peak frame"\n'
-        "- Be specific and visual — describe what you actually see\n"
+        "🏆 **Priority fix:** [One sentence — the most important thing to fix.]\n"
+        "💪 **What you did well:** [One genuine positive observation.]\n\n"
+        "STRICT RULES:\n"
+        '- Never say "frame", "error frame", "Error 1/2/3", "deviation", "DTW", "corridor", "pixel"\n'
+        '- Always reference errors by time range e.g. "around 3s" or "between 2s and 5s"\n'
+        "- Each Issue block must have exactly the ⚠️ header, 2-3 sentences, and ✅ line\n"
+        "- Do not add any text before 🎯 or after the 💪 line\n"
         "- Keep total response under 400 words\n"
-        "- The task could be any crafting or practical skill — reason from the visuals\n"
-        '- Reference errors by their time range (e.g. "around the 3-second mark" or "between 2s and 5s") — never say "frame" or "Error 1/2/3"\n'
+        '- Always address the learner directly as "you", never say "the learner"\n'
+        "- For each issue, explain what specific correction was needed in that moment — make it feel like real-time coaching\n"
     )
     user_content.append({"type": "text", "text": write_prompt})
 

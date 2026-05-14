@@ -21,3 +21,6 @@ imageio-ffmpeg
 imageio-ffmpeg
 mediapipe
 psycopg2-binary
+Pillow
+groq
+google-genai
