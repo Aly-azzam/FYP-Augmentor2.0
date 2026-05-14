@@ -231,6 +231,71 @@ async def generate_visualization(
     return {"status": "done", "visualization_url": visualization_url}
 
 
+# ── On-demand VLM feedback generation ────────────────────────────────────────
+
+@router.post("/{evaluation_id}/generate-feedback")
+async def generate_feedback(
+    evaluation_id: str,
+    body: dict = Body(...),
+):
+    """Generate VLM coaching feedback for a completed evaluation run.
+
+    Body: { "run_id": "<uuid>", "expert_id": "<uuid>" }
+    Returns: { "status": "done", "feedback": "<text>", "feedback_url": "/storage/..." }
+
+    If feedback.json already exists for this run it is returned without calling the API.
+    """
+    run_id: str | None = body.get("run_id")
+    expert_id: str | None = body.get("expert_id")
+    if not run_id:
+        raise HTTPException(status_code=400, detail="run_id is required in the request body.")
+    if not expert_id:
+        raise HTTPException(status_code=400, detail="expert_id is required in the request body.")
+
+    feedback_path = (
+        Path(settings.STORAGE_ROOT) / "evaluation" / run_id / "vlm" / "feedback.json"
+    )
+
+    if feedback_path.exists():
+        with open(feedback_path, encoding="utf-8") as fh:
+            cached = json.load(fh)
+        return {
+            "status": "done",
+            "feedback": cached.get("feedback", ""),
+            "feedback_url": f"/storage/evaluation/{run_id}/vlm/feedback.json",
+        }
+
+    output_dir = str(Path(settings.STORAGE_ROOT) / "evaluation" / run_id / "visualization")
+
+    try:
+        from app.services.evaluation.vlm_feedback import generate_feedback as _generate_feedback  # noqa: PLC0415
+
+        saved_path = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: _generate_feedback(
+                run_id=run_id,
+                expert_id=expert_id,
+                output_dir=output_dir,
+            ),
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Feedback generation failed: {exc}",
+        ) from exc
+
+    with open(saved_path, encoding="utf-8") as fh:
+        result = json.load(fh)
+
+    return {
+        "status": "done",
+        "feedback": result.get("feedback", ""),
+        "feedback_url": f"/storage/evaluation/{run_id}/vlm/feedback.json",
+    }
+
+
 # ── SSE stream ─────────────────────────────────────────────────────────────────
 
 @router.get("/{evaluation_id}/status-stream")
@@ -299,8 +364,40 @@ def _mark_hits_error(sx: float, sy: float, mark_type: str, error: dict) -> bool:
     return bb["x_min"] <= sx <= bb["x_max"] and bb["y_min"] <= sy <= bb["y_max"]
 
 
+def _run_feedback_bg(run_id: str, expert_id: str, output_dir: str) -> None:
+    try:
+        from app.services.evaluation.vlm_feedback import generate_feedback as _gen  # noqa: PLC0415
+        _gen(run_id=run_id, expert_id=expert_id, output_dir=output_dir)
+        print(f"[VLM] feedback generation complete for run {run_id}", flush=True)
+    except Exception as exc:
+        import traceback
+        print(f"[VLM] FAILED for run {run_id}:", flush=True)
+        traceback.print_exc()
+
+
+@router.get("/{evaluation_id}/generate-feedback")
+async def get_feedback_status(evaluation_id: str, run_id: str, expert_id: str = ""):
+    """Poll whether VLM coaching feedback is ready for a completed run.
+
+    Returns { "status": "pending" } while generation is in progress,
+    or { "status": "done", "feedback": "...", "feedback_url": "..." } once ready.
+    """
+    feedback_path = (
+        Path(settings.STORAGE_ROOT) / "evaluation" / run_id / "vlm" / "feedback.json"
+    )
+    if not feedback_path.exists():
+        return {"status": "pending"}
+    with open(feedback_path, encoding="utf-8") as fh:
+        cached = json.load(fh)
+    return {
+        "status": "done",
+        "feedback": cached.get("feedback", ""),
+        "feedback_url": f"/storage/evaluation/{run_id}/vlm/feedback.json",
+    }
+
+
 @router.post("/{evaluation_id}/score")
-async def score_evaluation(evaluation_id: str, body: dict = Body(...)):
+async def score_evaluation(evaluation_id: str, background_tasks: BackgroundTasks, body: dict = Body(...)):
     """Score the learner's X-mark game attempt against the stored unified errors.
 
     Body: { "run_id": "...", "marks": [ { mark_type, x, y, timestamp_sec,
@@ -386,6 +483,18 @@ async def score_evaluation(evaluation_id: str, body: dict = Body(...)):
     )
     with open(score_path, "w") as fh:
         json.dump(result, fh, indent=2)
+
+    # Kick off VLM feedback generation in the background (non-blocking).
+    expert_id: str | None = unified.get("expert_id")
+    if expert_id:
+        feedback_file = (
+            Path(settings.STORAGE_ROOT) / "evaluation" / run_id / "vlm" / "feedback.json"
+        )
+        if not feedback_file.exists():
+            output_dir = str(
+                Path(settings.STORAGE_ROOT) / "evaluation" / run_id / "visualization"
+            )
+            background_tasks.add_task(_run_feedback_bg, run_id, expert_id, output_dir)
 
     return result
 

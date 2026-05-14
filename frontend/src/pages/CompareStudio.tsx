@@ -376,6 +376,14 @@ function formatMetricValue(value: unknown): string {
   return Number.isInteger(value) ? String(value) : value.toFixed(3);
 }
 
+function renderFeedback(text: string) {
+  return text.split(/(\*\*[^*]+\*\*)/).map((chunk, i) =>
+    chunk.startsWith('**') && chunk.endsWith('**')
+      ? <strong key={i}>{chunk.slice(2, -2)}</strong>
+      : chunk,
+  );
+}
+
 const TOUR_STEPS = [
   {
     title: 'Welcome to Compare Studio',
@@ -523,6 +531,9 @@ export default function CompareStudio() {
   const [activeMarkType, setActiveMarkType] = useState<MarkType | null>(null);
   const [userMarks, setUserMarks] = useState<UserMark[]>([]);
   const [scoreResult, setScoreResult] = useState<ScoreResult | null>(null);
+  const [feedbackText, setFeedbackText] = useState<string | null>(null);
+  const [feedbackStatus, setFeedbackStatus] = useState<'idle' | 'loading' | 'done'>('idle');
+  const feedbackPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // MediaPipe integration state.
   const [mediapipeRun, setMediapipeRun] = useState<MediaPipeRunResult | null>(null);
@@ -817,6 +828,54 @@ export default function CompareStudio() {
       }
     };
   }, []);
+
+  // Poll for VLM coaching feedback once the score result panel appears.
+  useEffect(() => {
+    if (gamePhase !== 'result' || !evalEvaluationId || !evalRunId || !selectedClip) return;
+
+    setFeedbackStatus('loading');
+    setFeedbackText(null);
+    let cancelled = false;
+    let attempts = 0;
+
+    const poll = async () => {
+      if (cancelled) return;
+      attempts++;
+      if (attempts > 60) {
+        clearInterval(pollId);
+        setFeedbackStatus('done');
+        setFeedbackText('Your Crafting Coach is taking longer than expected. Please try again later.');
+        return;
+      }
+      try {
+        const res = await fetch(
+          `/api/evaluations/${encodeURIComponent(evalEvaluationId)}/generate-feedback` +
+          `?run_id=${encodeURIComponent(evalRunId)}&expert_id=${encodeURIComponent(selectedClip)}`,
+        );
+        if (cancelled || !res.ok) return;
+        const data = await res.json() as { status: string; feedback?: string };
+        if (!cancelled && data.status === 'done' && data.feedback) {
+          setFeedbackText(data.feedback);
+          setFeedbackStatus('done');
+          cancelled = true;
+          if (feedbackPollRef.current) {
+            clearInterval(feedbackPollRef.current);
+            feedbackPollRef.current = null;
+          }
+        }
+      } catch { /* keep polling */ }
+    };
+
+    void poll();
+    const pollId = setInterval(() => void poll(), 3000);
+    feedbackPollRef.current = pollId;
+
+    return () => {
+      cancelled = true;
+      clearInterval(pollId);
+      feedbackPollRef.current = null;
+    };
+  }, [gamePhase, evalEvaluationId, evalRunId, selectedClip]);
 
   // ── Video upload ─────────────────────────────────────────────────────────
 
@@ -2807,6 +2866,8 @@ export default function CompareStudio() {
                       setActiveMarkType(null);
                       setUserMarks([]);
                       setScoreResult(null);
+                      setFeedbackText(null);
+                      setFeedbackStatus('idle');
                     }}
                   >
                     <RotateCcw size={14} />
@@ -2892,6 +2953,8 @@ export default function CompareStudio() {
                       setActiveMarkType(null);
                       setUserMarks([]);
                       setScoreResult(null);
+                      setFeedbackText(null);
+                      setFeedbackStatus('idle');
                     }}
                   >
                     <RotateCcw size={14} />
@@ -4270,6 +4333,68 @@ export default function CompareStudio() {
           </Tabs>
         </motion.div>
       </div>
+
+      {/* ─── VLM Coach Feedback ───────────────────────────────────────── */}
+      <AnimatePresence>
+        {gamePhase === 'result' && (feedbackStatus === 'loading' || feedbackStatus === 'done') && (
+          <motion.div
+            key="coach-feedback"
+            initial={{ opacity: 0, y: 16 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: 8 }}
+            style={{ marginTop: 'var(--space-lg)' }}
+          >
+            {feedbackStatus === 'loading' && (
+              <div
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  gap: 'var(--space-sm)',
+                  padding: 'var(--space-lg)',
+                  color: 'var(--text-muted)',
+                  fontSize: '0.875rem',
+                }}
+              >
+                <Loader2 size={16} style={{ animation: 'spin 1s linear infinite', flexShrink: 0 }} />
+                Your Crafting Coach is reviewing your practice...
+              </div>
+            )}
+            {feedbackStatus === 'done' && feedbackText && (
+              <div
+                style={{
+                  background: 'var(--bg-secondary)',
+                  border: '1px solid var(--border-subtle)',
+                  borderRadius: 'var(--radius-lg)',
+                  padding: 'var(--space-xl)',
+                }}
+              >
+                <p
+                  style={{
+                    fontWeight: 700,
+                    fontSize: '1.05rem',
+                    color: 'var(--accent-primary)',
+                    margin: '0 0 var(--space-md) 0',
+                  }}
+                >
+                  🎓 Your Crafting Coach
+                </p>
+                <p
+                  style={{
+                    lineHeight: 1.75,
+                    margin: 0,
+                    whiteSpace: 'pre-wrap',
+                    color: 'var(--text-primary)',
+                    fontSize: '0.9375rem',
+                  }}
+                >
+                  {renderFeedback(feedbackText)}
+                </p>
+              </div>
+            )}
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       {/* ─── Guided Tour Overlay ───────────────────────────────────────── */}
       <AnimatePresence>
