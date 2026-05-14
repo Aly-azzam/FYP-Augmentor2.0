@@ -5,7 +5,8 @@ from typing import List, Literal
 import cv2
 import numpy as np
 
-from .schemas import FrameFlowFeatures, VideoFlowSummary
+from .schemas import FrameFlowFeatures, VideoFlowSummary, VibrationAnalysis
+from .vibration_classifier import classify_vibration
 
 
 def compute_magnitude_and_angle(flow: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -444,6 +445,7 @@ def build_video_flow_summary(
             vibration_consistency_score=0.0,
             consistent_freq_hz=0.0,
             max_consecutive_windows=0,
+            vibration_analysis=VibrationAnalysis(),
         )
 
     raw_mean_magnitudes = [f.mean_magnitude for f in frame_features]
@@ -523,7 +525,7 @@ def build_video_flow_summary(
     roi_area_ratios = [f.roi_area_ratio for f in frame_features if f.roi_used]
     average_roi_area_ratio = _safe_mean(roi_area_ratios)
 
-    return VideoFlowSummary(
+    summary = VideoFlowSummary(
         avg_magnitude=round(avg_magnitude, 6),
         peak_magnitude=round(peak_magnitude, 6),
         avg_motion_area_ratio=round(avg_motion_area_ratio, 6),
@@ -560,3 +562,5 @@ def build_video_flow_summary(
         consistent_freq_hz=round(consistent_freq_hz, 4),
         max_consecutive_windows=max_consecutive_windows,
     )
+    summary.vibration_analysis = classify_vibration(summary)
+    return summary

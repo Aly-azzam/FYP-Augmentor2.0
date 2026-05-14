@@ -357,6 +357,22 @@ class VideoFlowSummary(BaseModel):
         ge=0,
         description="Length of the longest streak of windows with consistent vibration frequency",
     )
+    vibration_analysis: Optional[VibrationAnalysis] = None
+
+
+class AffectedWindow(BaseModel):
+    timestamp_sec: float
+    confidence: float
+    freq_hz: float
+
+
+class VibrationAnalysis(BaseModel):
+    vibration_detected: bool = False
+    severity: str = "none"  # "none", "mild", "moderate", "severe"
+    peak_timestamp_sec: float = 0.0
+    peak_freq_hz: float = 0.0
+    duration_sec: float = 0.0
+    affected_windows: list[AffectedWindow] = []
 
 
 class ComparisonInfo(BaseModel):
