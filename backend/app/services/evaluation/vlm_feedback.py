@@ -127,6 +127,10 @@ def generate_feedback(run_id: str, expert_id: str, output_dir: str) -> str:
         if li is not None and ei is not None:
             dtw_lookup[int(li)] = int(ei)
     dtw_learner_frames = sorted(dtw_lookup.keys())
+    dtw_by_learner_frame: dict[int, dict] = {
+        int(m["learner_frame_index"]): m
+        for m in dtw_data.get("matches", [])
+    }
 
     # ── Load expert video path ────────────────────────────────────────────────
     expert_meta_path = (
@@ -154,7 +158,10 @@ def generate_feedback(run_id: str, expert_id: str, output_dir: str) -> str:
         'You are "Your Crafting Coach" — a warm, casual, encouraging coach who gives honest '
         "feedback to learners practicing hands-on crafting skills. You explain mistakes clearly "
         "like a friend who really knows what they're talking about. You use emojis naturally. "
-        "You never sound robotic or like a report. You always end on a motivating note."
+        "You never sound robotic or like a report. You always end on a motivating note. "
+        "Errors can be of three types: blade angle errors (wrong tilt), trajectory errors "
+        "(drifting off the cutting path), and vibration errors (hand tremor/shaking). "
+        "Each type needs different advice."
     )
 
     user_content: list[dict] = []
@@ -179,17 +186,34 @@ def generate_feedback(run_id: str, expert_id: str, output_dir: str) -> str:
                 (frame_start, frame_end), (frame_start + frame_end) // 2
             )
             peak_deg = error.get("peak_angle_diff_deg") or 0.0
-            correction = (
-                f"The learner's blade was {peak_deg:.0f}° off from the expert angle. "
-                "Look at the two lines in the image — the white line is the learner, the cyan line is the expert. "
-                "Describe which direction (clockwise or counter-clockwise, left or right) the learner needed to "
-                "rotate their blade to match the expert."
-            )
+            peak_match = dtw_by_learner_frame.get(peak_frame)
+            if peak_match:
+                learner_a = peak_match["learner_angle"]
+                expert_a  = peak_match["expert_angle"]
+                diff = expert_a - learner_a
+                while diff > 180:  diff -= 360
+                while diff < -180: diff += 360
+                rotation_direction = "clockwise" if diff > 0 else "counter-clockwise"
+            else:
+                rotation_direction = None
+
+            if rotation_direction:
+                correction = (
+                    f"The learner's blade was {peak_deg:.0f}° off from the expert angle. "
+                    f"To correct this, the learner needed to rotate their blade {rotation_direction} "
+                    f"by approximately {peak_deg:.0f}° to match the expert's position."
+                )
+            else:
+                correction = (
+                    f"The learner's blade was {peak_deg:.0f}° off from the expert angle. "
+                    f"Adjust the blade angle to match the expert."
+                )
             error_desc = f"Blade angle was {peak_deg:.0f}° off the expert angle\n{correction}"
             t_start = error.get("timestamp_start_sec", round(frame_start / 30, 1))
             t_end = error.get("timestamp_end_sec", round(frame_end / 30, 1))
             label = f"Angle error (from {t_start}s to {t_end}s)"
-        else:
+
+        elif error_type == "trajectory":
             peak_frame = (frame_start + frame_end) // 2
             deviation = error.get("peak_deviation_px") or 0.0
             drift_dir = "right" if deviation > 0 else "left"
@@ -199,14 +223,35 @@ def generate_feedback(run_id: str, expert_id: str, output_dir: str) -> str:
                 f"The scissors drifted {drift_dir} of the expert path. To self-correct, "
                 f"the learner needed to steer back {correct_dir} toward the cutting line."
             )
-            t_start = round(frame_start / 30, 1)
-            t_end = round(frame_end / 30, 1)
+            t_start = error.get("timestamp_start_sec", round(frame_start / 30, 1))
+            t_end = error.get("timestamp_end_sec", round(frame_end / 30, 1))
             label = f"Trajectory error (from {t_start}s to {t_end}s)"
+
+        elif error_type == "vibration":
+            peak_frame = (frame_start + frame_end) // 2
+            freq = error.get("dominant_freq_hz", 0.0)
+            severity = error.get("severity", "mild")
+            t_start = error.get("timestamp_start_sec", round(frame_start / 30, 1))
+            t_end   = error.get("timestamp_end_sec",   round(frame_end   / 30, 1))
+            label   = f"Hand tremor / vibration (from {t_start}s to {t_end}s)"
+            error_desc = (
+                f"Hand tremor detected at {freq:.1f}Hz with {severity} severity.\n"
+                f"During this period the scissors were shaking rather than moving smoothly. "
+                f"This kind of involuntary tremor affects cut precision and quality. "
+                f"To correct this: slow down the cutting motion, press the elbow gently against "
+                f"the body for stability, and focus on a relaxed but firm grip — tension in the "
+                f"hand makes tremor worse. No expert frame comparison needed for this error type."
+            )
+            expert_b64 = None
+
+        else:
+            continue
 
         expert_frame = _find_expert_frame(peak_frame, dtw_learner_frames, dtw_lookup)
 
         learner_b64 = _read_frame_b64(vis_video_path, peak_frame)
-        expert_b64 = _read_frame_b64(expert_video_path, expert_frame)
+        if error_type != "vibration":
+            expert_b64 = _read_frame_b64(expert_video_path, expert_frame)
 
         user_content.append({"type": "text", "text": f"--- {label} ---\n"})
 
@@ -247,6 +292,13 @@ def generate_feedback(run_id: str, expert_id: str, output_dir: str) -> str:
         "- Keep total response under 400 words\n"
         '- Always address the learner directly as "you", never say "the learner"\n'
         "- For each issue, explain what specific correction was needed in that moment — make it feel like real-time coaching\n"
+        "- Vibration and tremor issues must always be described as hand shaking or instability, "
+        "never as trajectory drift or angle deviation\n"
+        "- For vibration issues focus on grip, posture, elbow stability and slow controlled motion\n"
+        "- Never mention lines, overlays, cyan, white, colors, or any visual annotation — "
+        "describe corrections only in terms of hand, wrist, blade, and body movements\n"
+        "- The rotation direction (clockwise or counter-clockwise) is already provided to you — "
+        "use it exactly as given, do not override it based on what you see in the image\n"
     )
     user_content.append({"type": "text", "text": write_prompt})
 
