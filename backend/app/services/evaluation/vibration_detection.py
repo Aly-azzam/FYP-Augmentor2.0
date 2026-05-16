@@ -33,6 +33,7 @@ import json
 import os
 import threading
 import time
+from pathlib import Path
 from typing import Any
 
 import cv2
@@ -256,6 +257,8 @@ def _compute_flow_in_roi(
     frame_height: int,
     raft_ok: bool,
     raft_model_tuple: tuple | None,
+    hsv_cache: dict | None = None,
+    frame_idx: int = -1,
 ) -> dict[str, float]:
     """Compute dense optical flow inside *roi* and return magnitude features.
 
@@ -364,6 +367,19 @@ def _compute_flow_in_roi(
             flow = cv2.resize(flow_small, (fb_W, fb_H), interpolation=cv2.INTER_LINEAR)
         else:
             flow = flow_small
+
+    if hsv_cache is not None and frame_idx >= 0 and flow is not None:
+        try:
+            mag, ang = cv2.cartToPolar(flow[..., 0], flow[..., 1])
+            hsv_img = np.zeros((flow.shape[0], flow.shape[1], 3), dtype=np.uint8)
+            hsv_img[..., 0] = ang * 180 / np.pi / 2
+            hsv_img[..., 1] = 255
+            hsv_img[..., 2] = cv2.normalize(mag, None, 0, 255, cv2.NORM_MINMAX)
+            bgr_hsv = cv2.cvtColor(hsv_img, cv2.COLOR_HSV2BGR)
+            _, jpeg_buf = cv2.imencode(".jpg", bgr_hsv, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            hsv_cache[frame_idx] = jpeg_buf.tobytes()
+        except Exception:  # noqa: BLE001
+            pass
 
     return _flow_magnitude_features(flow)
 
@@ -701,6 +717,7 @@ async def run_vibration_detection(
 
     _first_batch_done = [False]
     _first_crop_done  = [False]
+    _hsv_cache: dict[int, bytes] = {}  # frame_idx → JPEG bytes of HSV flow frame
 
     def _proportional_resize(gray: np.ndarray) -> tuple[np.ndarray, int, int]:
         """Resize *gray* so its longest side ≤ _RAFT_MAX_SIDE (aspect-preserving).
@@ -726,7 +743,7 @@ async def run_vibration_detection(
     def _farneback_pairs(pairs: list[tuple]) -> None:
         """Farneback fallback: proportional-resize then run one at a time."""
         for item in pairs:
-            loop_i, _, gp, gc = item[0], item[1], item[2], item[3]
+            loop_i, fidx_fb, gp, gc = item[0], item[1], item[2], item[3]
             gp_r, _, _ = _proportional_resize(gp)
             gc_r, _, _ = _proportional_resize(gc)
             flow_fb = cv2.calcOpticalFlowFarneback(
@@ -738,6 +755,17 @@ async def run_vibration_detection(
                 flags=_FB_FLAGS,
             )
             results_map[loop_i] = _flow_magnitude_features(flow_fb)
+            try:
+                mag, ang = cv2.cartToPolar(flow_fb[..., 0], flow_fb[..., 1])
+                hsv_img = np.zeros((flow_fb.shape[0], flow_fb.shape[1], 3), dtype=np.uint8)
+                hsv_img[..., 0] = ang * 180 / np.pi / 2
+                hsv_img[..., 1] = 255
+                hsv_img[..., 2] = cv2.normalize(mag, None, 0, 255, cv2.NORM_MINMAX)
+                bgr_hsv = cv2.cvtColor(hsv_img, cv2.COLOR_HSV2BGR)
+                _, jpeg_buf = cv2.imencode(".jpg", bgr_hsv, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                _hsv_cache[fidx_fb] = jpeg_buf.tobytes()
+            except Exception:  # noqa: BLE001
+                pass
 
     def _flush_bucket(
         bucket: list[tuple],
@@ -820,7 +848,7 @@ async def run_vibration_detection(
                     _first_batch_done[0] = True
 
                 flow_full = preds[-1].float()   # (B, 2, tgt_h, tgt_w)
-                for b_idx, (loop_i, _, _, _, sh, sw) in enumerate(sub_items):
+                for b_idx, (loop_i, fidx_r, _, _, sh, sw) in enumerate(sub_items):
                     # Unpad: take only the proportionally-resized region.
                     flow_np = (
                         flow_full[b_idx, :, :sh, :sw]
@@ -830,6 +858,17 @@ async def run_vibration_detection(
                         .astype(np.float32)
                     )
                     results_map[loop_i] = _flow_magnitude_features(flow_np)
+                    try:
+                        mag, ang = cv2.cartToPolar(flow_np[..., 0], flow_np[..., 1])
+                        hsv_img = np.zeros((flow_np.shape[0], flow_np.shape[1], 3), dtype=np.uint8)
+                        hsv_img[..., 0] = ang * 180 / np.pi / 2
+                        hsv_img[..., 1] = 255
+                        hsv_img[..., 2] = cv2.normalize(mag, None, 0, 255, cv2.NORM_MINMAX)
+                        bgr_hsv = cv2.cvtColor(hsv_img, cv2.COLOR_HSV2BGR)
+                        _, jpeg_buf = cv2.imencode(".jpg", bgr_hsv, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                        _hsv_cache[fidx_r] = jpeg_buf.tobytes()
+                    except Exception:  # noqa: BLE001
+                        pass
 
             except _t.cuda.OutOfMemoryError:  # type: ignore[attr-defined]
                 half = batch_size // 2
@@ -890,6 +929,8 @@ async def run_vibration_detection(
                 prev_bgr_f, curr_bgr_f, roi,
                 frame_width, frame_height,
                 False, None,
+                hsv_cache=_hsv_cache,
+                frame_idx=fidx,
             )
 
         if (i + 1) % 100 == 0:
@@ -943,6 +984,25 @@ async def run_vibration_detection(
         flush=True,
     )
 
+    # ── Save HSV frames for vibration event windows only ──────────────────────
+    hsv_frames_dir = Path(output_dir) / "hsv_frames"
+    hsv_frame_indices_saved: list[int] = []
+    if vibration_events and _hsv_cache:
+        hsv_frames_dir.mkdir(parents=True, exist_ok=True)
+        saved_count = 0
+        for event in vibration_events:
+            for fidx_ev in range(event["start_frame"], event["end_frame"] + 1):
+                if fidx_ev in _hsv_cache:
+                    frame_path = hsv_frames_dir / f"frame_{fidx_ev:05d}.jpg"
+                    frame_path.write_bytes(_hsv_cache[fidx_ev])
+                    hsv_frame_indices_saved.append(fidx_ev)
+                    saved_count += 1
+        print(
+            f"[VIBRATION] Saved {saved_count} HSV frames to {hsv_frames_dir}",
+            flush=True,
+        )
+    _hsv_cache.clear()
+
     # ── Aggregate statistics ──────────────────────────────────────────────────
     mags_arr       = np.asarray(raw_mags, dtype=np.float32)
     avg_magnitude  = round(float(mags_arr.mean()), 6)
@@ -962,6 +1022,8 @@ async def run_vibration_detection(
         "frame_width":         frame_width,
         "frame_height":        frame_height,
         "processing_time_sec": processing_time,
+        "hsv_frames_dir":      str(hsv_frames_dir) if hsv_frame_indices_saved else None,
+        "hsv_frame_indices":   hsv_frame_indices_saved,
     }
 
     raw_payload: dict[str, Any] = {

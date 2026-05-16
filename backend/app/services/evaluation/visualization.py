@@ -16,9 +16,10 @@ _BACKEND_ROOT = Path(__file__).resolve().parents[3]
 
 _CORRIDOR_COLOR = (0, 0, 220)      # BGR red  (Component 1 — do not touch)
 
-_FREEZE_TOTAL       = 45   # duplicate frames inserted at each trajectory peak
-_FREEZE_ANIM        = 20   # frames over which trajectory annotation animates in
-_ANGLE_FREEZE_TOTAL = 150  # duplicate frames inserted at each angle peak
+_FREEZE_TOTAL            = 45   # duplicate frames inserted at each trajectory peak
+_FREEZE_ANIM             = 20   # frames over which trajectory annotation animates in
+_ANGLE_FREEZE_TOTAL      = 150  # duplicate frames inserted at each angle peak
+_VIBRATION_SLOW_FACTOR   = 3    # each vibration frame written this many times (3× slow-mo)
 
 
 # ── Fonts for annotation box ──────────────────────────────────────────────────
@@ -402,6 +403,62 @@ def _render_angle_freeze(
                      (0, 165, 255), 1, cv2.LINE_AA)
 
 
+# ── Vibration annotation renderer ─────────────────────────────────────────────
+
+def _render_vibration_annotation(
+    frame: np.ndarray,
+    lx: float,
+    ly: float,
+    freq_hz: float,
+    severity: str,
+    ts_start: float,
+    ts_end: float,
+    t: float,
+    width: int,
+    height: int,
+) -> None:
+    """Draw vibration-error freeze annotation onto frame in-place at animation progress t.
+
+    Matches the visual style of _render_freeze_annotation and _render_angle_freeze:
+    dark semi-transparent panel, amber border, PIL text, connecting line.
+    """
+    ease = 1.0 - (1.0 - t) ** 2
+
+    ox, oy = int(round(lx)), int(round(ly))
+
+    # Pulsing amber dot at blade-tip location
+    pulse = 0.5 + 0.5 * math.sin(t * math.pi * 4)
+    dot_r = int(round(8 + 5 * pulse))
+    dot_ov = frame.copy()
+    cv2.circle(dot_ov, (ox, oy), dot_r, (0, 165, 255), -1, cv2.LINE_AA)
+    cv2.addWeighted(dot_ov, 0.88, frame, 0.12, 0, frame)
+
+    # Annotation box sliding in from right — same as trajectory/angle style
+    box_w, box_h = 400, 110
+    margin   = 20
+    target_x = width - box_w - margin
+    box_x    = int(round(width + (target_x - width) * ease))
+    box_y    = max(margin, min(height - box_h - margin, oy - box_h // 2))
+
+    panel_ov = frame.copy()
+    cv2.rectangle(panel_ov, (box_x, box_y), (box_x + box_w, box_y + box_h), (20, 20, 20), -1)
+    cv2.addWeighted(panel_ov, 0.82, frame, 0.18, 0, frame)
+    cv2.rectangle(frame, (box_x, box_y), (box_x + box_w, box_y + box_h), (0, 165, 255), 1)
+
+    pil  = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    draw = ImageDraw.Draw(pil)
+    tx   = box_x + 14
+    draw.text((tx, box_y + 8),  "HAND TREMOR DETECTED",                                font=_FONT_ACCENT, fill=(255, 165, 0))
+    draw.text((tx, box_y + 36), f"{ts_start:.1f}s  to  {ts_end:.1f}s",                 font=_FONT_BODY,   fill=(255, 255, 255))
+    draw.text((tx, box_y + 58), f"Frequency: {freq_hz:.1f} Hz  |  {severity.upper()}", font=_FONT_BODY,   fill=(200, 200, 200))
+    draw.text((tx, box_y + 80), "Slow motion replay follows",                           font=_FONT_SMALL,  fill=(160, 160, 160))
+    frame[:] = cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
+
+    # Thin connecting line from dot to left edge of annotation box
+    if ease > 0.02:
+        cv2.line(frame, (ox, oy), (box_x, box_y + box_h // 2), (0, 165, 255), 1, cv2.LINE_AA)
+
+
 # ── Main renderer ─────────────────────────────────────────────────────────────
 
 def render_visualization(
@@ -538,11 +595,55 @@ def render_visualization(
     # ── Trajectory errors → freeze events ─────────────────────────────────────
     traj_errors: list[dict] = []
     angle_errors_raw: list[dict] = []
+    vibration_errors_raw: list[dict] = []
     if errors_path.is_file():
         with open(errors_path) as f:
             _errors_data = json.load(f)
-        traj_errors       = _errors_data.get("trajectory_errors", [])
-        angle_errors_raw  = _errors_data.get("angle_errors", [])
+        traj_errors          = _errors_data.get("trajectory_errors", [])
+        angle_errors_raw     = _errors_data.get("angle_errors", [])
+        vibration_errors_raw = _errors_data.get("vibration_errors", [])
+
+    # ── Vibration HSV frame overlay data ─────────────────────────────────────
+    _vibration_active: bool = False          # stays False unless all three conditions pass
+    vibration_hsv_frames: dict[int, np.ndarray] = {}
+    vibration_frame_windows: list[tuple[int, int]] = []
+
+    vibration_summary_path = (
+        _BACKEND_ROOT / "storage" / "evaluation" / run_id / "vibration" / "vibration_summary.json"
+    )
+    if vibration_summary_path.is_file():
+        with open(vibration_summary_path) as f:
+            vib_summary = json.load(f)
+
+        _vib_events = vib_summary.get("vibration_events", [])
+
+        # Guard: only activate vibration rendering when the pipeline actually detected events
+        if vib_summary.get("vibration_detected", False) and _vib_events:
+            _vibration_active = True
+
+            hsv_frames_dir    = vib_summary.get("hsv_frames_dir")
+            hsv_frame_indices = vib_summary.get("hsv_frame_indices", [])
+
+            if hsv_frames_dir and Path(hsv_frames_dir).is_dir():
+                for fidx in hsv_frame_indices:
+                    frame_path = Path(hsv_frames_dir) / f"frame_{fidx:05d}.jpg"
+                    if frame_path.is_file():
+                        img = cv2.imread(str(frame_path))
+                        if img is not None:
+                            vibration_hsv_frames[fidx] = img
+
+            for event in _vib_events:
+                vibration_frame_windows.append((
+                    int(event["start_frame"]),
+                    int(event["end_frame"]),
+                ))
+
+    print(
+        f"[VIZ] Vibration active={_vibration_active}  "
+        f"HSV frames={len(vibration_hsv_frames)}  "
+        f"windows={len(vibration_frame_windows)}",
+        flush=True,
+    )
 
     lf_dtw_sorted = sorted(learner_to_expert_kf.keys())
 
@@ -607,6 +708,26 @@ def render_visualization(
             "learner_angle_deg": learner_ang,
             "expert_angle_deg":  expert_ang,
             "angle_diff_deg":    angle_diff,
+        }
+
+    # ── Vibration annotation freeze events (fire at START of each window) ─────
+    vibration_freeze_events: dict[int, dict] = {}
+    for err in vibration_errors_raw:
+        f_start = int(err["frame_start"])
+        f_end   = int(err["frame_end"])
+        peak_frame = f_start
+        fc = fc_by_frame.get(peak_frame) or _nearest_fc(peak_frame)
+        lx_v = float(fc["learner_x"]) if fc else float(err.get("peak_location", {}).get("x", 0))
+        ly_v = float(fc["learner_y"]) if fc else float(err.get("peak_location", {}).get("y", 0))
+        vibration_freeze_events[peak_frame] = {
+            "lx":       lx_v,
+            "ly":       ly_v,
+            "freq_hz":  float(err.get("dominant_freq_hz", 0.0)),
+            "severity": str(err.get("severity", "mild")),
+            "ts_start": float(err.get("timestamp_start_sec", f_start / 30.0)),
+            "ts_end":   float(err.get("timestamp_end_sec",   f_end   / 30.0)),
+            "f_start":  f_start,
+            "f_end":    f_end,
         }
 
     # ── Open learner video ────────────────────────────────────────────────────
@@ -728,7 +849,38 @@ def render_visualization(
             for arr_pt1, arr_pt2 in accumulated_arrows:
                 _draw_arrow_alpha(frame, arr_pt1, arr_pt2, (210, 60, 10), 0.65)
 
-            writer.write(frame)
+            # ── Vibration: HSV overlay + slow-motion write ────────────────
+            _in_vibration = _vibration_active and any(
+                f_start <= frame_idx <= f_end
+                for f_start, f_end in vibration_frame_windows
+            )
+
+            if _in_vibration:
+                if frame_idx in vibration_hsv_frames:
+                    hsv_img     = vibration_hsv_frames[frame_idx]
+                    target_h    = height // 3
+                    target_w    = width  // 3
+                    hsv_resized = cv2.resize(hsv_img, (target_w, target_h))
+                    x_off = width  - target_w - 20
+                    y_off = 20
+                    roi_region = frame[y_off:y_off + target_h, x_off:x_off + target_w]
+                    blended    = cv2.addWeighted(hsv_resized, 0.8, roi_region, 0.2, 0)
+                    frame[y_off:y_off + target_h, x_off:x_off + target_w] = blended
+                    cv2.rectangle(
+                        frame,
+                        (x_off, y_off),
+                        (x_off + target_w, y_off + target_h),
+                        (0, 165, 255), 2,
+                    )
+                    pil_lbl  = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                    draw_lbl = ImageDraw.Draw(pil_lbl)
+                    draw_lbl.text((x_off + 8, y_off + 6), "Optical Flow", font=_FONT_SMALL, fill=(255, 165, 0))
+                    frame[:] = cv2.cvtColor(np.array(pil_lbl), cv2.COLOR_RGB2BGR)
+
+                for _ in range(_VIBRATION_SLOW_FACTOR):
+                    writer.write(frame)
+            else:
+                writer.write(frame)
 
             # ── Peak deviation freeze ──────────────────────────────────────
             if frame_idx in freeze_events:
@@ -770,6 +922,22 @@ def render_visualization(
                         ev["learner_angle_deg"], ev["expert_angle_deg"],
                         ev["angle_diff_deg"],
                         anim_i, width, height,
+                    )
+                    writer.write(frozen)
+
+            # ── Vibration annotation freeze — fires at START of each window ─
+            if _vibration_active and frame_idx in vibration_freeze_events:
+                ev_v = vibration_freeze_events[frame_idx]
+                _vib_freeze_frames = int(video_fps * 5)
+                for anim_i in range(_vib_freeze_frames):
+                    frozen = frame.copy()
+                    t_v = min(anim_i / max(_vib_freeze_frames - 1, 1), 1.0)
+                    _render_vibration_annotation(
+                        frozen,
+                        ev_v["lx"], ev_v["ly"],
+                        ev_v["freq_hz"], ev_v["severity"],
+                        ev_v["ts_start"], ev_v["ts_end"],
+                        t_v, width, height,
                     )
                     writer.write(frozen)
 
