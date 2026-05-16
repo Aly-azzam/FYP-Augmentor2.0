@@ -9,6 +9,7 @@ import cv2
 import numpy as np
 
 from .feature_extractor import extract_frame_flow_features
+from .raft_flow_service import _check_raft_available, compute_raft_flow
 from .schemas import FrameFlowFeatures, VideoMetadata
 
 
@@ -151,6 +152,36 @@ def _blur_gray_for_flow(gray: np.ndarray, kernel_size: int) -> np.ndarray:
     if k < 3:
         return gray
     return cv2.GaussianBlur(gray, (k, k), 0)
+
+
+def _compute_flow(
+    prev_gray: np.ndarray,
+    curr_gray: np.ndarray,
+    config: FarnebackConfig,
+) -> np.ndarray:
+    """Try RAFT GPU first, fall back to Farneback on any failure.
+
+    Both input arrays must be (H, W) uint8 grayscale.  The return value is
+    always (H, W, 2) float32 — identical to cv2.calcOpticalFlowFarneback.
+    """
+    if _check_raft_available():
+        try:
+            return compute_raft_flow(prev_gray, curr_gray)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[OF] RAFT failed, falling back to Farneback: {exc}", flush=True)
+
+    return cv2.calcOpticalFlowFarneback(
+        prev=prev_gray,
+        next=curr_gray,
+        flow=None,
+        pyr_scale=config.pyr_scale,
+        levels=config.levels,
+        winsize=config.winsize,
+        iterations=config.iterations,
+        poly_n=config.poly_n,
+        poly_sigma=config.poly_sigma,
+        flags=config.flags,
+    )
 
 
 def read_video_metadata(video_path: str | Path) -> VideoMetadata:
@@ -353,18 +384,7 @@ def compute_video_optical_flow_features(
             if roi is not None:
                 roi_prev = crop_to_roi(prev_for_flow, roi)
                 roi_curr = crop_to_roi(curr_for_flow, roi)
-                roi_flow = cv2.calcOpticalFlowFarneback(
-                    prev=roi_prev,
-                    next=roi_curr,
-                    flow=None,
-                    pyr_scale=config.pyr_scale,
-                    levels=config.levels,
-                    winsize=config.winsize,
-                    iterations=config.iterations,
-                    poly_n=config.poly_n,
-                    poly_sigma=config.poly_sigma,
-                    flags=config.flags,
-                )
+                roi_flow = _compute_flow(roi_prev, roi_curr, config)
                 height, width = curr_gray.shape[:2]
                 flow = embed_roi_flow_in_canvas(
                     roi_flow=roi_flow,
@@ -375,18 +395,7 @@ def compute_video_optical_flow_features(
                 roi_used = True
                 feature_flow = roi_flow if active_roi_source == "yolo_scissors_expanded" else flow
             else:
-                flow = cv2.calcOpticalFlowFarneback(
-                    prev=prev_for_flow,
-                    next=curr_for_flow,
-                    flow=None,
-                    pyr_scale=config.pyr_scale,
-                    levels=config.levels,
-                    winsize=config.winsize,
-                    iterations=config.iterations,
-                    poly_n=config.poly_n,
-                    poly_sigma=config.poly_sigma,
-                    flags=config.flags,
-                )
+                flow = _compute_flow(prev_for_flow, curr_for_flow, config)
                 feature_flow = flow
 
             timestamp_sec = frame_index / fps
