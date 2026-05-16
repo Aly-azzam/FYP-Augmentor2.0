@@ -43,7 +43,8 @@ PROGRESS_STEPS: dict[str, dict] = {
     "trajectory_errors": {"step": "trajectory_errors", "label": "Detecting trajectory errors",      "progress": 55},
     "angle_init":        {"step": "angle_init",        "label": "Analyzing cutting angles",         "progress": 68},
     "angle_track":       {"step": "angle_track",       "label": "Comparing angles to expert",       "progress": 82},
-    "angle_errors":      {"step": "angle_errors",      "label": "Detecting angle errors",           "progress": 92},
+    "angle_errors":      {"step": "angle_errors",      "label": "Detecting angle errors",           "progress": 88},
+    "vibration":         {"step": "vibration",         "label": "Analyzing hand vibration",          "progress": 95},
     "done":              {"step": "done",               "label": "Analysis complete",                "progress": 100},
 }
 
@@ -355,13 +356,28 @@ def _scale_mark(mark: dict) -> tuple[float, float]:
     return mark["x"] * (NATIVE_W / vw), mark["y"] * (NATIVE_H / vh)
 
 
-def _mark_hits_error(sx: float, sy: float, mark_type: str, error: dict) -> bool:
+def _mark_hits_error(
+    sx: float,
+    sy: float,
+    mark_type: str,
+    mark_ts: float | None,
+    error: dict,
+) -> bool:
     if error["error_type"] != mark_type:
         return False
     bb = error.get("bounding_box")
     if bb is None:
         return False
-    return bb["x_min"] <= sx <= bb["x_max"] and bb["y_min"] <= sy <= bb["y_max"]
+    if not (bb["x_min"] <= sx <= bb["x_max"] and bb["y_min"] <= sy <= bb["y_max"]):
+        return False
+    # Vibration errors additionally require the mark timestamp to fall within the event window
+    if error["error_type"] == "vibration" and mark_ts is not None:
+        ts_start = error.get("timestamp_start_sec")
+        ts_end   = error.get("timestamp_end_sec")
+        if ts_start is not None and ts_end is not None:
+            if not (ts_start <= mark_ts <= ts_end):
+                return False
+    return True
 
 
 def _run_feedback_bg(run_id: str, expert_id: str, output_dir: str) -> None:
@@ -423,11 +439,12 @@ async def score_evaluation(evaluation_id: str, background_tasks: BackgroundTasks
 
     for mark in marks:
         sx, sy = _scale_mark(mark)
+        mark_ts: float | None = mark.get("timestamp_sec")
         hit_error: dict | None = None
         for error in errors:
             if error["error_id"] in matched_error_ids:
                 continue
-            if _mark_hits_error(sx, sy, mark["mark_type"], error):
+            if _mark_hits_error(sx, sy, mark["mark_type"], mark_ts, error):
                 hit_error = error
                 break
 
@@ -458,9 +475,14 @@ async def score_evaluation(evaluation_id: str, background_tasks: BackgroundTasks
     missed = len(missed_errors)
     score_pct = round(100 * correct / total_real) if total_real > 0 else 0
 
+    vibration_errors_total = sum(1 for e in errors if e.get("error_type") == "vibration")
+
     result = {
         "run_id": run_id,
         "total_real_errors": total_real,
+        "trajectory_errors_total": sum(1 for e in errors if e.get("error_type") == "trajectory"),
+        "angle_errors_total":      sum(1 for e in errors if e.get("error_type") == "angle"),
+        "vibration_errors_total":  vibration_errors_total,
         "correct_marks": correct,
         "false_alarms": false_alarms,
         "missed_errors": missed,

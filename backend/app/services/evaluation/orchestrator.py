@@ -2,7 +2,7 @@
 
 Step 1 — YOLO (once):
     run_shared_yolo → yolo_detections.json
-    Feeds both SAM2 and the angle pipeline — YOLO never runs twice.
+    Feeds SAM2, angle, and vibration pipelines — YOLO never runs twice.
 
 Step 2 — SAM2 trajectory pipeline:
     run_sam2_pipeline_from_yolo → raw.json, cleaned_trajectory.json,
@@ -14,6 +14,10 @@ Step 3 — Angle + DTW pipeline:
     run_learner_angle_from_yolo → angles.json, dtw_alignment.json,
     learner_angle_comparison.json, run_summary.json,
     learner_comparison_output.mp4
+
+Step 4 — Vibration detection (optical flow):
+    run_vibration_stage → vibration_raw.json, vibration_summary.json
+    detect_vibration_errors → list of unified-error-compatible dicts
 
 Output layout:
     storage/evaluation/{run_id}/
@@ -32,6 +36,9 @@ Output layout:
             learner_angle_comparison.json
             run_summary.json
             learner_comparison_output.mp4
+        vibration/
+            vibration_raw.json
+            vibration_summary.json
         score/
         visualization/
         vlm/
@@ -39,6 +46,7 @@ Output layout:
 
 from __future__ import annotations
 
+import asyncio
 import os
 import time
 import uuid
@@ -82,6 +90,7 @@ def run_evaluation_pipeline(
         "root":          base_dir,
         "trajectory":    f"{base_dir}/trajectory",
         "angle":         f"{base_dir}/angle",
+        "vibration":     f"{base_dir}/vibration",
         "score":         f"{base_dir}/score",
         "visualization": f"{base_dir}/visualization",
         "vlm":           f"{base_dir}/vlm",
@@ -178,6 +187,28 @@ def run_evaluation_pipeline(
     print(f"[TIMING] Angle errors: {time.time() - t0:.1f}s")
     # saves: angle/angle_errors.json
 
+    print("[EVALUATE] Step 3/4 — Angle + DTW pipeline complete")
+
+    # ── Step 4: Vibration detection (optical flow) ────────────────────────────
+    emit_progress("vibration")
+    from app.services.evaluation.vibration_pipeline_stage import (  # noqa: PLC0415
+        run_vibration_stage,
+    )
+
+    t0 = time.time()
+    vibration_errors, vibration_summary = asyncio.run(
+        run_vibration_stage(
+            video_path=learner_video_path,
+            yolo_roi_data=yolo_result["all_detections"],
+            run_id=run_id,
+            base_storage_path=str(_BACKEND_ROOT / "storage"),
+        )
+    )
+    print(f"[TIMING] Vibration stage: {time.time() - t0:.1f}s")
+    # saves to vibration/: vibration_raw.json, vibration_summary.json
+
+    print("[EVALUATE] Step 4/4 — Vibration detection complete")
+
     from app.services.evaluation.merge_errors import merge_errors  # noqa: PLC0415
 
     t0 = time.time()
@@ -186,24 +217,27 @@ def run_evaluation_pipeline(
         angle_errors_path=f"{dirs['angle']}/angle_errors.json",
         aligned_corridor_path=f"{dirs['trajectory']}/aligned_corridor.json",
         output_dir=dirs["score"],
+        vibration_errors=vibration_errors,
     )
     print(f"[TIMING] Merge errors: {time.time() - t0:.1f}s")
     # saves: score/unified_errors.json
 
     emit_progress("done")
 
-    print("[EVALUATE] Step 3/3 — Angle + DTW pipeline complete")
+    print("[EVALUATE] All pipeline stages complete")
     print(f"[TIMING] Total: {time.time() - t_start:.1f}s")
     print(f"[EVALUATE] Run complete — run_id: {run_id}")
 
     return {
         "run_id": run_id,
         "dirs": dirs,
-        "yolo_detections_path":   f"{dirs['root']}/yolo_detections.json",
-        "trajectory_errors_path": f"{dirs['trajectory']}/trajectory_errors.json",
-        "dtw_alignment_path":     f"{dirs['angle']}/dtw_alignment.json",
-        "angle_errors_path":      f"{dirs['angle']}/angle_errors.json",
-        "unified_errors_path":    f"{dirs['score']}/unified_errors.json",
+        "yolo_detections_path":      f"{dirs['root']}/yolo_detections.json",
+        "trajectory_errors_path":    f"{dirs['trajectory']}/trajectory_errors.json",
+        "dtw_alignment_path":        f"{dirs['angle']}/dtw_alignment.json",
+        "angle_errors_path":         f"{dirs['angle']}/angle_errors.json",
+        "vibration_summary_path":    f"{dirs['vibration']}/vibration_summary.json",
+        "vibration_preview_path":    vibration_summary.get("preview_path") or f"{dirs['vibration']}/vibration_errors_preview.png",
+        "unified_errors_path":       f"{dirs['score']}/unified_errors.json",
         "sam2_result": {
             "status": sam2_result.get("status"),
             "raw_json_path": raw_json_path,

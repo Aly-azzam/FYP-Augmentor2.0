@@ -71,6 +71,7 @@ const EVAL_STEPS = [
   'Detecting trajectory errors',
   'Analyzing cutting angles',
   'Comparing angles to expert',
+  'Analyzing hand vibration',
   'Analysis complete',
 ];
 
@@ -88,7 +89,9 @@ const SSE_STEP_INDEX: Record<string, number> = {
   trajectory_errors: 3,
   angle_init: 4,
   angle_track: 5,
-  done: 6,
+  angle_errors: 5,
+  vibration: 6,
+  done: 7,
 };
 
 const SSE_PROGRESS: Record<string, number> = {
@@ -98,6 +101,8 @@ const SSE_PROGRESS: Record<string, number> = {
   trajectory_errors: 60,
   angle_init: 72,
   angle_track: 86,
+  angle_errors: 88,
+  vibration: 95,
   done: 100,
 };
 
@@ -494,7 +499,7 @@ export default function CompareStudio() {
 
   // ── Game phase state ───────────────────────────────────────────────────────
   type GamePhase = 'idle' | 'processing' | 'game' | 'result';
-  type MarkType = 'trajectory' | 'angle';
+  type MarkType = 'trajectory' | 'angle' | 'vibration';
   interface UserMark {
     id: string;
     mark_type: MarkType;
@@ -527,10 +532,25 @@ export default function CompareStudio() {
       peak_location: { x: number; y: number };
     }>;
   }
+  interface UnifiedError {
+    error_id: number;
+    error_type: 'trajectory' | 'angle' | 'vibration';
+    timestamp_start_sec: number;
+    timestamp_end_sec: number;
+    duration_sec: number;
+    peak_location: { x: number; y: number } | null;
+    bounding_box: { x_min: number; y_min: number; x_max: number; y_max: number } | null;
+    dominant_freq_hz?: number | null;
+    peak_confidence?: number | null;
+    severity?: 'mild' | 'moderate' | 'severe' | null;
+    consecutive_windows?: number | null;
+  }
+
   const [gamePhase, setGamePhase] = useState<GamePhase>('idle');
   const [activeMarkType, setActiveMarkType] = useState<MarkType | null>(null);
   const [userMarks, setUserMarks] = useState<UserMark[]>([]);
   const [scoreResult, setScoreResult] = useState<ScoreResult | null>(null);
+  const [gameErrors, setGameErrors] = useState<UnifiedError[]>([]);
   const [feedbackText, setFeedbackText] = useState<string | null>(null);
   const [feedbackStatus, setFeedbackStatus] = useState<'idle' | 'loading' | 'done'>('idle');
   const feedbackPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -829,6 +849,19 @@ export default function CompareStudio() {
     };
   }, []);
 
+  // Load unified errors (for vibration bbox overlay) once the game phase starts.
+  useEffect(() => {
+    if (gamePhase !== 'game' || !evalEvaluationId || !evalRunId) return;
+    let cancelled = false;
+    fetch(`/api/evaluations/${evalEvaluationId}/errors?run_id=${evalRunId}`)
+      .then((r) => r.json())
+      .then((d: { all_errors?: UnifiedError[] }) => {
+        if (!cancelled) setGameErrors(d.all_errors ?? []);
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [gamePhase, evalEvaluationId, evalRunId]);
+
   // Poll for VLM coaching feedback once the score result panel appears.
   useEffect(() => {
     if (gamePhase !== 'result' || !evalEvaluationId || !evalRunId || !selectedClip) return;
@@ -1039,7 +1072,7 @@ export default function CompareStudio() {
           if (step === 'done' || progress === 100) {
             es.close();
             evalEventSourceRef.current = null;
-            setEvalStepIndex(6);
+            setEvalStepIndex(7);
             setEvalProgress(100);
             setEvalPhase('done');
             setPathOverlayState('idle');
@@ -2181,14 +2214,22 @@ export default function CompareStudio() {
                       const resultEntry = scoreResult?.mark_results[markIdx];
                       const isCorrect = resultEntry?.result === 'correct';
                       const isFalseAlarm = resultEntry?.result === 'false_alarm';
+                      const pendingColor =
+                        mark.mark_type === 'vibration' ? '#F59E0B' : '#ef4444';
                       const color =
                         gamePhase === 'result'
                           ? isCorrect
                             ? '#22c55e'
-                            : isFalseAlarm
-                              ? '#ef4444'
-                              : '#ef4444'
-                          : '#ef4444';
+                            : '#ef4444'
+                          : pendingColor;
+                      const symbol =
+                        mark.mark_type === 'trajectory' ? '✕'
+                        : mark.mark_type === 'angle' ? '○'
+                        : '〜';
+                      const fSize =
+                        mark.mark_type === 'trajectory' ? 28
+                        : mark.mark_type === 'vibration' ? 30
+                        : 36;
                       return (
                         <span
                           key={mark.id}
@@ -2203,7 +2244,7 @@ export default function CompareStudio() {
                             left: mark.x,
                             top: mark.y,
                             transform: 'translate(-50%, -50%)',
-                            fontSize: mark.mark_type === 'trajectory' ? 28 : 36,
+                            fontSize: fSize,
                             lineHeight: 1,
                             color,
                             textShadow: '0 0 3px #fff, 0 0 6px #fff',
@@ -2218,7 +2259,7 @@ export default function CompareStudio() {
                             textDecoration: isFalseAlarm && gamePhase === 'result' ? 'line-through' : 'none',
                           }}
                         >
-                          {mark.mark_type === 'trajectory' ? '✕' : '○'}
+                          {symbol}
                         </span>
                       );
                     })}
@@ -2231,6 +2272,14 @@ export default function CompareStudio() {
                         if (!vw || !vh) return null;
                         const dx = e.peak_location.x * (vw / 1920);
                         const dy = e.peak_location.y * (vh / 1080);
+                        const missedSymbol =
+                          e.error_type === 'trajectory' ? '✕'
+                          : e.error_type === 'vibration' ? '〜'
+                          : '○';
+                        const missedSize =
+                          e.error_type === 'trajectory' ? 28
+                          : e.error_type === 'vibration' ? 30
+                          : 36;
                         return (
                           <span
                             key={`missed-${e.error_id}`}
@@ -2240,7 +2289,7 @@ export default function CompareStudio() {
                               left: dx,
                               top: dy,
                               transform: 'translate(-50%, -50%)',
-                              fontSize: e.error_type === 'trajectory' ? 28 : 36,
+                              fontSize: missedSize,
                               lineHeight: 1,
                               color: 'rgba(156,163,175,0.85)',
                               textShadow: '0 0 3px #000',
@@ -2252,7 +2301,7 @@ export default function CompareStudio() {
                               gap: 2,
                             }}
                           >
-                            {e.error_type === 'trajectory' ? '✕' : '○'}
+                            {missedSymbol}
                             <span style={{ fontSize: 9, fontWeight: 600, color: 'rgba(209,213,219,0.9)', lineHeight: 1 }}>
                               missed
                             </span>
@@ -2807,24 +2856,39 @@ export default function CompareStudio() {
                   </div>
 
                   {/* Toggle buttons */}
-                  <div style={{ display: 'flex', gap: 'var(--space-sm)' }}>
-                    {(['trajectory', 'angle'] as const).map((type) => (
-                      <button
-                        key={type}
-                        className={activeMarkType === type ? 'btn btn-primary' : 'btn btn-secondary'}
-                        style={{ flex: 1, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: 6 }}
-                        onClick={() => setActiveMarkType((prev) => (prev === type ? null : type))}
-                      >
-                        <span style={{ fontSize: 16 }}>{type === 'trajectory' ? '✕' : '○'}</span>
-                        {type === 'trajectory' ? 'Path' : 'Angle'}
-                      </button>
-                    ))}
+                  <div style={{ display: 'flex', gap: 'var(--space-sm)', flexWrap: 'wrap' }}>
+                    {(['trajectory', 'angle', 'vibration'] as const).map((type) => {
+                      const isActive = activeMarkType === type;
+                      const isVib = type === 'vibration';
+                      const symbol = type === 'trajectory' ? '✕' : type === 'angle' ? '○' : '〜';
+                      const label  = type === 'trajectory' ? 'Path' : type === 'angle' ? 'Angle' : 'Vibration';
+                      return (
+                        <button
+                          key={type}
+                          className={isActive ? 'btn btn-primary' : 'btn btn-secondary'}
+                          style={{
+                            flex: 1,
+                            display: 'inline-flex',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            gap: 6,
+                            ...(isVib && isActive  ? { background: '#D97706', borderColor: '#B45309', color: '#fff' } : {}),
+                            ...(isVib && !isActive ? { borderColor: '#D97706', color: '#F59E0B' } : {}),
+                          }}
+                          onClick={() => setActiveMarkType((prev) => (prev === type ? null : type))}
+                        >
+                          <span style={{ fontSize: 16 }}>{symbol}</span>
+                          {label}
+                        </button>
+                      );
+                    })}
                   </div>
 
                   {/* Mark counts */}
                   <div className="text-small" style={{ color: 'var(--text-muted)', display: 'flex', flexDirection: 'column', gap: 2 }}>
                     <span>Marks placed: {userMarks.filter((m) => m.mark_type === 'trajectory').length} trajectory</span>
                     <span style={{ paddingLeft: 70 }}>{userMarks.filter((m) => m.mark_type === 'angle').length} angle</span>
+                    <span style={{ paddingLeft: 70, color: '#F59E0B' }}>{userMarks.filter((m) => m.mark_type === 'vibration').length} vibration</span>
                   </div>
 
                   <hr style={{ border: 'none', borderTop: '1px solid var(--border-subtle)', margin: 0 }} />
@@ -2866,6 +2930,7 @@ export default function CompareStudio() {
                       setActiveMarkType(null);
                       setUserMarks([]);
                       setScoreResult(null);
+                      setGameErrors([]);
                       setFeedbackText(null);
                       setFeedbackStatus('idle');
                     }}
@@ -2921,25 +2986,90 @@ export default function CompareStudio() {
                   <hr style={{ border: 'none', borderTop: '1px solid var(--border-subtle)', margin: 0 }} />
 
                   {/* Breakdown by type */}
-                  {(['trajectory', 'angle'] as const).map((type) => {
+                  {(['trajectory', 'angle', 'vibration'] as const).map((type) => {
                     const totalReal = scoreResult.missed_error_details.filter((e) => e.error_type === type).length
                       + scoreResult.mark_results.filter((m) => m.mark_type === type && m.result === 'correct').length;
                     const found = scoreResult.mark_results.filter((m) => m.mark_type === type && m.result === 'correct').length;
+                    if (totalReal === 0 && found === 0) return null;
+                    const label = type === 'trajectory' ? 'Trajectory' : type === 'angle' ? 'Angle' : 'Vibration';
+                    const labelColor = type === 'vibration' ? '#F59E0B' : 'var(--text-secondary)';
                     return (
                       <div
                         key={type}
                         className="text-small"
                         style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}
                       >
-                        <span style={{ textTransform: 'capitalize', color: 'var(--text-secondary)' }}>
-                          {type === 'trajectory' ? 'Trajectory' : 'Angle'}
-                        </span>
+                        <span style={{ color: labelColor }}>{label}</span>
                         <span style={{ color: 'var(--text-muted)' }}>
                           {totalReal} real &nbsp;|&nbsp; {found} found
                         </span>
                       </div>
                     );
                   })}
+
+                  {/* Vibration error detail list */}
+                  {gameErrors.filter((e) => e.error_type === 'vibration').length > 0 && (
+                    <>
+                      <hr style={{ border: 'none', borderTop: '1px solid var(--border-subtle)', margin: 0 }} />
+                      <div>
+                        <p
+                          className="text-small"
+                          style={{ fontWeight: 600, color: '#F59E0B', marginBottom: 6, margin: '0 0 6px' }}
+                        >
+                          Vibration Events
+                        </p>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                          {gameErrors
+                            .filter((e) => e.error_type === 'vibration')
+                            .map((e) => (
+                              <div
+                                key={`vib-detail-${e.error_id}`}
+                                className="text-small"
+                                style={{
+                                  display: 'flex',
+                                  flexDirection: 'column',
+                                  gap: 2,
+                                  padding: '6px 8px',
+                                  background: 'rgba(245,158,11,0.08)',
+                                  border: '1px solid rgba(245,158,11,0.25)',
+                                  borderRadius: 6,
+                                }}
+                              >
+                                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                                  <span style={{ color: '#F59E0B', fontWeight: 600 }}>
+                                    〜 Vibration #{e.error_id}
+                                  </span>
+                                  {e.severity && (
+                                    <span
+                                      style={{
+                                        fontSize: 10,
+                                        fontWeight: 700,
+                                        textTransform: 'uppercase',
+                                        letterSpacing: '0.04em',
+                                        color:
+                                          e.severity === 'severe' ? '#ef4444'
+                                          : e.severity === 'moderate' ? '#F59E0B'
+                                          : '#a3a3a3',
+                                      }}
+                                    >
+                                      {e.severity}
+                                    </span>
+                                  )}
+                                </div>
+                                <div style={{ color: 'var(--text-muted)', display: 'flex', gap: 12 }}>
+                                  <span>
+                                    {e.timestamp_start_sec.toFixed(1)}s – {e.timestamp_end_sec.toFixed(1)}s
+                                  </span>
+                                  {e.dominant_freq_hz != null && (
+                                    <span>{e.dominant_freq_hz.toFixed(1)} Hz</span>
+                                  )}
+                                </div>
+                              </div>
+                            ))}
+                        </div>
+                      </div>
+                    </>
+                  )}
 
                   <button
                     className="btn btn-primary"
@@ -2953,6 +3083,7 @@ export default function CompareStudio() {
                       setActiveMarkType(null);
                       setUserMarks([]);
                       setScoreResult(null);
+                      setGameErrors([]);
                       setFeedbackText(null);
                       setFeedbackStatus('idle');
                     }}

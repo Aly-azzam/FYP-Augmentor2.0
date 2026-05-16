@@ -1,10 +1,11 @@
-"""Merge trajectory and angle errors into a single unified_errors.json.
+"""Merge trajectory, angle, and vibration errors into a single unified_errors.json.
 
 Inputs
 ------
 storage/evaluation/{run_id}/trajectory/trajectory_errors.json
 storage/evaluation/{run_id}/angle/angle_errors.json
 storage/evaluation/{run_id}/trajectory/aligned_corridor.json
+vibration_errors (optional) — pre-built list from detect_vibration_errors()
 
 Output
 ------
@@ -89,8 +90,9 @@ def merge_errors(
     angle_errors_path: str,
     aligned_corridor_path: str,
     output_dir: str,
+    vibration_errors: list[dict] | None = None,
 ) -> dict:
-    """Merge trajectory and angle error events into one sorted unified list.
+    """Merge trajectory, angle, and vibration error events into one sorted unified list.
 
     Parameters
     ----------
@@ -104,6 +106,10 @@ def merge_errors(
     output_dir:
         Directory where ``unified_errors.json`` is written
         (typically ``storage/evaluation/{run_id}/score/``).
+    vibration_errors:
+        Optional list of pre-built error dicts from ``detect_vibration_errors()``.
+        Each dict already contains a ``bounding_box`` and matches the unified
+        schema.  Defaults to an empty list when not provided.
 
     Returns
     -------
@@ -162,6 +168,12 @@ def merge_errors(
             "mean_angle_diff_deg": e.get("mean_angle_diff_deg"),
         })
 
+    # Vibration errors arrive pre-built with bboxes — just append them
+    vib_errors: list[dict] = list(vibration_errors) if vibration_errors else []
+    for e in vib_errors:
+        e["error_id"] = None  # will be reassigned below
+        all_errors.append(e)
+
     # Sort by start timestamp, then assign sequential global IDs
     all_errors.sort(key=lambda e: e["timestamp_start_sec"])
     for idx, e in enumerate(all_errors):
@@ -173,9 +185,11 @@ def merge_errors(
         "total_errors": len(all_errors),
         "trajectory_error_count": len(traj["error_events"]),
         "angle_error_count": len(angle["error_events"]),
+        "vibration_error_count": len(vib_errors),
         "all_errors": all_errors,
         "trajectory_errors": traj["error_events"],
         "angle_errors": angle["error_events"],
+        "vibration_errors": vib_errors,
     }
 
     os.makedirs(output_dir, exist_ok=True)
@@ -185,11 +199,13 @@ def merge_errors(
 
     traj_count = len(traj["error_events"])
     angle_count = len(angle["error_events"])
+    vib_count = len(vib_errors)
     bbox_label = "with bounding boxes" if corridor_available else "no corridor data"
 
     print("\n=== UNIFIED ERROR SUMMARY ===")
     print(f"Trajectory errors: {traj_count} ({bbox_label})")
     print(f"Angle errors: {angle_count} ({bbox_label})")
+    print(f"Vibration errors: {vib_count}")
     print(f"Total errors: {len(all_errors)}")
     for e in all_errors:
         bb = e["bounding_box"]
