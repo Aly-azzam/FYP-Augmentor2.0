@@ -505,6 +505,8 @@ export default function CompareStudio() {
     mark_type: MarkType;
     x: number;
     y: number;
+    display_x: number;
+    display_y: number;
     timestamp_sec: number;
     video_width: number;
     video_height: number;
@@ -1340,23 +1342,62 @@ export default function CompareStudio() {
   );
 
   const handleLearnerTipClick = useCallback(
-    (event: React.MouseEvent<HTMLVideoElement>) => {
+    (event: React.MouseEvent<HTMLElement>) => {
       // Game mark placement takes priority
       if (gamePhase === 'game' && activeMarkType) {
+        if (!learnerVideoRef.current) return;
         const rect = event.currentTarget.getBoundingClientRect();
-        const x = event.clientX - rect.left;
-        const y = event.clientY - rect.top;
-        const video = event.currentTarget;
+        const video = learnerVideoRef.current;
+
+        // Calculate actual video content area within the element (object-fit: contain)
+        const videoAspect = video.videoWidth / video.videoHeight;
+        const elementAspect = rect.width / rect.height;
+
+        let contentWidth: number, contentHeight: number, contentLeft: number, contentTop: number;
+        if (videoAspect > elementAspect) {
+          // Black bars top and bottom
+          contentWidth = rect.width;
+          contentHeight = rect.width / videoAspect;
+          contentLeft = 0;
+          contentTop = (rect.height - contentHeight) / 2;
+        } else {
+          // Black bars left and right
+          contentHeight = rect.height;
+          contentWidth = rect.height * videoAspect;
+          contentLeft = (rect.width - contentWidth) / 2;
+          contentTop = 0;
+        }
+
+        // Raw element-relative position (used for visual display)
+        const display_x = event.clientX - rect.left;
+        const display_y = event.clientY - rect.top;
+
+        // Content-relative position
+        const content_x = display_x - contentLeft;
+        const content_y = display_y - contentTop;
+
+        // Ignore clicks in black bars
+        if (content_x < 0 || content_y < 0 || content_x > contentWidth || content_y > contentHeight) return;
+
+        // Pre-scale to native video pixel space so backend receives coordinates
+        // already in the same space as the stored bounding boxes.
+        const nativeW = video.videoWidth || contentWidth;
+        const nativeH = video.videoHeight || contentHeight;
+        const native_x = content_x * (nativeW / contentWidth);
+        const native_y = content_y * (nativeH / contentHeight);
+
         setUserMarks((prev) => [
           ...prev,
           {
             id: crypto.randomUUID(),
             mark_type: activeMarkType,
-            x,
-            y,
+            x: native_x,
+            y: native_y,
+            display_x,
+            display_y,
             timestamp_sec: video.currentTime,
-            video_width: rect.width,
-            video_height: rect.height,
+            video_width: nativeW,
+            video_height: nativeH,
           },
         ]);
         return;
@@ -1972,7 +2013,8 @@ export default function CompareStudio() {
                   sam2LearnerRun?.annotated_video_url ||
                   corridorOverlayBaseUrl ||
                   evalCorridorOverlayUrl ||
-                  opticalFlowVisualizationUrl) && (
+                  opticalFlowVisualizationUrl) &&
+                  !(gamePhase === 'game' && activeMarkType) && (
                   <div
                     role="tablist"
                     aria-label="Learner video source"
@@ -2142,7 +2184,7 @@ export default function CompareStudio() {
                   key={learnerVideoSource ?? userVideoUrl}
                   ref={learnerVideoRef}
                   src={learnerVideoSource ?? undefined}
-                  controls={learnerOverlay === 'sam2' || learnerOverlay === 'optical_flow' || learnerOverlay === 'aligned_corridor' || learnerOverlay === 'eval_corridor' || learnerOverlay === 'visualization'}
+                  controls={(learnerOverlay === 'sam2' || learnerOverlay === 'optical_flow' || learnerOverlay === 'aligned_corridor' || learnerOverlay === 'eval_corridor' || learnerOverlay === 'visualization') && gamePhase !== 'game'}
                   onClick={handleLearnerTipClick}
                   muted={learnerMuted}
                   playsInline
@@ -2166,8 +2208,25 @@ export default function CompareStudio() {
                       );
                     }
                   }}
-                  style={{ cursor: (gamePhase === 'game' && activeMarkType) || isSelectingTip ? 'crosshair' : 'default' }}
+                  style={{
+                    cursor: (gamePhase === 'game' && activeMarkType) || isSelectingTip ? 'crosshair' : 'default',
+                    pointerEvents: (gamePhase === 'game' && activeMarkType) ? 'none' : 'auto'
+                  }}
                 />
+
+                {gamePhase === 'game' && activeMarkType && (
+                  <div
+                    style={{
+                      position: 'absolute',
+                      inset: 0,
+                      zIndex: 20,
+                      background: 'transparent',
+                      cursor: 'crosshair',
+                      pointerEvents: 'all',
+                    }}
+                    onClick={handleLearnerTipClick}
+                  />
+                )}
 
                 {/* DTW preview loading overlay */}
                 {isDtwPreviewGenerating && (
@@ -2241,8 +2300,8 @@ export default function CompareStudio() {
                           }
                           style={{
                             position: 'absolute',
-                            left: mark.x,
-                            top: mark.y,
+                            left: mark.display_x,
+                            top: mark.display_y,
                             transform: 'translate(-50%, -50%)',
                             fontSize: fSize,
                             lineHeight: 1,
@@ -2267,11 +2326,35 @@ export default function CompareStudio() {
                     {/* Missed errors shown in result phase */}
                     {gamePhase === 'result' &&
                       scoreResult?.missed_error_details.map((e) => {
-                        const vw = learnerVideoRef.current?.offsetWidth ?? 0;
-                        const vh = learnerVideoRef.current?.offsetHeight ?? 0;
+                        const video = learnerVideoRef.current;
+                        if (!video) return null;
+
+                        const vw = video.offsetWidth;
+                        const vh = video.offsetHeight;
                         if (!vw || !vh) return null;
-                        const dx = e.peak_location.x * (vw / 1920);
-                        const dy = e.peak_location.y * (vh / 1080);
+
+                        // Letterbox calculation (same as handleLearnerTipClick)
+                        const videoAspect = video.videoWidth / video.videoHeight;
+                        const elementAspect = vw / vh;
+
+                        let contentWidth: number, contentHeight: number, contentLeft: number, contentTop: number;
+                        if (videoAspect > elementAspect) {
+                          contentWidth = vw;
+                          contentHeight = vw / videoAspect;
+                          contentLeft = 0;
+                          contentTop = (vh - contentHeight) / 2;
+                        } else {
+                          contentHeight = vh;
+                          contentWidth = vh * videoAspect;
+                          contentLeft = (vw - contentWidth) / 2;
+                          contentTop = 0;
+                        }
+
+                        // Scale from native video coords to display coords
+                        const nativeW = video.videoWidth || 1440;
+                        const nativeH = video.videoHeight || 1080;
+                        const dx = contentLeft + (e.peak_location.x / nativeW) * contentWidth;
+                        const dy = contentTop + (e.peak_location.y / nativeH) * contentHeight;
                         const missedSymbol =
                           e.error_type === 'trajectory' ? '✕'
                           : e.error_type === 'vibration' ? '〜'

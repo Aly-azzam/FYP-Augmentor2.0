@@ -67,6 +67,7 @@ def align_corridor_blade_tip_with_extension(
     expert_code: str,
     learner_video_path: str | None = None,
     generate_overlay_video: bool = True,
+    fps: float | None = None,
 ) -> dict[str, Any]:
     """Align pre-built expert corridor via blade-tip translation + safe axis extension.
 
@@ -96,17 +97,46 @@ def align_corridor_blade_tip_with_extension(
     smoothed = json.loads(Path(learner_smoothed_path).read_text(encoding="utf-8"))
 
     # ── Step 1: anchors & translation ─────────────────────────────────────
-    expert_anchor = (
-        float(corridor["centerline"][0]["x"]),
-        float(corridor["centerline"][0]["y"]),
-    )
+
+    # Resolve fps: use caller-supplied value, else read from video, else 30.0
+    _fps = fps
+    if _fps is None or _fps <= 0:
+        _fps = 30.0
+        if learner_video_path:
+            try:
+                _cap_fps = cv2.VideoCapture(learner_video_path)
+                if _cap_fps.isOpened():
+                    _v = _cap_fps.get(cv2.CAP_PROP_FPS)
+                    if _v and _v > 0:
+                        _fps = float(_v)
+                _cap_fps.release()
+            except Exception:  # noqa: BLE001
+                pass
+    print(f"[corridor_alignment] fps for anchor: {_fps:.2f}", flush=True)
+
+    frames_2s = max(1, round(_fps * 2.0))
+
+    expert_pts_2s = corridor["centerline"][:frames_2s]
+
     smoothed_pts = smoothed.get("points", [])
     if not smoothed_pts:
         raise ValueError("trajectory_smoothed.json has no points")
-    first_pt = smoothed_pts[0]
-    learner_anchor = (float(first_pt["smoothed_x"]), float(first_pt["smoothed_y"]))
-    t_dx = learner_anchor[0] - expert_anchor[0]
-    t_dy = learner_anchor[1] - expert_anchor[1]
+
+    learner_pts_2s = smoothed_pts[:frames_2s]
+
+    # X: use 2-second average (reduces horizontal jitter)
+    expert_anchor_x = float(np.mean([p["x"] for p in expert_pts_2s]))
+    learner_anchor_x = float(np.mean([p["smoothed_x"] for p in learner_pts_2s]))
+
+    # Y: use first point only (corridor must start exactly at learner's first point)
+    expert_anchor_y = float(corridor["centerline"][0]["y"])
+    learner_anchor_y = float(smoothed_pts[0]["smoothed_y"])
+
+    expert_anchor = (expert_anchor_x, expert_anchor_y)
+    learner_anchor = (learner_anchor_x, learner_anchor_y)
+
+    t_dx = learner_anchor_x - expert_anchor_x
+    t_dy = learner_anchor_y - expert_anchor_y
 
     print(f"[corridor_alignment] Expert anchor: ({expert_anchor[0]:.2f}, {expert_anchor[1]:.2f})", flush=True)
     print(f"[corridor_alignment] Learner anchor: ({learner_anchor[0]:.2f}, {learner_anchor[1]:.2f})", flush=True)
@@ -171,6 +201,41 @@ def align_corridor_blade_tip_with_extension(
                 f"BUG: rejected segment {rs['segment_index']} was extended. "
                 "This should never happen."
             )
+
+    # ── Y-axis rescaling ──────────────────────────────────────────────────────
+    # Stretch/compress the corridor on the Y axis only so its Y range matches
+    # the learner's Y range.  X coordinates and corridor width are untouched.
+    learner_ys = [py for _, py in learner_points]
+    if learner_ys:
+        learner_y_min = min(learner_ys)
+        learner_y_max = max(learner_ys)
+        learner_y_range = learner_y_max - learner_y_min
+
+        corridor_ys = [py for _, py in adapted_cl]
+        corridor_y_min = min(corridor_ys)
+        corridor_y_max = max(corridor_ys)
+        corridor_y_range = corridor_y_max - corridor_y_min
+
+        y_scale = learner_y_range / corridor_y_range if corridor_y_range > 1e-6 else 1.0
+        print(
+            f"[corridor_alignment] Y-rescale: corridor_y_range={corridor_y_range:.1f}px  "
+            f"learner_y_range={learner_y_range:.1f}px  y_scale={y_scale:.4f}",
+            flush=True,
+        )
+
+        # Anchor Y rescaling at corridor first point (= learner first point Y)
+        # So start is always locked and only the end stretches/compresses
+        y_anchor = adapted_cl[0][1]
+
+        def _rescale_y(pts: list[tuple[float, float]]) -> list[tuple[float, float]]:
+            return [
+                (px, y_anchor + (py - y_anchor) * y_scale)
+                for px, py in pts
+            ]
+
+        adapted_cl    = _rescale_y(adapted_cl)
+        adapted_left  = _rescale_y(adapted_left)
+        adapted_right = _rescale_y(adapted_right)
 
     adapted_polygon = adapted_left + list(reversed(adapted_right)) + [adapted_left[0]]
     adapted_n = len(adapted_cl)

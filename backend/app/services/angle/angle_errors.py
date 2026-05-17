@@ -109,7 +109,14 @@ def detect_angle_errors(
     print(f"Total DTW matches: {len(matches)}")
 
     # ── Enrich each match with corridor data + just_re_entered flag ───────
-    prev_outside = True
+    # Initialize based on actual first frame status, not assumed outside
+    first_match = matches[0] if matches else None
+    if first_match and corridor_available:
+        nearest = nearest_strided_frame(first_match["learner_frame_index"])
+        sam_info = corridor_lookup.get(nearest, {})
+        prev_outside = sam_info.get("outside", True)
+    else:
+        prev_outside = True
     for match in matches:
         if corridor_available:
             nearest = nearest_strided_frame(match["learner_frame_index"])
@@ -138,7 +145,7 @@ def detect_angle_errors(
     print()
 
     # ── State-machine with look-ahead re-entry decision ───────────────────
-    LOOK_AHEAD_FRAMES = 90
+    LOOK_AHEAD_FRAMES = 180
     MIN_CORRECTION_FRAMES = 10  # consecutive frames below threshold = corrected
 
     raw_windows: list[tuple[int, int]] = []
@@ -188,6 +195,7 @@ def detect_angle_errors(
                 else:
                     consecutive_ok = 0
 
+            print(f"[DEBUG just_re_entered] frame_idx={match['learner_frame_index']} buffer_size={len(buffer)} corrected={corrected}")
             if corrected:
                 # Correction accepted — skip the entire buffer, no error opened
                 i = j

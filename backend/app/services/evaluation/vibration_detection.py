@@ -979,8 +979,12 @@ async def run_vibration_detection(
 
     window_size = max(8, int(_FFT_WINDOW_SEC * fps))
     vibration_events = _classify_vibration_events(fft_windows, window_size, fps)
+    vibration_events = [
+        e for e in vibration_events
+        if e["severity"] == "severe"
+    ]
     print(
-        f"[VIBRATION] Vibration events detected: {len(vibration_events)}",
+        f"[VIBRATION] Vibration events detected (severe only): {len(vibration_events)}",
         flush=True,
     )
 

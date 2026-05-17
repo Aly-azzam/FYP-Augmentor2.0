@@ -346,14 +346,37 @@ async def get_unified_errors(evaluation_id: str, run_id: str):
 
 # ── POST /{evaluation_id}/score ────────────────────────────────────────────────
 
-NATIVE_W = 1920
-NATIVE_H = 1080
+_FALLBACK_W = 1920
+_FALLBACK_H = 1080
 
 
-def _scale_mark(mark: dict) -> tuple[float, float]:
-    vw = mark.get("video_width") or NATIVE_W
-    vh = mark.get("video_height") or NATIVE_H
-    return mark["x"] * (NATIVE_W / vw), mark["y"] * (NATIVE_H / vh)
+def _scale_mark(mark: dict, native_w: int, native_h: int) -> tuple[float, float]:
+    if mark.get('x') is None or mark.get('y') is None:
+        return 0.0, 0.0
+    vw = mark.get("video_width") or native_w
+    vh = mark.get("video_height") or native_h
+    return mark["x"] * (native_w / vw), mark["y"] * (native_h / vh)
+
+
+def _load_native_dims(run_id: str) -> tuple[int, int]:
+    """Read actual video frame dimensions from vibration_summary.json.
+
+    Falls back to 1920×1080 if the file is absent or lacks the fields.
+    """
+    try:
+        vib_path = (
+            Path(settings.STORAGE_ROOT) / "evaluation" / run_id / "vibration" / "vibration_summary.json"
+        )
+        if vib_path.exists():
+            with open(vib_path) as fh:
+                vib = json.load(fh)
+            fw = int(vib.get("frame_width") or 0)
+            fh_ = int(vib.get("frame_height") or 0)
+            if fw > 0 and fh_ > 0:
+                return fw, fh_
+    except Exception:  # noqa: BLE001
+        pass
+    return _FALLBACK_W, _FALLBACK_H
 
 
 def _mark_hits_error(
@@ -366,6 +389,7 @@ def _mark_hits_error(
     if error["error_type"] != mark_type:
         return False
     bb = error.get("bounding_box")
+    print(f"[SCORE DEBUG] checking error_type={error['error_type']} bbox={bb}", flush=True)
     if bb is None:
         return False
     if not (bb["x_min"] <= sx <= bb["x_max"] and bb["y_min"] <= sy <= bb["y_max"]):
@@ -434,11 +458,15 @@ async def score_evaluation(evaluation_id: str, background_tasks: BackgroundTasks
         unified = json.load(fh)
     errors: list[dict] = unified.get("all_errors", [])
 
+    native_w, native_h = _load_native_dims(run_id)
+    print(f"[SCORE DEBUG] native dims: {native_w}×{native_h}", flush=True)
+
     matched_error_ids: set[int] = set()
     mark_results: list[dict] = []
 
     for mark in marks:
-        sx, sy = _scale_mark(mark)
+        sx, sy = _scale_mark(mark, native_w, native_h)
+        print(f"[SCORE DEBUG] mark type={mark['mark_type']} raw=({mark['x']:.1f},{mark['y']:.1f}) scaled=({sx:.1f},{sy:.1f}) vw={mark.get('video_width')} vh={mark.get('video_height')}", flush=True)
         mark_ts: float | None = mark.get("timestamp_sec")
         hit_error: dict | None = None
         for error in errors:

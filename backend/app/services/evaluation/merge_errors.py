@@ -19,7 +19,7 @@ import os
 from pathlib import Path
 
 
-def compute_trajectory_bbox(error: dict, frame_checks: list[dict], padding: int = 80) -> dict:
+def compute_trajectory_bbox(error: dict, frame_checks: list[dict], padding: int = 250) -> dict:
     """Find all frame_checks whose frame_index falls between
     error.frame_start and error.frame_end, then compute bbox
     of their learner_x/learner_y with padding.
@@ -34,10 +34,10 @@ def compute_trajectory_bbox(error: dict, frame_checks: list[dict], padding: int 
         px = error["peak_location"]["x"]
         py = error["peak_location"]["y"]
         return {
-            "x_min": round(px - 60, 2),
-            "y_min": round(py - 60, 2),
-            "x_max": round(px + 60, 2),
-            "y_max": round(py + 60, 2),
+            "x_min": round(px - 250, 2),
+            "y_min": round(py - 250, 2),
+            "x_max": round(px + 250, 2),
+            "y_max": round(py + 250, 2),
         }
 
     xs = [fc["learner_x"] for fc in points_in_window]
@@ -51,7 +51,7 @@ def compute_trajectory_bbox(error: dict, frame_checks: list[dict], padding: int 
     }
 
 
-def compute_angle_bbox(error: dict, frame_checks: list[dict], padding: int = 80) -> dict:
+def compute_angle_bbox(error: dict, frame_checks: list[dict], padding: int = 150) -> dict:
     """Bounding box around inside-corridor frames during the angle error window.
 
     These are the red-dot positions — scissors inside the corridor but holding
@@ -68,10 +68,10 @@ def compute_angle_bbox(error: dict, frame_checks: list[dict], padding: int = 80)
         px = error["peak_location"]["x"]
         py = error["peak_location"]["y"]
         return {
-            "x_min": round(px - 100, 2),
-            "y_min": round(py - 100, 2),
-            "x_max": round(px + 100, 2),
-            "y_max": round(py + 100, 2),
+            "x_min": round(px - 150, 2),
+            "y_min": round(py - 150, 2),
+            "x_max": round(px + 150, 2),
+            "y_max": round(py + 150, 2),
         }
 
     xs = [fc["learner_x"] for fc in points_in_window]

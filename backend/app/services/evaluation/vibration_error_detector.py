@@ -28,8 +28,7 @@ from typing import Any
 
 
 # Padding added around the raw YOLO bbox union.
-# Matches roi_padding_px=40 from the standalone optical flow config.
-_BBOX_PADDING = 40
+_BBOX_PADDING = 150
 
 
 # ── Bounding box helpers ──────────────────────────────────────────────────────
@@ -86,10 +85,10 @@ def _compute_vibration_bbox(
         raw_x_max = max(xs2) + padding
         raw_y_max = max(ys2) + padding
     else:
-        raw_x_min = frame_width  * 0.25
-        raw_y_min = frame_height * 0.25
-        raw_x_max = frame_width  * 0.75
-        raw_y_max = frame_height * 0.75
+        raw_x_min = frame_width  * 0.20
+        raw_y_min = frame_height * 0.20
+        raw_x_max = frame_width  * 0.80
+        raw_y_max = frame_height * 0.80
 
     return {
         "x_min": round(max(0.0,               raw_x_min), 2),
