@@ -495,21 +495,8 @@ def render_visualization(
     with open(traj_path) as f:
         traj_data = json.load(f)
 
-    # ── Component 1: Corridor line setup (DO NOT TOUCH) ───────────────────────
-    fitted    = metrics["trajectory_metrics"]["fitted_line"]
-    direction = np.array(fitted["direction"],    dtype=np.float64)
-    start_pt  = np.array(fitted["start_point"], dtype=np.float64)
-    end_pt    = np.array(fitted["end_point"],   dtype=np.float64)
-    normal    = np.array([-direction[1], direction[0]], dtype=np.float64)
-
     dx = float(corridor["translation"]["dx"])
     dy = float(corridor["translation"]["dy"])
-    translation = np.array([dx, dy], dtype=np.float64)
-
-    left_start  = start_pt + 80.0 * normal + translation
-    left_end    = end_pt   + 80.0 * normal + translation
-    right_start = start_pt - 80.0 * normal + translation
-    right_end   = end_pt   - 80.0 * normal + translation
 
     # ── Expert smoothed trajectory ────────────────────────────────────────────
     traj_x_kf: dict[int, float] = {}
@@ -789,9 +776,6 @@ def render_visualization(
         cap.release()
         raise RuntimeError(f"Could not create output video at {tmp_path}")
 
-    lp1, lp2 = _extend_line_to_frame(left_start,  left_end,  width, height)
-    rp1, rp2 = _extend_line_to_frame(right_start, right_end, width, height)
-
     draw_progress = 0.0       # monotonically increasing expert-line draw progress [0..1]
     last_arrow_frame = -25    # frame index of the most recently added arrow
     accumulated_arrows: list[tuple[tuple[int, int], tuple[int, int]]] = []
@@ -802,11 +786,69 @@ def render_visualization(
             if not ret:
                 break
 
-            # ── Component 1: Red corridor lines (unchanged logic) ──────────
             overlay = frame.copy()
-            cv2.line(overlay, lp1, lp2, _CORRIDOR_COLOR, 3, cv2.LINE_AA)
-            cv2.line(overlay, rp1, rp2, _CORRIDOR_COLOR, 3, cv2.LINE_AA)
-            frame = cv2.addWeighted(overlay, 0.8, frame, 0.2, 0)
+
+            margin = float(corridor.get("margin_px", 40))
+
+            # Build corridor lines directly from expert trajectory keyframe points
+            # expert_kf_pts is already computed above and contains the expert path in learner space
+            if len(expert_kf_sorted) >= 2:
+                # Downsample to ~8 key points for clean smooth lines
+                step = max(1, len(expert_kf_sorted) // 8)
+                key_frames = expert_kf_sorted[::step]
+                if expert_kf_sorted[-1] not in key_frames:
+                    key_frames = list(key_frames) + [expert_kf_sorted[-1]]
+
+                # Remove return path — keep only frames where path moves forward
+                filtered_frames = [key_frames[0]]
+                for i in range(1, len(key_frames)):
+                    prev_cx, prev_cy = expert_kf_pts[key_frames[i-1]]
+                    curr_cx, curr_cy = expert_kf_pts[key_frames[i]]
+                    # Compute overall path direction from first to last point
+                    total_dx = expert_kf_pts[key_frames[-1]][0] - expert_kf_pts[key_frames[0]][0]
+                    total_dy = expert_kf_pts[key_frames[-1]][1] - expert_kf_pts[key_frames[0]][1]
+                    total_len = math.hypot(total_dx, total_dy)
+                    if total_len > 1e-6:
+                        # Project movement onto overall direction
+                        move_dx = curr_cx - prev_cx
+                        move_dy = curr_cy - prev_cy
+                        forward = (move_dx * total_dx + move_dy * total_dy) / total_len
+                        if forward > -10:  # allow small backwards movement
+                            filtered_frames.append(key_frames[i])
+                key_frames = filtered_frames
+
+                left_pts = []
+                right_pts = []
+
+                for i, fi in enumerate(key_frames):
+                    cx, cy = expert_kf_pts[fi]
+
+                    # Compute direction at this point
+                    if i < len(key_frames) - 1:
+                        nx_fi = key_frames[i + 1]
+                        ex, ey = expert_kf_pts[nx_fi]
+                        vx, vy = ex - cx, ey - cy
+                    else:
+                        px_fi = key_frames[i - 1]
+                        px, py = expert_kf_pts[px_fi]
+                        vx, vy = cx - px, cy - py
+
+                    length = math.hypot(vx, vy)
+                    if length > 1e-6:
+                        # Normal = perpendicular to direction
+                        nx, ny = -vy / length, vx / length
+                    else:
+                        nx, ny = 1.0, 0.0
+
+                    left_pts.append((int(round(cx + margin * nx)), int(round(cy + margin * ny))))
+                    right_pts.append((int(round(cx - margin * nx)), int(round(cy - margin * ny))))
+
+                left_arr  = np.array(left_pts,  dtype=np.int32).reshape(-1, 1, 2)
+                right_arr = np.array(right_pts, dtype=np.int32).reshape(-1, 1, 2)
+
+                cv2.polylines(overlay, [left_arr],  False, _CORRIDOR_COLOR, 3, cv2.LINE_AA)
+                cv2.polylines(overlay, [right_arr], False, _CORRIDOR_COLOR, 3, cv2.LINE_AA)
+                frame = cv2.addWeighted(overlay, 0.8, frame, 0.2, 0)
 
             # ── Component 2a: Expert trajectory (dashed yellow, growing) ───
             # Project learner blade tip onto the reference polyline to get
@@ -829,7 +871,7 @@ def render_visualization(
                 _draw_dashed_polyline(line_ov, pts, (0, 255, 255), 2)   # yellow
                 cv2.addWeighted(line_ov, 0.9, frame, 0.1, 0, frame)
 
-            # ── Component 2b: Correction arrows (horizontal, outside frames only) ─
+            # ── Component 2b: Correction arrows (outside frames only) ─
             if frame_idx % 7 == 0:
                 fc = _nearest_fc(frame_idx)
                 if (fc and fc.get("outside", False)
@@ -837,13 +879,13 @@ def render_visualization(
                         and frame_idx - last_arrow_frame >= 60):
                     ilx = int(round(float(fc["learner_x"])))
                     ily = int(round(float(fc["learner_y"])))
-                    # Find where the expert drawn line is at this Y — horizontal arrow
-                    ex_at_y = _expert_x_at_y(pts, float(fc["learner_y"]))
-                    if ex_at_y is not None:
-                        iex = int(round(ex_at_y))
-                        # Both endpoints share ily → perfectly horizontal arrow
-                        accumulated_arrows.append(((ilx, ily), (iex, ily)))
-                        last_arrow_frame = frame_idx
+                    if pts:
+                        tip_x, tip_y = pts[-1]
+                        iex = int(round(tip_x))
+                        iey = int(round(tip_y))
+                        if (ilx, ily) != (iex, iey):
+                            accumulated_arrows.append(((ilx, ily), (iex, iey)))
+                            last_arrow_frame = frame_idx
 
             # Redraw all accumulated arrows so they persist for the rest of the video
             for arr_pt1, arr_pt2 in accumulated_arrows:

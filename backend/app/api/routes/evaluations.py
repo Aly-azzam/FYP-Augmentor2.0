@@ -223,6 +223,8 @@ async def generate_visualization(
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:
+        import traceback as _tb
+        _tb.print_exc()
         raise HTTPException(
             status_code=500,
             detail=f"Visualization generation failed: {exc}",
