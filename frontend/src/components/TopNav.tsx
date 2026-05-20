@@ -4,10 +4,8 @@ import { useAuth } from '@/contexts/AuthContext';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
   BookOpen,
-  BarChart3,
   RefreshCw,
   Clock,
-  Trophy,
   Sun,
   Moon,
   Bot,
@@ -29,10 +27,8 @@ import { useThemeStore, useUIStore } from '../store';
 
 const navLinks = [
   { label: 'Courses', path: '/courses', icon: BookOpen },
-  { label: 'My Learning', path: '/progress', icon: BarChart3 },
   { label: 'Compare Studio', path: '/compare', icon: RefreshCw },
   { label: 'History', path: '/history', icon: Clock },
-  { label: 'Achievements', path: '/achievements', icon: Trophy },
 ] as const;
 
 export default function TopNav() {

@@ -7,6 +7,11 @@ interface AuthUser {
   id: string;
   email: string;
   display_name: string;
+  bio?: string | null;
+  github_url?: string | null;
+  twitter_url?: string | null;
+  linkedin_url?: string | null;
+  created_at?: string | null;
 }
 
 interface AuthContextType {

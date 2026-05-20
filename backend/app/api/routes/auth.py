@@ -1,5 +1,6 @@
 import uuid
 import httpx
+from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, EmailStr
@@ -32,6 +33,11 @@ class UserOut(BaseModel):
     id: str
     email: str
     display_name: str
+    bio: str | None = None
+    github_url: str | None = None
+    twitter_url: str | None = None
+    linkedin_url: str | None = None
+    created_at: datetime | None = None
 
     class Config:
         from_attributes = True
@@ -127,3 +133,32 @@ def me(current_user: User = Depends(get_current_user)):
 @router.post("/logout")
 def logout():
     return {"message": "logged out"}
+
+
+class ProfileUpdateRequest(BaseModel):
+    display_name: str | None = None
+    bio: str | None = None
+    github_url: str | None = None
+    twitter_url: str | None = None
+    linkedin_url: str | None = None
+
+
+@router.patch("/profile", response_model=UserOut)
+def update_profile(
+    req: ProfileUpdateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if req.display_name is not None:
+        current_user.display_name = req.display_name
+    if req.bio is not None:
+        current_user.bio = req.bio
+    if req.github_url is not None:
+        current_user.github_url = req.github_url
+    if req.twitter_url is not None:
+        current_user.twitter_url = req.twitter_url
+    if req.linkedin_url is not None:
+        current_user.linkedin_url = req.linkedin_url
+    db.commit()
+    db.refresh(current_user)
+    return UserOut.model_validate(current_user)

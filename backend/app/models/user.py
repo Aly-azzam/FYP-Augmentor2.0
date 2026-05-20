@@ -1,7 +1,7 @@
 import uuid
 from datetime import date, datetime
 
-from sqlalchemy import Date, DateTime, String, func
+from sqlalchemy import Date, DateTime, String, Text, func
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -31,6 +31,11 @@ class User(Base):
         onupdate=func.now(),
         nullable=False,
     )
+
+    bio: Mapped[str | None] = mapped_column(Text, nullable=True)
+    github_url: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    twitter_url: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    linkedin_url: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
     videos: Mapped[list["Video"]] = relationship("Video", back_populates="owner_user")
     attempts: Mapped[list["Attempt"]] = relationship("Attempt", back_populates="user")

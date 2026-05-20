@@ -13,9 +13,7 @@ import Dashboard from './pages/Home';
 import CourseLibrary from './pages/Courses';
 import CourseDetail from './pages/CourseDetail';
 import CompareStudio from './pages/CompareStudio';
-import ProgressPage from './pages/ProgressPage';
 import HistoryPage from './pages/HistoryPage';
-import AchievementsPage from './pages/AchievementsPage';
 import SettingsPage from './pages/SettingsPage';
 import ProfilePage from './pages/ProfilePage';
 import NotFound from './pages/NotFound';
@@ -45,9 +43,7 @@ export default function App() {
                 <Route path="/courses" element={<ProtectedRoute><CourseLibrary /></ProtectedRoute>} />
                 <Route path="/courses/:courseId" element={<ProtectedRoute><CourseDetail /></ProtectedRoute>} />
                 <Route path="/compare" element={<ProtectedRoute><CompareStudio /></ProtectedRoute>} />
-                <Route path="/progress" element={<ProtectedRoute><ProgressPage /></ProtectedRoute>} />
                 <Route path="/history" element={<ProtectedRoute><HistoryPage /></ProtectedRoute>} />
-                <Route path="/achievements" element={<ProtectedRoute><AchievementsPage /></ProtectedRoute>} />
                 <Route path="/settings" element={<ProtectedRoute><SettingsPage /></ProtectedRoute>} />
                 <Route path="/profile" element={<ProtectedRoute><ProfilePage /></ProtectedRoute>} />
                 <Route path="*" element={<NotFound />} />
