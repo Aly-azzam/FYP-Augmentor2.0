@@ -605,6 +605,11 @@ export default function CompareStudio() {
   // run_id returned by the backend for the most recent angle pipeline run.
   const [angleRunId, setAngleRunId] = useState<string | null>(null);
 
+  // Rules modal — shown once per session.
+  const [showRulesModal, setShowRulesModal] = useState(
+    !sessionStorage.getItem('augmentor_rules_seen'),
+  );
+
   // SYNC dialog + DTW preview state.
   const [isSyncDialogOpen, setIsSyncDialogOpen] = useState(false);
   const [isDtwPreviewGenerating, setIsDtwPreviewGenerating] = useState(false);
@@ -1786,6 +1791,105 @@ export default function CompareStudio() {
 
   return (
     <div style={{ padding: 'var(--space-lg)', maxWidth: 1600, margin: '0 auto' }}>
+      {/* ─── Rules modal (shown once per session) ──────────────────────── */}
+      {showRulesModal && (
+        <div
+          style={{
+            position: 'fixed',
+            inset: 0,
+            zIndex: 9999,
+            background: 'var(--bg-primary)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            padding: 'var(--space-lg)',
+          }}
+        >
+          <div
+            className="card"
+            style={{
+              maxWidth: 560,
+              width: '100%',
+              padding: 'var(--space-xl)',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: 'var(--space-lg)',
+            }}
+          >
+            <div>
+              <h2 className="heading-2" style={{ marginBottom: 'var(--space-xs)' }}>
+                How You're Evaluated
+              </h2>
+              <p className="text-small" style={{ color: 'var(--text-muted)', margin: 0 }}>
+                Understand how errors are detected before you start
+              </p>
+            </div>
+
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-md)' }}>
+              <div>
+                <p style={{ margin: '0 0 var(--space-xs)', fontWeight: 600 }}>
+                  🎯 Trajectory Error
+                </p>
+                <p className="text-small" style={{ color: 'var(--text-secondary)', margin: 0 }}>
+                  Your scissors should follow the expert's cutting path. If you stray outside the
+                  allowed corridor, that counts as one error. A new error won't be counted again
+                  until you return to the correct region and deviate again — so staying outside
+                  longer doesn't make things worse.
+                </p>
+              </div>
+
+              <div>
+                <p style={{ margin: '0 0 var(--space-xs)', fontWeight: 600 }}>
+                  📐 Angle Error
+                </p>
+                <p className="text-small" style={{ color: 'var(--text-secondary)', margin: 0 }}>
+                  Your scissors should be held at the same angle as the expert's. If your angle
+                  drifts too far, an error is recorded — but only for the first moment of deviation.
+                  Think of it this way: the wrong angle causes you to leave the path, not the other
+                  way around. If you return to the correct region, you get a short grace period to
+                  fix your angle before another error is logged.
+                </p>
+              </div>
+
+              <div>
+                <p style={{ margin: '0 0 var(--space-xs)', fontWeight: 600 }}>
+                  〰️ Vibration Error
+                </p>
+                <p className="text-small" style={{ color: 'var(--text-secondary)', margin: 0 }}>
+                  If your hand shakes severely for more than a couple of seconds, a vibration error
+                  is registered. Mild tremors are ignored — only sustained, intense shaking counts.
+                </p>
+              </div>
+            </div>
+
+            <div className="divider" />
+
+            <div>
+              <p style={{ margin: '0 0 var(--space-xs)', fontWeight: 600 }}>
+                💡 Tip
+              </p>
+              <p className="text-small" style={{ color: 'var(--text-secondary)', margin: 0 }}>
+                After completing your evaluation, press <strong>Visualization</strong> to see an
+                annotated replay of exactly where errors occurred. Then read your{' '}
+                <strong>Crafting Coach</strong> explanation for personalized feedback on how to
+                improve.
+              </p>
+            </div>
+
+            <button
+              className="btn btn-primary"
+              style={{ width: '100%', padding: 'var(--space-md) var(--space-lg)', fontSize: '1rem' }}
+              onClick={() => {
+                sessionStorage.setItem('augmentor_rules_seen', 'true');
+                setShowRulesModal(false);
+              }}
+            >
+              I Understand
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* ─── Sync Controls Bar ─────────────────────────────────────────── */}
       <motion.div
         className="glass"
