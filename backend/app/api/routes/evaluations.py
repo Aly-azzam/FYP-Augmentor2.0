@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, BackgroundTasks, Body, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session, joinedload
 
@@ -221,59 +221,61 @@ async def generate_corridor_overlay(
 @router.post("/{evaluation_id}/generate-visualization")
 async def generate_visualization(
     evaluation_id: str,
-    body: dict = Body(...),
+    request: Request,
+    db: Session = Depends(get_db),
 ):
-    """Generate the mask-based visualization video on demand for a completed evaluation run.
+    """Return or render the visualization.mp4 for a completed evaluation run.
 
     Body: { "run_id": "<uuid>", "expert_id": "<uuid>" }
-    Returns: { "status": "done", "visualization_url": "/storage/evaluation/{run_id}/visualization/visualization.mp4" }
+    Returns: { "status": "ready", "visualization_url": "/storage/evaluation/{run_id}/visualization/visualization.mp4" }
     """
-    run_id: str | None = body.get("run_id")
-    expert_id: str | None = body.get("expert_id")
-    if not run_id:
-        raise HTTPException(status_code=400, detail="run_id is required in the request body.")
-    if not expert_id:
-        raise HTTPException(status_code=400, detail="expert_id is required in the request body.")
+    body = await request.json()
+    run_id = body.get("run_id")
+    expert_id = body.get("expert_id")
+    if not run_id or not expert_id:
+        raise HTTPException(status_code=422, detail="run_id and expert_id are required")
 
-    eval_base_dir = settings.STORAGE_ROOT / "evaluation"
-    run_dir = eval_base_dir / run_id
+    _BACKEND_ROOT = Path(__file__).resolve().parents[3]
+    viz_path = _BACKEND_ROOT / "storage" / "evaluation" / run_id / "visualization" / "visualization.mp4"
 
-    yolo_path = run_dir / "yolo_detections.json"
-    if not yolo_path.is_file():
-        raise HTTPException(status_code=404, detail="yolo_detections.json not found for this run.")
+    if viz_path.is_file():
+        return {
+            "status": "ready",
+            "visualization_url": f"/storage/evaluation/{run_id}/visualization/visualization.mp4",
+        }
 
-    with open(yolo_path) as fh:
-        yolo_data = json.load(fh)
-    learner_video_path: str | None = yolo_data.get("video_path")
-    if not learner_video_path or not Path(learner_video_path).is_file():
-        raise HTTPException(status_code=404, detail="Learner video path not found or file missing.")
+    # Find learner video — use the most recently uploaded mp4 in compare_tmp
+    compare_tmp = _BACKEND_ROOT / "storage" / "uploads" / "compare_tmp"
+    mp4s = sorted(compare_tmp.glob("*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True) if compare_tmp.exists() else []
+    if not mp4s:
+        raise HTTPException(status_code=404, detail="Learner video not found in compare_tmp")
+    learner_video_path = str(mp4s[0])
 
-    output_dir = run_dir / "visualization"
+    out_dir = str(_BACKEND_ROOT / "storage" / "evaluation" / run_id / "visualization")
 
     try:
         from app.services.evaluation.visualization import render_visualization  # noqa: PLC0415
-
-        out_path = await asyncio.get_event_loop().run_in_executor(
+        await asyncio.get_event_loop().run_in_executor(
             None,
             lambda: render_visualization(
                 learner_video_path=learner_video_path,
                 expert_id=expert_id,
                 run_id=run_id,
-                output_dir=str(output_dir),
+                output_dir=out_dir,
             ),
         )
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:
         import traceback as _tb
         _tb.print_exc()
-        raise HTTPException(
-            status_code=500,
-            detail=f"Visualization generation failed: {exc}",
-        ) from exc
+        raise HTTPException(status_code=500, detail=f"Visualization failed: {exc}") from exc
 
-    visualization_url = f"/storage/evaluation/{run_id}/visualization/visualization.mp4"
-    return {"status": "done", "visualization_url": visualization_url}
+    if not viz_path.is_file():
+        raise HTTPException(status_code=500, detail="Visualization rendering completed but file not found")
+
+    return {
+        "status": "ready",
+        "visualization_url": f"/storage/evaluation/{run_id}/visualization/visualization.mp4",
+    }
 
 
 # ── On-demand VLM feedback generation ────────────────────────────────────────

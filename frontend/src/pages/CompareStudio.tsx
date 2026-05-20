@@ -2037,7 +2037,8 @@ export default function CompareStudio() {
             </span>
             {userVideoUrl ? (
               <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)', flexWrap: 'wrap' }}>
-                  {(mediapipeRun?.annotated_video_url ||
+                  {(vizUrl ||
+                  mediapipeRun?.annotated_video_url ||
                   sam2OverlayBaseUrl ||
                   sam2LearnerRun?.annotated_video_url ||
                   corridorOverlayBaseUrl ||
@@ -2116,29 +2117,18 @@ export default function CompareStudio() {
                         Path Overlay
                       </button>
                     )}
+                    {console.log('vizUrl state:', vizUrl, 'gamePhase:', gamePhase, 'evalPhase:', evalPhase) as undefined}
                     {vizUrl && (
-                      <>
-                        <button
-                          type="button"
-                          role="tab"
-                          aria-selected={learnerOverlay !== 'visualization'}
-                          className={`btn ${learnerOverlay !== 'visualization' ? 'btn-primary' : 'btn-ghost'}`}
-                          style={{ borderRadius: 0, fontSize: '0.75rem', padding: 'var(--space-xs) var(--space-sm)' }}
-                          onClick={() => setLearnerOverlay('none')}
-                        >
-                          Original
-                        </button>
-                        <button
-                          type="button"
-                          role="tab"
-                          aria-selected={learnerOverlay === 'visualization'}
-                          className={`btn ${learnerOverlay === 'visualization' ? 'btn-primary' : 'btn-ghost'}`}
-                          style={{ borderRadius: 0, fontSize: '0.75rem', padding: 'var(--space-xs) var(--space-sm)' }}
-                          onClick={() => setLearnerOverlay('visualization')}
-                        >
-                          Visualization
-                        </button>
-                      </>
+                      <button
+                        type="button"
+                        role="tab"
+                        aria-selected={learnerOverlay === 'visualization'}
+                        className={`btn ${learnerOverlay === 'visualization' ? 'btn-primary' : 'btn-ghost'}`}
+                        style={{ borderRadius: 0, fontSize: '0.75rem', padding: 'var(--space-xs) var(--space-sm)' }}
+                        onClick={() => setLearnerOverlay('visualization')}
+                      >
+                        Visualization
+                      </button>
                     )}
                     {opticalFlowVisualizationUrl && (
                       <button
@@ -3101,6 +3091,7 @@ export default function CompareStudio() {
                           ? data.visualization_url
                           : `http://localhost:8001${data.visualization_url}`;
                         setVizUrl(fullUrl);
+                        console.log('vizUrl set to:', fullUrl);
                         setVizState('ready');
                       } catch (err) {
                         setVizState('idle');
