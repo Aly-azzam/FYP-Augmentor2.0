@@ -9,6 +9,11 @@ class Settings(BaseSettings):
 
     DATABASE_URL: str
 
+    SECRET_KEY: str = "change-me-in-production"
+    ALGORITHM: str = "HS256"
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 10080  # 7 days
+    GOOGLE_CLIENT_ID: str = ""
+
     # Local storage root (MVP)
     STORAGE_ROOT: Path = Path(__file__).resolve().parents[2] / "storage"
     UPLOAD_DIR: str = "uploads"

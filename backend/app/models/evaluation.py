@@ -24,15 +24,15 @@ class Evaluation(Base):
         nullable=False,
         unique=True,
     )
-    expert_video_id: Mapped[str] = mapped_column(
+    expert_video_id: Mapped[str | None] = mapped_column(
         PG_UUID(as_uuid=False),
         ForeignKey("videos.id", ondelete="CASCADE"),
-        nullable=False,
+        nullable=True,
     )
-    learner_video_id: Mapped[str] = mapped_column(
+    learner_video_id: Mapped[str | None] = mapped_column(
         PG_UUID(as_uuid=False),
         ForeignKey("videos.id", ondelete="CASCADE"),
-        nullable=False,
+        nullable=True,
     )
     overall_score: Mapped[Decimal | None] = mapped_column(Numeric, nullable=True)
     status: Mapped[str] = mapped_column(String(50), nullable=False)

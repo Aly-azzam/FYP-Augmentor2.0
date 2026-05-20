@@ -26,10 +26,10 @@ class Attempt(Base):
         ForeignKey("chapters.id", ondelete="CASCADE"),
         nullable=False,
     )
-    learner_video_id: Mapped[str] = mapped_column(
+    learner_video_id: Mapped[str | None] = mapped_column(
         PG_UUID(as_uuid=False),
         ForeignKey("videos.id", ondelete="CASCADE"),
-        nullable=False,
+        nullable=True,
     )
     status: Mapped[str] = mapped_column(String(50), nullable=False)
     original_filename: Mapped[str | None] = mapped_column(String(255), nullable=True)

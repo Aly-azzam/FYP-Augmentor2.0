@@ -38,7 +38,9 @@ export async function startEvaluation(formData) {
     return payload;
   }
 
-  return payload.evaluation_id || payload.id || payload;
+  // Return the full payload so callers can access video_url and other fields.
+  // evaluation_id is extracted by the caller.
+  return payload;
 }
 
 export async function getEvaluationResult(id) {

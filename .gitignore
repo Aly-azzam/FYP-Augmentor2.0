@@ -95,3 +95,4 @@ backend/runs/
 backend/storage/evaluation/
 backend/storage/uploads/compare_tmp/
 .claude/** 
+backend/resource_logs/

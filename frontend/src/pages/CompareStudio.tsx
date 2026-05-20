@@ -49,6 +49,7 @@ import {
 } from '../store';
 import { fetchClipsForCourse, fetchCourse } from '../services/api/courses';
 import { getEvaluationResult, startEvaluation as startEvaluationApi } from '../api/evaluationApi';
+import { useAuth } from '@/contexts/AuthContext';
 import { runLearnerAngle, generateDtwPreview } from '../api/angleApi';
 import type { AngleDtwSummary } from '../api/angleApi';
 import { formatTime } from '../utils/helpers';
@@ -106,30 +107,6 @@ const SSE_PROGRESS: Record<string, number> = {
   done: 100,
 };
 
-const DRAWING_TOOLS: {
-  id: DrawingTool;
-  label: string;
-  icon: React.ReactNode;
-}[] = [
-  { id: 'select', label: 'Select', icon: <MousePointer size={16} /> },
-  { id: 'arrow', label: 'Arrow', icon: <ArrowUpRight size={16} /> },
-  { id: 'line', label: 'Line', icon: <Minus size={16} /> },
-  { id: 'rectangle', label: 'Rect', icon: <Square size={16} /> },
-  { id: 'circle', label: 'Circle', icon: <Circle size={16} /> },
-  { id: 'pen', label: 'Pen', icon: <PenTool size={16} /> },
-  { id: 'angle', label: 'Angle', icon: <Triangle size={16} /> },
-  { id: 'calibrate', label: 'Calibrate', icon: <Ruler size={16} /> },
-  { id: 'track', label: 'Track', icon: <Crosshair size={16} /> },
-];
-
-const COLOR_SWATCHES = [
-  '#2563EB',
-  '#EF4444',
-  '#10B981',
-  '#F59E0B',
-  '#8B5CF6',
-  '#EC4899',
-];
 
 const PLAYBACK_RATES = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 2];
 
@@ -473,6 +450,8 @@ export default function CompareStudio() {
   const { timers, addTimer, startTimer, stopTimer, resetTimer, addTimestamp, updateElapsed } =
     useTimerStore();
 
+  const { user } = useAuth();
+
   // ── Local state ──────────────────────────────────────────────────────────
 
   const [userVideoUrl, setUserVideoUrl] = useState<string | null>(null);
@@ -666,6 +645,89 @@ export default function CompareStudio() {
       evalEventSourceRef.current?.close();
     };
   }, []);
+
+  // Restore full CompareStudio state on mount (survives navigation, cleared on browser refresh).
+  useEffect(() => {
+    const saved = sessionStorage.getItem('augmentor_compare_state');
+    if (saved) {
+      try {
+        const s = JSON.parse(saved) as {
+          evalPhase?: string;
+          evalRunId?: string | null;
+          evalEvaluationId?: string | null;
+          gamePhase?: string;
+          scoreResult?: ScoreResult | null;
+          userMarks?: UserMark[];
+          gameErrors?: UnifiedError[];
+          practiceVideoUrl?: string | null;
+        };
+        if (s.evalPhase && s.evalPhase !== 'idle') setEvalPhase(s.evalPhase as EvalPhase);
+        if (s.evalRunId) setEvalRunId(s.evalRunId);
+        if (s.evalEvaluationId) setEvalEvaluationId(s.evalEvaluationId);
+        if (s.gamePhase && s.gamePhase !== 'idle') setGamePhase(s.gamePhase as GamePhase);
+        if (s.scoreResult) setScoreResult(s.scoreResult);
+        if (s.userMarks?.length) setUserMarks(s.userMarks);
+        if (s.gameErrors?.length) setGameErrors(s.gameErrors);
+        if (s.practiceVideoUrl) setUserVideoUrl(s.practiceVideoUrl);
+
+        // If the eval was still streaming when the user navigated away, re-attach the SSE.
+        if (s.evalPhase === 'streaming' && s.evalEvaluationId) {
+          const evaluationId = s.evalEvaluationId;
+          const es = new EventSource(`/api/evaluations/${evaluationId}/status-stream`);
+          evalEventSourceRef.current = es;
+
+          es.onmessage = (event) => {
+            try {
+              const data = JSON.parse(event.data as string) as {
+                step?: string;
+                progress?: number;
+                run_id?: string;
+              };
+              if (data.run_id) setEvalRunId(data.run_id);
+              const step = data.step ?? '';
+              const progress = data.progress ?? SSE_PROGRESS[step] ?? undefined;
+              if (step in SSE_STEP_INDEX) setEvalStepIndex(SSE_STEP_INDEX[step]);
+              if (progress !== undefined) setEvalProgress(progress);
+              if (step === 'done' || progress === 100) {
+                es.close();
+                evalEventSourceRef.current = null;
+                setEvalStepIndex(7);
+                setEvalProgress(100);
+                setEvalPhase('done');
+                setGamePhase('game');
+              }
+            } catch {
+              // ignore malformed events
+            }
+          };
+
+          es.onerror = () => {
+            es.close();
+            evalEventSourceRef.current = null;
+            setEvalPhase('error');
+            setEvalError('Connection lost. Please try again.');
+          };
+        }
+      } catch {
+        sessionStorage.removeItem('augmentor_compare_state');
+      }
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Persist key state to sessionStorage so it survives SPA navigation (cleared on browser refresh).
+  useEffect(() => {
+    sessionStorage.setItem('augmentor_compare_state', JSON.stringify({
+      evalPhase,
+      evalRunId,
+      evalEvaluationId,
+      gamePhase,
+      scoreResult,
+      userMarks,
+      gameErrors,
+      practiceVideoUrl: userVideoUrl,
+    }));
+  }, [evalPhase, evalRunId, evalEvaluationId, gamePhase, scoreResult, userMarks, gameErrors, userVideoUrl]);
 
   useEffect(() => {
     if (requestedCourseId && requestedCourseId !== selectedCourse) {
@@ -964,6 +1026,7 @@ export default function CompareStudio() {
         setOpticalFlowRun(null);
         setOpticalFlowError(null);
         setOpticalFlowVideoVersion(0);
+        sessionStorage.removeItem('augmentor_compare_state');
         resetEvaluation();
         toast.success('Practice video ready');
       };
@@ -1015,6 +1078,7 @@ export default function CompareStudio() {
       formData.append('course_id', selectedCourse);
       formData.append('clip_id', selectedClip);
       formData.append('filename', userVideo.name);
+      if (user?.id) formData.append('user_id', user.id);
 
       const started = await startEvaluationApi(formData);
 
@@ -1042,6 +1106,12 @@ export default function CompareStudio() {
 
       setEvalEvaluationId(evaluationId);
       if (started?.run_id) setEvalRunId(started.run_id);
+
+      // Persist the server-side video URL so the player can be restored after navigation.
+      if (started?.video_url) {
+        const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+        setUserVideoUrl(`${API_BASE}${started.video_url}`);
+      }
 
       // Upload done — step 0 complete, step 1 running.
       setEvalStepIndex(1);
@@ -1635,12 +1705,6 @@ export default function CompareStudio() {
       ref.current.currentTime = Math.max(0, ref.current.currentTime + delta);
   };
 
-  const handleClearAll = () => {
-    clearTrackedPoints();
-    clearMeasurements();
-    toast.info('All annotations cleared');
-  };
-
   const handleAddTimer = () => {
     addTimer({
       id: `timer-${Date.now()}`,
@@ -1805,41 +1869,6 @@ export default function CompareStudio() {
             </div>
           </div>
         )}
-
-        <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)' }}>
-          <span className="label">Playback Rate</span>
-          <select
-            className="input"
-            style={{ width: 80 }}
-            value={playbackRate}
-            onChange={(e) => setPlaybackRate(Number(e.target.value))}
-          >
-            {PLAYBACK_RATES.map((r) => (
-              <option key={r} value={r}>
-                {r}x
-              </option>
-            ))}
-          </select>
-        </div>
-
-        <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)' }}>
-          <span className="label">Offset</span>
-          <input
-            className="input"
-            type="number"
-            step={0.1}
-            style={{ width: 80 }}
-            value={offset}
-            onChange={(e) => setOffset(Number(e.target.value))}
-          />
-          <span className="text-small" style={{ color: 'var(--text-muted)' }}>
-            sec
-          </span>
-        </div>
-
-        <button className="btn btn-secondary" onClick={() => setOffset(0)}>
-          Align Start
-        </button>
 
         {/* ── Path Overlay button ──────────────────────────────────────── */}
         <button
@@ -2650,143 +2679,12 @@ export default function CompareStudio() {
           animate={{ opacity: 1, x: 0 }}
           transition={{ delay: 0.2 }}
         >
-          <Tabs defaultValue="tools">
+          <Tabs defaultValue="evaluate">
             <TabsList>
-              <TabsTrigger value="tools">Tools</TabsTrigger>
               <TabsTrigger value="evaluate">Evaluate</TabsTrigger>
-              <TabsTrigger value="mediapipe">MediaPipe</TabsTrigger>
-              <TabsTrigger value="optical-flow">Optical Flow</TabsTrigger>
+              <TabsTrigger value="mediapipe">Models (Developer Tab)</TabsTrigger>
               <TabsTrigger value="timers">Timers</TabsTrigger>
             </TabsList>
-
-            {/* ── Tab: Tools ───────────────────────────────────────────── */}
-            <TabsContent value="tools">
-              <div
-                style={{
-                  display: 'flex',
-                  flexDirection: 'column',
-                  gap: 'var(--space-md)',
-                }}
-              >
-                {/* Tool grid */}
-                <div>
-                  <span
-                    className="label"
-                    style={{
-                      display: 'block',
-                      marginBottom: 'var(--space-sm)',
-                    }}
-                  >
-                    Tools
-                  </span>
-                  <div
-                    style={{
-                      display: 'grid',
-                      gridTemplateColumns: 'repeat(3, 1fr)',
-                      gap: 'var(--space-xs)',
-                    }}
-                  >
-                    {DRAWING_TOOLS.map((tool) => (
-                      <button
-                        key={tool.id}
-                        className={`btn ${activeTool === tool.id ? 'btn-primary' : 'btn-secondary'}`}
-                        style={{
-                          flexDirection: 'column',
-                          padding: 'var(--space-sm)',
-                          fontSize: '0.7rem',
-                          gap: '0.25rem',
-                        }}
-                        onClick={() => setActiveTool(tool.id)}
-                      >
-                        {tool.icon}
-                        {tool.label}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-
-                {/* Color picker */}
-                <div>
-                  <span
-                    className="label"
-                    style={{
-                      display: 'block',
-                      marginBottom: 'var(--space-sm)',
-                    }}
-                  >
-                    Color
-                  </span>
-                  <div style={{ display: 'flex', gap: 'var(--space-sm)' }}>
-                    {COLOR_SWATCHES.map((color) => (
-                      <button
-                        key={color}
-                        aria-label={`Color ${color}`}
-                        onClick={() => setToolColor(color)}
-                        style={{
-                          width: 28,
-                          height: 28,
-                          borderRadius: '50%',
-                          background: color,
-                          border:
-                            toolColor === color
-                              ? '2px solid var(--text-primary)'
-                              : '2px solid transparent',
-                          cursor: 'pointer',
-                          transition: 'transform var(--transition-fast)',
-                          transform:
-                            toolColor === color ? 'scale(1.15)' : 'scale(1)',
-                          outline: 'none',
-                        }}
-                      />
-                    ))}
-                  </div>
-                </div>
-
-                {/* Thickness */}
-                <div>
-                  <div
-                    className="flex-between"
-                    style={{ marginBottom: 'var(--space-sm)' }}
-                  >
-                    <span className="label">Thickness</span>
-                    <span
-                      className="text-small"
-                      style={{ color: 'var(--text-secondary)' }}
-                    >
-                      {toolThickness}px
-                    </span>
-                  </div>
-                  <Slider
-                    value={[toolThickness]}
-                    min={1}
-                    max={10}
-                    step={1}
-                    onValueChange={([v]) => setToolThickness(v)}
-                  />
-                </div>
-
-                {/* Show all frames */}
-                <div className="flex-between">
-                  <span className="text-small">Show on all frames</span>
-                  <Switch
-                    checked={showAllFrames}
-                    onCheckedChange={setShowAllFrames}
-                  />
-                </div>
-
-                <div className="divider" />
-
-                {/* Clear all */}
-                <button
-                  className="btn btn-secondary"
-                  style={{ width: '100%' }}
-                  onClick={handleClearAll}
-                >
-                  <Trash2 size={14} />
-                  Clear All
-                </button>
-              </div>
-            </TabsContent>
 
             {/* ── Tab: Evaluate ─────────────────────────────────────────── */}
             <TabsContent value="evaluate">
@@ -3005,6 +2903,7 @@ export default function CompareStudio() {
                     className="btn btn-secondary"
                     style={{ width: '100%' }}
                     onClick={() => {
+                      sessionStorage.removeItem('augmentor_compare_state');
                       setGamePhase('idle');
                       setEvalPhase('idle');
                       setEvalStepIndex(0);
@@ -3158,6 +3057,7 @@ export default function CompareStudio() {
                     className="btn btn-primary"
                     style={{ width: '100%', marginTop: 'var(--space-xs)' }}
                     onClick={() => {
+                      sessionStorage.removeItem('augmentor_compare_state');
                       setGamePhase('idle');
                       setEvalPhase('idle');
                       setEvalStepIndex(0);
@@ -3255,6 +3155,7 @@ export default function CompareStudio() {
                     className="btn btn-secondary"
                     style={{ width: '100%' }}
                     onClick={() => {
+                      sessionStorage.removeItem('augmentor_compare_state');
                       setEvalPhase('idle');
                       setEvalStepIndex(0);
                       setEvalProgress(0);
@@ -3310,6 +3211,7 @@ export default function CompareStudio() {
                     className="btn btn-secondary"
                     style={{ width: '100%' }}
                     onClick={() => {
+                      sessionStorage.removeItem('augmentor_compare_state');
                       resetEvaluation();
                       setApiEvaluationResult(null);
                     }}
@@ -4069,16 +3971,204 @@ export default function CompareStudio() {
 
                   <TabsContent value="optical_flow">
                     <div
-                      className="text-small"
                       style={{
-                        color: 'var(--text-muted)',
-                        marginTop: 'var(--space-sm)',
-                        background: 'var(--bg-tertiary)',
-                        borderRadius: 'var(--radius-md)',
-                        padding: 'var(--space-sm) var(--space-md)',
+                        display: 'flex',
+                        flexDirection: 'column',
+                        gap: 'var(--space-md)',
+                        padding: 'var(--space-sm) 0',
                       }}
                     >
-                      Optical Flow inspection is reserved for later and will appear here in the same panel.
+                      <div
+                        style={{
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: 'var(--space-sm)',
+                        }}
+                      >
+                        <Activity size={18} style={{ color: 'var(--accent-primary)' }} />
+                        <span className="text-small" style={{ fontWeight: 600 }}>
+                          Motion Instability (Optical Flow)
+                        </span>
+                      </div>
+                      <p
+                        className="text-small"
+                        style={{ color: 'var(--text-muted)', margin: 0 }}
+                      >
+                        Run learner-only Optical Flow to estimate vibration and motion
+                        stability. These values are side-analysis only and do not affect
+                        the evaluation score.
+                      </p>
+
+                      <button
+                        className="btn btn-primary"
+                        style={{
+                          width: '100%',
+                          display: 'inline-flex',
+                          alignItems: 'center',
+                          justifyContent: 'center',
+                          gap: 'var(--space-xs)',
+                        }}
+                        disabled={!userVideo || isOpticalFlowProcessing}
+                        onClick={runOpticalFlow}
+                      >
+                        {isOpticalFlowProcessing ? (
+                          <>
+                            <Loader2
+                              size={14}
+                              style={{ animation: 'spin 1s linear infinite' }}
+                            />
+                            Processing...
+                          </>
+                        ) : (
+                          <>
+                            <Activity size={14} />
+                            {opticalFlowRun ? 'Run Optical Flow Again' : 'Run Optical Flow'}
+                          </>
+                        )}
+                      </button>
+
+                      {!userVideo && (
+                        <p
+                          className="text-small"
+                          style={{
+                            color: 'var(--text-muted)',
+                            textAlign: 'center',
+                            margin: 0,
+                          }}
+                        >
+                          Upload a practice video to enable Optical Flow
+                        </p>
+                      )}
+
+                      {opticalFlowError && (
+                        <div
+                          className="text-small"
+                          style={{
+                            background: 'var(--bg-tertiary)',
+                            border: '1px solid var(--danger, #ef4444)',
+                            color: 'var(--danger, #ef4444)',
+                            borderRadius: 'var(--radius-md)',
+                            padding: 'var(--space-sm) var(--space-md)',
+                          }}
+                        >
+                          {opticalFlowError}
+                        </div>
+                      )}
+
+                      {opticalFlowRun && (
+                        <>
+                          <div
+                            style={{
+                              display: 'grid',
+                              gridTemplateColumns: '1fr 1fr',
+                              gap: 'var(--space-sm)',
+                            }}
+                          >
+                            {[
+                              {
+                                label: 'Vibration',
+                                value: opticalFlowRun.summary.vibration_score,
+                              },
+                              {
+                                label: 'High freq.',
+                                value: opticalFlowRun.summary.vibration_high_freq_mean,
+                              },
+                              {
+                                label: 'Stability',
+                                value: opticalFlowRun.summary.motion_stability_score,
+                              },
+                              {
+                                label: 'Avg magnitude',
+                                value: opticalFlowRun.summary.avg_magnitude,
+                              },
+                              {
+                                label: 'ROI usage',
+                                value: opticalFlowRun.summary.roi_usage_ratio,
+                              },
+                              {
+                                label: 'Jitter',
+                                value: opticalFlowRun.summary.magnitude_jitter,
+                              },
+                            ].map((metric) => (
+                              <div
+                                key={metric.label}
+                                className="stat-card"
+                                style={{ padding: 'var(--space-sm)' }}
+                              >
+                                <div
+                                  className="stat-value"
+                                  style={{ fontSize: '1.25rem' }}
+                                >
+                                  {formatMetricValue(metric.value)}
+                                </div>
+                                <div
+                                  className="stat-label"
+                                  style={{ fontSize: '0.7rem' }}
+                                >
+                                  {metric.label}
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+
+                          <button
+                            type="button"
+                            className={`btn ${learnerOverlay === 'optical_flow' ? 'btn-primary' : 'btn-secondary'}`}
+                            style={{ width: '100%' }}
+                            disabled={!opticalFlowVisualizationUrl}
+                            onClick={() => {
+                              setLearnerOverlay((current) =>
+                                current === 'optical_flow' ? 'none' : 'optical_flow',
+                              );
+                            }}
+                          >
+                            {learnerOverlay === 'optical_flow'
+                              ? 'Show Original Learner Video'
+                              : 'Show Optical Flow Visualization'}
+                          </button>
+
+                          {opticalFlowVisualizationUrl && (
+                            <div
+                              className="video-container"
+                              style={{
+                                aspectRatio: '16/9',
+                                border: '1px solid var(--border-default)',
+                              }}
+                            >
+                              <video
+                                key={`optical-flow-preview-${opticalFlowLearnerSource ?? opticalFlowVisualizationUrl}`}
+                                src={opticalFlowLearnerSource ?? opticalFlowVisualizationUrl}
+                                controls
+                                muted
+                                playsInline
+                                preload="metadata"
+                              />
+                            </div>
+                          )}
+
+                          <div
+                            style={{
+                              display: 'flex',
+                              flexDirection: 'column',
+                              gap: 'var(--space-xs)',
+                              fontSize: '0.75rem',
+                              color: 'var(--text-secondary)',
+                            }}
+                          >
+                            <span>
+                              <strong>run_id:</strong>{' '}
+                              <code
+                                style={{
+                                  fontFamily: 'var(--font-mono)',
+                                  fontSize: '0.7rem',
+                                }}
+                              >
+                                {opticalFlowRun.run_id}
+                              </code>
+                            </span>
+                          </div>
+                        </>
+                      )}
                     </div>
                   </TabsContent>
 
@@ -4220,210 +4310,6 @@ export default function CompareStudio() {
                   </TabsContent>
                 </Tabs>
 
-              </div>
-            </TabsContent>
-
-            {/* ── Tab: Optical Flow ─────────────────────────────────────── */}
-            <TabsContent value="optical-flow">
-              <div
-                style={{
-                  display: 'flex',
-                  flexDirection: 'column',
-                  gap: 'var(--space-md)',
-                  padding: 'var(--space-sm) 0',
-                }}
-              >
-                <div
-                  style={{
-                    display: 'flex',
-                    alignItems: 'center',
-                    gap: 'var(--space-sm)',
-                  }}
-                >
-                  <Activity size={18} style={{ color: 'var(--accent-primary)' }} />
-                  <span className="text-small" style={{ fontWeight: 600 }}>
-                    Motion Instability (Optical Flow)
-                  </span>
-                </div>
-                <p
-                  className="text-small"
-                  style={{ color: 'var(--text-muted)', margin: 0 }}
-                >
-                  Run learner-only Optical Flow to estimate vibration and motion
-                  stability. These values are side-analysis only and do not affect
-                  the evaluation score.
-                </p>
-
-                <button
-                  className="btn btn-primary"
-                  style={{
-                    width: '100%',
-                    display: 'inline-flex',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    gap: 'var(--space-xs)',
-                  }}
-                  disabled={!userVideo || isOpticalFlowProcessing}
-                  onClick={runOpticalFlow}
-                >
-                  {isOpticalFlowProcessing ? (
-                    <>
-                      <Loader2
-                        size={14}
-                        style={{ animation: 'spin 1s linear infinite' }}
-                      />
-                      Processing...
-                    </>
-                  ) : (
-                    <>
-                      <Activity size={14} />
-                      {opticalFlowRun ? 'Run Optical Flow Again' : 'Run Optical Flow'}
-                    </>
-                  )}
-                </button>
-
-                {!userVideo && (
-                  <p
-                    className="text-small"
-                    style={{
-                      color: 'var(--text-muted)',
-                      textAlign: 'center',
-                      margin: 0,
-                    }}
-                  >
-                    Upload a practice video to enable Optical Flow
-                  </p>
-                )}
-
-                {opticalFlowError && (
-                  <div
-                    className="text-small"
-                    style={{
-                      background: 'var(--bg-tertiary)',
-                      border: '1px solid var(--danger, #ef4444)',
-                      color: 'var(--danger, #ef4444)',
-                      borderRadius: 'var(--radius-md)',
-                      padding: 'var(--space-sm) var(--space-md)',
-                    }}
-                  >
-                    {opticalFlowError}
-                  </div>
-                )}
-
-                {opticalFlowRun && (
-                  <>
-                    <div
-                      style={{
-                        display: 'grid',
-                        gridTemplateColumns: '1fr 1fr',
-                        gap: 'var(--space-sm)',
-                      }}
-                    >
-                      {[
-                        {
-                          label: 'Vibration',
-                          value: opticalFlowRun.summary.vibration_score,
-                        },
-                        {
-                          label: 'High freq.',
-                          value: opticalFlowRun.summary.vibration_high_freq_mean,
-                        },
-                        {
-                          label: 'Stability',
-                          value: opticalFlowRun.summary.motion_stability_score,
-                        },
-                        {
-                          label: 'Avg magnitude',
-                          value: opticalFlowRun.summary.avg_magnitude,
-                        },
-                        {
-                          label: 'ROI usage',
-                          value: opticalFlowRun.summary.roi_usage_ratio,
-                        },
-                        {
-                          label: 'Jitter',
-                          value: opticalFlowRun.summary.magnitude_jitter,
-                        },
-                      ].map((metric) => (
-                        <div
-                          key={metric.label}
-                          className="stat-card"
-                          style={{ padding: 'var(--space-sm)' }}
-                        >
-                          <div
-                            className="stat-value"
-                            style={{ fontSize: '1.25rem' }}
-                          >
-                            {formatMetricValue(metric.value)}
-                          </div>
-                          <div
-                            className="stat-label"
-                            style={{ fontSize: '0.7rem' }}
-                          >
-                            {metric.label}
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-
-                    <button
-                      type="button"
-                      className={`btn ${learnerOverlay === 'optical_flow' ? 'btn-primary' : 'btn-secondary'}`}
-                      style={{ width: '100%' }}
-                      disabled={!opticalFlowVisualizationUrl}
-                      onClick={() => {
-                        setLearnerOverlay((current) =>
-                          current === 'optical_flow' ? 'none' : 'optical_flow',
-                        );
-                      }}
-                    >
-                      {learnerOverlay === 'optical_flow'
-                        ? 'Show Original Learner Video'
-                        : 'Show Optical Flow Visualization'}
-                    </button>
-
-                    {opticalFlowVisualizationUrl && (
-                      <div
-                        className="video-container"
-                        style={{
-                          aspectRatio: '16/9',
-                          border: '1px solid var(--border-default)',
-                        }}
-                      >
-                        <video
-                          key={`optical-flow-preview-${opticalFlowLearnerSource ?? opticalFlowVisualizationUrl}`}
-                          src={opticalFlowLearnerSource ?? opticalFlowVisualizationUrl}
-                          controls
-                          muted
-                          playsInline
-                          preload="metadata"
-                        />
-                      </div>
-                    )}
-
-                    <div
-                      style={{
-                        display: 'flex',
-                        flexDirection: 'column',
-                        gap: 'var(--space-xs)',
-                        fontSize: '0.75rem',
-                        color: 'var(--text-secondary)',
-                      }}
-                    >
-                      <span>
-                        <strong>run_id:</strong>{' '}
-                        <code
-                          style={{
-                            fontFamily: 'var(--font-mono)',
-                            fontSize: '0.7rem',
-                          }}
-                        >
-                          {opticalFlowRun.run_id}
-                        </code>
-                      </span>
-                    </div>
-                  </>
-                )}
               </div>
             </TabsContent>
 

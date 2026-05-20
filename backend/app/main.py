@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.core.database import SessionLocal, engine, get_db
 from app.db.base import Base
-from app.api.routes import courses, chapters, uploads, evaluations, history, progress
+from app.api.routes import courses, chapters, uploads, evaluations, history, progress, auth
 from app.api.routes import expert_mediapipe, expert_sam2, inspection, optical_flow
 from app.api import sam2_yolo
 from app.api.mediapipe import router as mediapipe_router
@@ -37,6 +37,8 @@ app = FastAPI(
     redoc_url="/redoc",
 )
 
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -45,6 +47,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(auth.router)
 app.include_router(courses.router)
 app.include_router(chapters.router)
 app.include_router(uploads.router)

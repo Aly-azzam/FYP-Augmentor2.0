@@ -12,7 +12,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session, joinedload
 
 from app.core.config import settings
-from app.core.database import get_db
+from app.core.database import get_db, SessionLocal
 from app.models.evaluation import Evaluation as EvaluationModel
 from app.models.evaluation_feedback import EvaluationFeedback
 from app.models.attempt import Attempt
@@ -58,6 +58,7 @@ def _run_orchestrator_bg(
     evaluation_id: str,
     learner_video_path: str,
     expert_id: str,
+    user_id: str | None = None,
 ) -> None:
     def emit(step: str) -> None:
         if step != "done":
@@ -74,6 +75,43 @@ def _run_orchestrator_bg(
             "run_id": result.get("run_id"),
         }
         print(f"[EVAL] Background orchestrator complete — run_id: {result.get('run_id')}")
+
+        # Write Attempt + Evaluation rows to DB
+        if user_id:
+            from app.core.database import SessionLocal
+            import uuid as _uuid
+            _db = SessionLocal()
+            try:
+                from app.models.chapter import Chapter
+                chapter = _db.query(Chapter).filter(Chapter.id == expert_id).first()
+                chapter_id_to_use = expert_id if chapter is not None else None
+
+                attempt = Attempt(
+                    id=str(_uuid.uuid4()),
+                    user_id=user_id,
+                    chapter_id=chapter_id_to_use,
+                    learner_video_id=None,
+                    status="completed",
+                )
+                _db.add(attempt)
+                _db.flush()
+                evaluation = EvaluationModel(
+                    id=str(_uuid.uuid4()),
+                    attempt_id=attempt.id,
+                    overall_score=None,
+                    status="completed",
+                )
+                _db.add(evaluation)
+                _db.commit()
+                print(f"[DB] SUCCESS — attempt {attempt.id} written for user {user_id}, chapter={chapter_id_to_use}")
+            except Exception as _e:
+                _db.rollback()
+                import traceback as _tb
+                print(f"[DB] FAILED — {type(_e).__name__}: {_e}")
+                _tb.print_exc()
+            finally:
+                _db.close()
+
     except Exception as exc:
         _evaluation_progress[evaluation_id] = {
             "step": "error",
@@ -91,6 +129,7 @@ async def start_evaluation(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     clip_id: str = Form(...),
+    user_id: str = Form(None),
 ):
     # 1. Save uploaded file to disk
     suffix = Path(file.filename or "upload.mp4").suffix or ".mp4"
@@ -111,12 +150,15 @@ async def start_evaluation(
         evaluation_id,
         str(save_path),
         clip_id,
+        user_id,
     )
 
-    print(f"[EVAL] Orchestrator started — evaluation_id: {evaluation_id}, expert_id: {clip_id}")
+    print(f"[EVAL] Orchestrator started — evaluation_id: {evaluation_id}, expert_id: {clip_id}, user_id: {user_id}")
 
     # 5. Return immediately
-    return {"evaluation_id": evaluation_id, "status": "processing"}
+    video_filename = save_path.name
+    video_url = f"/storage/uploads/compare_tmp/{video_filename}"
+    return {"evaluation_id": evaluation_id, "status": "processing", "video_url": video_url}
 
 
 # ── On-demand corridor overlay generation ─────────────────────────────────────
@@ -547,6 +589,27 @@ async def score_evaluation(evaluation_id: str, background_tasks: BackgroundTasks
                 Path(settings.STORAGE_ROOT) / "evaluation" / run_id / "visualization"
             )
             background_tasks.add_task(_run_feedback_bg, run_id, expert_id, output_dir)
+
+    # Update DB evaluation record with the gamified score
+    _score_db = SessionLocal()
+    try:
+        from app.models.evaluation import Evaluation as _EvalModel
+        _eval_row = (
+            _score_db.query(_EvalModel)
+            .filter(_EvalModel.overall_score == None)
+            .filter(_EvalModel.status == "completed")
+            .order_by(_EvalModel.created_at.desc())
+            .first()
+        )
+        if _eval_row is not None:
+            _eval_row.overall_score = score_pct
+            _score_db.commit()
+            print(f"[DB] Score {score_pct} saved to evaluation {_eval_row.id}")
+    except Exception as _se:
+        _score_db.rollback()
+        print(f"[DB] Score save failed: {_se}")
+    finally:
+        _score_db.close()
 
     return result
 
