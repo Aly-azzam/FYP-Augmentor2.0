@@ -49,6 +49,7 @@ import {
 } from '../store';
 import { fetchClipsForCourse, fetchCourse } from '../services/api/courses';
 import { getEvaluationResult, startEvaluation as startEvaluationApi } from '../api/evaluationApi';
+import { useAuth } from '@/contexts/AuthContext';
 import { runLearnerAngle, generateDtwPreview } from '../api/angleApi';
 import type { AngleDtwSummary } from '../api/angleApi';
 import { formatTime } from '../utils/helpers';
@@ -64,30 +65,48 @@ const PIPELINE_STAGES = [
   'VLM Explanation',
 ];
 
-const DRAWING_TOOLS: {
-  id: DrawingTool;
-  label: string;
-  icon: React.ReactNode;
-}[] = [
-  { id: 'select', label: 'Select', icon: <MousePointer size={16} /> },
-  { id: 'arrow', label: 'Arrow', icon: <ArrowUpRight size={16} /> },
-  { id: 'line', label: 'Line', icon: <Minus size={16} /> },
-  { id: 'rectangle', label: 'Rect', icon: <Square size={16} /> },
-  { id: 'circle', label: 'Circle', icon: <Circle size={16} /> },
-  { id: 'pen', label: 'Pen', icon: <PenTool size={16} /> },
-  { id: 'angle', label: 'Angle', icon: <Triangle size={16} /> },
-  { id: 'calibrate', label: 'Calibrate', icon: <Ruler size={16} /> },
-  { id: 'track', label: 'Track', icon: <Crosshair size={16} /> },
+const EVAL_STEPS = [
+  'Uploading your video',
+  'Detecting scissors in your video',
+  'Tracking scissor path',
+  'Detecting trajectory errors',
+  'Analyzing cutting angles',
+  'Comparing angles to expert',
+  'Analyzing hand vibration',
+  'Analysis complete',
 ];
 
-const COLOR_SWATCHES = [
-  '#2563EB',
-  '#EF4444',
-  '#10B981',
-  '#F59E0B',
-  '#8B5CF6',
-  '#EC4899',
+const EVAL_HINTS = [
+  'Analyzing your cutting path frame by frame...',
+  'Comparing your trajectory to the expert...',
+  'Measuring your cutting angles...',
+  'Almost there...',
 ];
+
+const SSE_STEP_INDEX: Record<string, number> = {
+  yolo: 1,
+  trajectory_init: 2,
+  trajectory_track: 2,
+  trajectory_errors: 3,
+  angle_init: 4,
+  angle_track: 5,
+  angle_errors: 5,
+  vibration: 6,
+  done: 7,
+};
+
+const SSE_PROGRESS: Record<string, number> = {
+  yolo: 20,
+  trajectory_init: 35,
+  trajectory_track: 50,
+  trajectory_errors: 60,
+  angle_init: 72,
+  angle_track: 86,
+  angle_errors: 88,
+  vibration: 95,
+  done: 100,
+};
+
 
 const PLAYBACK_RATES = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 2];
 
@@ -339,6 +358,14 @@ function formatMetricValue(value: unknown): string {
   return Number.isInteger(value) ? String(value) : value.toFixed(3);
 }
 
+function renderFeedback(text: string) {
+  return text.split(/(\*\*[^*]+\*\*)/).map((chunk, i) =>
+    chunk.startsWith('**') && chunk.endsWith('**')
+      ? <strong key={i}>{chunk.slice(2, -2)}</strong>
+      : chunk,
+  );
+}
+
 const TOUR_STEPS = [
   {
     title: 'Welcome to Compare Studio',
@@ -423,6 +450,8 @@ export default function CompareStudio() {
   const { timers, addTimer, startTimer, stopTimer, resetTimer, addTimestamp, updateElapsed } =
     useTimerStore();
 
+  const { user } = useAuth();
+
   // ── Local state ──────────────────────────────────────────────────────────
 
   const [userVideoUrl, setUserVideoUrl] = useState<string | null>(null);
@@ -436,6 +465,77 @@ export default function CompareStudio() {
   const [learnerMuted, setLearnerMuted] = useState(false);
   const [apiEvaluationResult, setApiEvaluationResult] = useState<any | null>(null);
 
+  // ── Evaluate tab — new progress-UI state ─────────────────────────────────
+  type EvalPhase = 'idle' | 'uploading' | 'streaming' | 'done' | 'error';
+  const [evalPhase, setEvalPhase] = useState<EvalPhase>('idle');
+  const [evalStepIndex, setEvalStepIndex] = useState(0);
+  const [evalProgress, setEvalProgress] = useState(0);
+  const [evalHintIndex, setEvalHintIndex] = useState(0);
+  const [evalError, setEvalError] = useState<string | null>(null);
+  const [evalRunId, setEvalRunId] = useState<string | null>(null);
+  const [evalEvaluationId, setEvalEvaluationId] = useState<string | null>(null);
+  const evalEventSourceRef = useRef<EventSource | null>(null);
+
+  // ── Game phase state ───────────────────────────────────────────────────────
+  type GamePhase = 'idle' | 'processing' | 'game' | 'result';
+  type MarkType = 'trajectory' | 'angle' | 'vibration';
+  interface UserMark {
+    id: string;
+    mark_type: MarkType;
+    x: number;
+    y: number;
+    display_x: number;
+    display_y: number;
+    timestamp_sec: number;
+    video_width: number;
+    video_height: number;
+  }
+  interface ScoreResult {
+    run_id: string;
+    total_real_errors: number;
+    correct_marks: number;
+    false_alarms: number;
+    missed_errors: number;
+    score_pct: number;
+    mark_results: Array<{
+      mark_type: string;
+      x: number;
+      y: number;
+      timestamp_sec: number | null;
+      result: 'correct' | 'false_alarm';
+      matched_error_id: number | null;
+    }>;
+    missed_error_details: Array<{
+      error_id: number;
+      error_type: string;
+      timestamp_start_sec: number;
+      timestamp_end_sec: number;
+      peak_location: { x: number; y: number };
+    }>;
+  }
+  interface UnifiedError {
+    error_id: number;
+    error_type: 'trajectory' | 'angle' | 'vibration';
+    timestamp_start_sec: number;
+    timestamp_end_sec: number;
+    duration_sec: number;
+    peak_location: { x: number; y: number } | null;
+    bounding_box: { x_min: number; y_min: number; x_max: number; y_max: number } | null;
+    dominant_freq_hz?: number | null;
+    peak_confidence?: number | null;
+    severity?: 'mild' | 'moderate' | 'severe' | null;
+    consecutive_windows?: number | null;
+  }
+
+  const [gamePhase, setGamePhase] = useState<GamePhase>('idle');
+  const [activeMarkType, setActiveMarkType] = useState<MarkType | null>(null);
+  const [userMarks, setUserMarks] = useState<UserMark[]>([]);
+  const [scoreResult, setScoreResult] = useState<ScoreResult | null>(null);
+  const [gameErrors, setGameErrors] = useState<UnifiedError[]>([]);
+  const [feedbackText, setFeedbackText] = useState<string | null>(null);
+  const [feedbackStatus, setFeedbackStatus] = useState<'idle' | 'loading' | 'done'>('idle');
+  const feedbackPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
   // MediaPipe integration state.
   const [mediapipeRun, setMediapipeRun] = useState<MediaPipeRunResult | null>(null);
   const [isMediapipeProcessing, setIsMediapipeProcessing] = useState(false);
@@ -446,7 +546,17 @@ export default function CompareStudio() {
   // Learner overlay: show the raw uploaded video, the MediaPipe annotated
   // output, YOLO+SAM2 scissors overlay, or Optical Flow visualization.
   const [learnerOverlay, setLearnerOverlay] =
-    useState<'none' | 'mediapipe' | 'sam2' | 'optical_flow' | 'aligned_corridor' | 'angle'>('none');
+    useState<'none' | 'mediapipe' | 'sam2' | 'optical_flow' | 'aligned_corridor' | 'angle' | 'eval_corridor' | 'visualization'>('none');
+
+  // Path Overlay (on-demand corridor overlay from evaluation run).
+  type PathOverlayState = 'disabled' | 'idle' | 'loading' | 'ready';
+  const [pathOverlayState, setPathOverlayState] = useState<PathOverlayState>('disabled');
+  const [evalCorridorOverlayUrl, setEvalCorridorOverlayUrl] = useState<string | null>(null);
+
+  // Visualization (corridor lines + ghost scissor overlay).
+  type VizState = 'idle' | 'loading' | 'ready';
+  const [vizState, setVizState] = useState<VizState>('idle');
+  const [vizUrl, setVizUrl] = useState<string | null>(null);
 
   // YOLO+SAM2 learner scissors tracking state.
   const [sam2LearnerRun, setSam2LearnerRun] = useState<Sam2LearnerResult | null>(null);
@@ -495,6 +605,11 @@ export default function CompareStudio() {
   // run_id returned by the backend for the most recent angle pipeline run.
   const [angleRunId, setAngleRunId] = useState<string | null>(null);
 
+  // Rules modal — shown once per session.
+  const [showRulesModal, setShowRulesModal] = useState(
+    !sessionStorage.getItem('augmentor_rules_seen'),
+  );
+
   // SYNC dialog + DTW preview state.
   const [isSyncDialogOpen, setIsSyncDialogOpen] = useState(false);
   const [isDtwPreviewGenerating, setIsDtwPreviewGenerating] = useState(false);
@@ -519,6 +634,105 @@ export default function CompareStudio() {
   const hasSelectedExpertReference = Boolean(selectedClip || requestedClipId);
 
   // ── Effects ──────────────────────────────────────────────────────────────
+
+  // Rotate hint message while evaluation is streaming.
+  useEffect(() => {
+    if (evalPhase !== 'streaming') return;
+    const id = setInterval(() => {
+      setEvalHintIndex((prev) => (prev + 1) % EVAL_HINTS.length);
+    }, 4000);
+    return () => clearInterval(id);
+  }, [evalPhase]);
+
+  // Clean up any open SSE connection on unmount.
+  useEffect(() => {
+    return () => {
+      evalEventSourceRef.current?.close();
+    };
+  }, []);
+
+  // Restore full CompareStudio state on mount (survives navigation, cleared on browser refresh).
+  useEffect(() => {
+    const saved = sessionStorage.getItem('augmentor_compare_state');
+    if (saved) {
+      try {
+        const s = JSON.parse(saved) as {
+          evalPhase?: string;
+          evalRunId?: string | null;
+          evalEvaluationId?: string | null;
+          gamePhase?: string;
+          scoreResult?: ScoreResult | null;
+          userMarks?: UserMark[];
+          gameErrors?: UnifiedError[];
+          practiceVideoUrl?: string | null;
+        };
+        if (s.evalPhase && s.evalPhase !== 'idle') setEvalPhase(s.evalPhase as EvalPhase);
+        if (s.evalRunId) setEvalRunId(s.evalRunId);
+        if (s.evalEvaluationId) setEvalEvaluationId(s.evalEvaluationId);
+        if (s.gamePhase && s.gamePhase !== 'idle') setGamePhase(s.gamePhase as GamePhase);
+        if (s.scoreResult) setScoreResult(s.scoreResult);
+        if (s.userMarks?.length) setUserMarks(s.userMarks);
+        if (s.gameErrors?.length) setGameErrors(s.gameErrors);
+        if (s.practiceVideoUrl) setUserVideoUrl(s.practiceVideoUrl);
+
+        // If the eval was still streaming when the user navigated away, re-attach the SSE.
+        if (s.evalPhase === 'streaming' && s.evalEvaluationId) {
+          const evaluationId = s.evalEvaluationId;
+          const es = new EventSource(`/api/evaluations/${evaluationId}/status-stream`);
+          evalEventSourceRef.current = es;
+
+          es.onmessage = (event) => {
+            try {
+              const data = JSON.parse(event.data as string) as {
+                step?: string;
+                progress?: number;
+                run_id?: string;
+              };
+              if (data.run_id) setEvalRunId(data.run_id);
+              const step = data.step ?? '';
+              const progress = data.progress ?? SSE_PROGRESS[step] ?? undefined;
+              if (step in SSE_STEP_INDEX) setEvalStepIndex(SSE_STEP_INDEX[step]);
+              if (progress !== undefined) setEvalProgress(progress);
+              if (step === 'done' || progress === 100) {
+                es.close();
+                evalEventSourceRef.current = null;
+                setEvalStepIndex(7);
+                setEvalProgress(100);
+                setEvalPhase('done');
+                setGamePhase('game');
+              }
+            } catch {
+              // ignore malformed events
+            }
+          };
+
+          es.onerror = () => {
+            es.close();
+            evalEventSourceRef.current = null;
+            setEvalPhase('error');
+            setEvalError('Connection lost. Please try again.');
+          };
+        }
+      } catch {
+        sessionStorage.removeItem('augmentor_compare_state');
+      }
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Persist key state to sessionStorage so it survives SPA navigation (cleared on browser refresh).
+  useEffect(() => {
+    sessionStorage.setItem('augmentor_compare_state', JSON.stringify({
+      evalPhase,
+      evalRunId,
+      evalEvaluationId,
+      gamePhase,
+      scoreResult,
+      userMarks,
+      gameErrors,
+      practiceVideoUrl: userVideoUrl,
+    }));
+  }, [evalPhase, evalRunId, evalEvaluationId, gamePhase, scoreResult, userMarks, gameErrors, userVideoUrl]);
 
   useEffect(() => {
     if (requestedCourseId && requestedCourseId !== selectedCourse) {
@@ -704,6 +918,67 @@ export default function CompareStudio() {
     };
   }, []);
 
+  // Load unified errors (for vibration bbox overlay) once the game phase starts.
+  useEffect(() => {
+    if (gamePhase !== 'game' || !evalEvaluationId || !evalRunId) return;
+    let cancelled = false;
+    fetch(`/api/evaluations/${evalEvaluationId}/errors?run_id=${evalRunId}`)
+      .then((r) => r.json())
+      .then((d: { all_errors?: UnifiedError[] }) => {
+        if (!cancelled) setGameErrors(d.all_errors ?? []);
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [gamePhase, evalEvaluationId, evalRunId]);
+
+  // Poll for VLM coaching feedback once the score result panel appears.
+  useEffect(() => {
+    if (gamePhase !== 'result' || !evalEvaluationId || !evalRunId || !selectedClip) return;
+
+    setFeedbackStatus('loading');
+    setFeedbackText(null);
+    let cancelled = false;
+    let attempts = 0;
+
+    const poll = async () => {
+      if (cancelled) return;
+      attempts++;
+      if (attempts > 60) {
+        clearInterval(pollId);
+        setFeedbackStatus('done');
+        setFeedbackText('Your Crafting Coach is taking longer than expected. Please try again later.');
+        return;
+      }
+      try {
+        const res = await fetch(
+          `/api/evaluations/${encodeURIComponent(evalEvaluationId)}/generate-feedback` +
+          `?run_id=${encodeURIComponent(evalRunId)}&expert_id=${encodeURIComponent(selectedClip)}`,
+        );
+        if (cancelled || !res.ok) return;
+        const data = await res.json() as { status: string; feedback?: string };
+        if (!cancelled && data.status === 'done' && data.feedback) {
+          setFeedbackText(data.feedback);
+          setFeedbackStatus('done');
+          cancelled = true;
+          if (feedbackPollRef.current) {
+            clearInterval(feedbackPollRef.current);
+            feedbackPollRef.current = null;
+          }
+        }
+      } catch { /* keep polling */ }
+    };
+
+    void poll();
+    const pollId = setInterval(() => void poll(), 3000);
+    feedbackPollRef.current = pollId;
+
+    return () => {
+      cancelled = true;
+      clearInterval(pollId);
+      feedbackPollRef.current = null;
+    };
+  }, [gamePhase, evalEvaluationId, evalRunId, selectedClip]);
+
   // ── Video upload ─────────────────────────────────────────────────────────
 
   const handlePracticeVideoFile = useCallback(
@@ -756,6 +1031,7 @@ export default function CompareStudio() {
         setOpticalFlowRun(null);
         setOpticalFlowError(null);
         setOpticalFlowVideoVersion(0);
+        sessionStorage.removeItem('augmentor_compare_state');
         resetEvaluation();
         toast.success('Practice video ready');
       };
@@ -783,22 +1059,35 @@ export default function CompareStudio() {
 
   const runEvaluation = useCallback(async () => {
     if (!selectedCourse || !selectedClip || !userVideo) return;
-    try {
-      setApiEvaluationResult(null);
-      startEvaluation();
-      setEvaluationStep(0);
-      setEvaluationProgress(20);
 
+    // Close any leftover SSE connection.
+    evalEventSourceRef.current?.close();
+    evalEventSourceRef.current = null;
+
+    setEvalPhase('uploading');
+    setEvalStepIndex(0);
+    setEvalProgress(8);
+    setEvalHintIndex(0);
+    setEvalError(null);
+    setEvalRunId(null);
+    setEvalEvaluationId(null);
+    setApiEvaluationResult(null);
+    setGamePhase('processing');
+    setActiveMarkType(null);
+    setUserMarks([]);
+    setScoreResult(null);
+
+    try {
       const formData = new FormData();
       formData.append('file', userVideo);
       formData.append('course_id', selectedCourse);
       formData.append('clip_id', selectedClip);
       formData.append('filename', userVideo.name);
+      if (user?.id) formData.append('user_id', user.id);
 
       const started = await startEvaluationApi(formData);
 
       if (started?.status === 'out_of_context') {
-        resetEvaluation();
         setApiEvaluationResult({
           score: 0,
           status: 'out_of_context',
@@ -808,6 +1097,7 @@ export default function CompareStudio() {
           explanation: null,
           key_error_moments: [],
         });
+        setEvalPhase('idle');
         toast.error('Video rejected: does not match the expert task');
         return;
       }
@@ -817,32 +1107,74 @@ export default function CompareStudio() {
           ? started
           : started?.evaluation_id || started?.id;
 
-      if (!evaluationId) {
-        throw new Error('Missing evaluation_id from backend response');
+      if (!evaluationId) throw new Error('Missing evaluation_id from backend response');
+
+      setEvalEvaluationId(evaluationId);
+      if (started?.run_id) setEvalRunId(started.run_id);
+
+      // Persist the server-side video URL so the player can be restored after navigation.
+      if (started?.video_url) {
+        const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+        setUserVideoUrl(`${API_BASE}${started.video_url}`);
       }
 
-      setEvaluationStep(2);
-      setEvaluationProgress(70);
-      const result = await getEvaluationResult(evaluationId);
-      setEvaluationStep(4);
-      setEvaluationProgress(100);
-      setApiEvaluationResult(result);
-      resetEvaluation();
-      console.log('CompareStudio evaluation response:', result);
-      toast.success(`Evaluation complete! Score: ${result.score}/100`);
+      // Upload done — step 0 complete, step 1 running.
+      setEvalStepIndex(1);
+      setEvalProgress(14);
+      setEvalPhase('streaming');
+
+      const es = new EventSource(`/api/evaluations/${evaluationId}/status-stream`);
+      evalEventSourceRef.current = es;
+
+      es.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data as string) as {
+            step?: string;
+            progress?: number;
+            run_id?: string;
+          };
+
+          if (data.run_id) setEvalRunId(data.run_id);
+
+          const step = data.step ?? '';
+          const progress = data.progress ?? SSE_PROGRESS[step] ?? undefined;
+
+          if (step in SSE_STEP_INDEX) {
+            setEvalStepIndex(SSE_STEP_INDEX[step]);
+          }
+          if (progress !== undefined) {
+            setEvalProgress(progress);
+          }
+
+          if (step === 'done' || progress === 100) {
+            es.close();
+            evalEventSourceRef.current = null;
+            setEvalStepIndex(7);
+            setEvalProgress(100);
+            setEvalPhase('done');
+            setPathOverlayState('idle');
+            setGamePhase('game');
+          }
+        } catch {
+          // ignore malformed events
+        }
+      };
+
+      es.onerror = () => {
+        es.close();
+        evalEventSourceRef.current = null;
+        setEvalPhase('error');
+        setEvalError('Connection lost. Please try again.');
+      };
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Evaluation failed';
-      toast.error(message);
-      resetEvaluation();
+      setEvalError(message);
+      setEvalPhase('error');
     }
   }, [
     selectedCourse,
     selectedClip,
     userVideo,
-    startEvaluation,
-    setEvaluationStep,
-    setEvaluationProgress,
-    resetEvaluation,
   ]);
 
   // ── MediaPipe run ────────────────────────────────────────────────────────
@@ -1085,7 +1417,66 @@ export default function CompareStudio() {
   );
 
   const handleLearnerTipClick = useCallback(
-    (event: React.MouseEvent<HTMLVideoElement>) => {
+    (event: React.MouseEvent<HTMLElement>) => {
+      // Game mark placement takes priority
+      if (gamePhase === 'game' && activeMarkType) {
+        if (!learnerVideoRef.current) return;
+        const rect = event.currentTarget.getBoundingClientRect();
+        const video = learnerVideoRef.current;
+
+        // Calculate actual video content area within the element (object-fit: contain)
+        const videoAspect = video.videoWidth / video.videoHeight;
+        const elementAspect = rect.width / rect.height;
+
+        let contentWidth: number, contentHeight: number, contentLeft: number, contentTop: number;
+        if (videoAspect > elementAspect) {
+          // Black bars top and bottom
+          contentWidth = rect.width;
+          contentHeight = rect.width / videoAspect;
+          contentLeft = 0;
+          contentTop = (rect.height - contentHeight) / 2;
+        } else {
+          // Black bars left and right
+          contentHeight = rect.height;
+          contentWidth = rect.height * videoAspect;
+          contentLeft = (rect.width - contentWidth) / 2;
+          contentTop = 0;
+        }
+
+        // Raw element-relative position (used for visual display)
+        const display_x = event.clientX - rect.left;
+        const display_y = event.clientY - rect.top;
+
+        // Content-relative position
+        const content_x = display_x - contentLeft;
+        const content_y = display_y - contentTop;
+
+        // Ignore clicks in black bars
+        if (content_x < 0 || content_y < 0 || content_x > contentWidth || content_y > contentHeight) return;
+
+        // Pre-scale to native video pixel space so backend receives coordinates
+        // already in the same space as the stored bounding boxes.
+        const nativeW = video.videoWidth || contentWidth;
+        const nativeH = video.videoHeight || contentHeight;
+        const native_x = content_x * (nativeW / contentWidth);
+        const native_y = content_y * (nativeH / contentHeight);
+
+        setUserMarks((prev) => [
+          ...prev,
+          {
+            id: crypto.randomUUID(),
+            mark_type: activeMarkType,
+            x: native_x,
+            y: native_y,
+            display_x,
+            display_y,
+            timestamp_sec: video.currentTime,
+            video_width: nativeW,
+            video_height: nativeH,
+          },
+        ]);
+        return;
+      }
       if (!isSelectingTip || !sam2LearnerRun || !learnerVideoRef.current) return;
       const video = learnerVideoRef.current;
       const rect = video.getBoundingClientRect();
@@ -1095,7 +1486,7 @@ export default function CompareStudio() {
       const y = Math.max(0, Math.min(1, ny)) * (video.videoHeight || sam2LearnerRun.metadata?.height || 1);
       void runTipTracking(x, y);
     },
-    [isSelectingTip, sam2LearnerRun, runTipTracking],
+    [gamePhase, activeMarkType, isSelectingTip, sam2LearnerRun, runTipTracking],
   );
 
   const eventToVideoPixels = useCallback(
@@ -1284,6 +1675,12 @@ export default function CompareStudio() {
     if (learnerOverlay === 'aligned_corridor' && corridorOverlayBaseUrl) {
       return corridorOverlayBaseUrl;
     }
+    if (learnerOverlay === 'eval_corridor' && evalCorridorOverlayUrl) {
+      return evalCorridorOverlayUrl;
+    }
+    if (learnerOverlay === 'visualization' && vizUrl) {
+      return vizUrl;
+    }
     return userVideoUrl;
   })();
   const learnerVideoPixelWidth =
@@ -1311,12 +1708,6 @@ export default function CompareStudio() {
   ) => {
     if (ref.current)
       ref.current.currentTime = Math.max(0, ref.current.currentTime + delta);
-  };
-
-  const handleClearAll = () => {
-    clearTrackedPoints();
-    clearMeasurements();
-    toast.info('All annotations cleared');
   };
 
   const handleAddTimer = () => {
@@ -1400,6 +1791,105 @@ export default function CompareStudio() {
 
   return (
     <div style={{ padding: 'var(--space-lg)', maxWidth: 1600, margin: '0 auto' }}>
+      {/* ─── Rules modal (shown once per session) ──────────────────────── */}
+      {showRulesModal && (
+        <div
+          style={{
+            position: 'fixed',
+            inset: 0,
+            zIndex: 9999,
+            background: 'var(--bg-primary)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            padding: 'var(--space-lg)',
+          }}
+        >
+          <div
+            className="card"
+            style={{
+              maxWidth: 560,
+              width: '100%',
+              padding: 'var(--space-xl)',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: 'var(--space-lg)',
+            }}
+          >
+            <div>
+              <h2 className="heading-2" style={{ marginBottom: 'var(--space-xs)' }}>
+                How You're Evaluated
+              </h2>
+              <p className="text-small" style={{ color: 'var(--text-muted)', margin: 0 }}>
+                Understand how errors are detected before you start
+              </p>
+            </div>
+
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-md)' }}>
+              <div>
+                <p style={{ margin: '0 0 var(--space-xs)', fontWeight: 600 }}>
+                  🎯 Trajectory Error
+                </p>
+                <p className="text-small" style={{ color: 'var(--text-secondary)', margin: 0 }}>
+                  Your scissors should follow the expert's cutting path. If you stray outside the
+                  allowed corridor, that counts as one error. A new error won't be counted again
+                  until you return to the correct region and deviate again — so staying outside
+                  longer doesn't make things worse.
+                </p>
+              </div>
+
+              <div>
+                <p style={{ margin: '0 0 var(--space-xs)', fontWeight: 600 }}>
+                  📐 Angle Error
+                </p>
+                <p className="text-small" style={{ color: 'var(--text-secondary)', margin: 0 }}>
+                  Your scissors should be held at the same angle as the expert's. If your angle
+                  drifts too far, an error is recorded — but only for the first moment of deviation.
+                  Think of it this way: the wrong angle causes you to leave the path, not the other
+                  way around. If you return to the correct region, you get a short grace period to
+                  fix your angle before another error is logged.
+                </p>
+              </div>
+
+              <div>
+                <p style={{ margin: '0 0 var(--space-xs)', fontWeight: 600 }}>
+                  〰️ Vibration Error
+                </p>
+                <p className="text-small" style={{ color: 'var(--text-secondary)', margin: 0 }}>
+                  If your hand shakes severely for more than a couple of seconds, a vibration error
+                  is registered. Mild tremors are ignored — only sustained, intense shaking counts.
+                </p>
+              </div>
+            </div>
+
+            <div className="divider" />
+
+            <div>
+              <p style={{ margin: '0 0 var(--space-xs)', fontWeight: 600 }}>
+                💡 Tip
+              </p>
+              <p className="text-small" style={{ color: 'var(--text-secondary)', margin: 0 }}>
+                After completing your evaluation, press <strong>Visualization</strong> to see an
+                annotated replay of exactly where errors occurred. Then read your{' '}
+                <strong>Crafting Coach</strong> explanation for personalized feedback on how to
+                improve.
+              </p>
+            </div>
+
+            <button
+              className="btn btn-primary"
+              style={{ width: '100%', padding: 'var(--space-md) var(--space-lg)', fontSize: '1rem' }}
+              onClick={() => {
+                sessionStorage.setItem('augmentor_rules_seen', 'true');
+                setShowRulesModal(false);
+              }}
+            >
+              I Understand
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* ─── Sync Controls Bar ─────────────────────────────────────────── */}
       <motion.div
         className="glass"
@@ -1484,39 +1974,51 @@ export default function CompareStudio() {
           </div>
         )}
 
-        <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)' }}>
-          <span className="label">Playback Rate</span>
-          <select
-            className="input"
-            style={{ width: 80 }}
-            value={playbackRate}
-            onChange={(e) => setPlaybackRate(Number(e.target.value))}
-          >
-            {PLAYBACK_RATES.map((r) => (
-              <option key={r} value={r}>
-                {r}x
-              </option>
-            ))}
-          </select>
-        </div>
-
-        <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)' }}>
-          <span className="label">Offset</span>
-          <input
-            className="input"
-            type="number"
-            step={0.1}
-            style={{ width: 80 }}
-            value={offset}
-            onChange={(e) => setOffset(Number(e.target.value))}
-          />
-          <span className="text-small" style={{ color: 'var(--text-muted)' }}>
-            sec
-          </span>
-        </div>
-
-        <button className="btn btn-secondary" onClick={() => setOffset(0)}>
-          Align Start
+        {/* ── Path Overlay button ──────────────────────────────────────── */}
+        <button
+          className={`btn ${pathOverlayState === 'ready' ? 'btn-primary' : 'btn-secondary'}`}
+          title={pathOverlayState === 'disabled' ? 'Run evaluation first' : undefined}
+          disabled={pathOverlayState === 'disabled' || pathOverlayState === 'loading'}
+          style={pathOverlayState === 'disabled' ? { opacity: 0.4, cursor: 'not-allowed' } : undefined}
+          onClick={async () => {
+            if (pathOverlayState !== 'idle') return;
+            if (!evalEvaluationId || !evalRunId) return;
+            setPathOverlayState('loading');
+            console.log('[PATH OVERLAY] evaluation_id:', evalEvaluationId);
+            console.log('[PATH OVERLAY] run_id being sent:', evalRunId);
+            try {
+              const res = await fetch(
+                `/api/evaluations/${evalEvaluationId}/generate-corridor-overlay`,
+                {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ run_id: evalRunId }),
+                },
+              );
+              if (!res.ok) {
+                const err = await res.json().catch(() => ({}));
+                throw new Error((err as any).detail ?? `HTTP ${res.status}`);
+              }
+              const data = await res.json() as { status: string; overlay_video_url: string };
+              const fullUrl = data.overlay_video_url.startsWith('http')
+                ? data.overlay_video_url
+                : `http://localhost:8001${data.overlay_video_url}`;
+              setEvalCorridorOverlayUrl(fullUrl);
+              setPathOverlayState('ready');
+            } catch (err) {
+              setPathOverlayState('idle');
+              console.error('Path overlay generation failed:', err);
+            }
+          }}
+        >
+          {pathOverlayState === 'loading' ? (
+            <>
+              <Loader2 size={14} style={{ animation: 'spin 1s linear infinite' }} />
+              Generating...
+            </>
+          ) : (
+            'Path Overlay'
+          )}
         </button>
       </motion.div>
 
@@ -1639,11 +2141,14 @@ export default function CompareStudio() {
             </span>
             {userVideoUrl ? (
               <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)', flexWrap: 'wrap' }}>
-                {(mediapipeRun?.annotated_video_url ||
+                  {(vizUrl ||
+                  mediapipeRun?.annotated_video_url ||
                   sam2OverlayBaseUrl ||
                   sam2LearnerRun?.annotated_video_url ||
                   corridorOverlayBaseUrl ||
-                  opticalFlowVisualizationUrl) && (
+                  evalCorridorOverlayUrl ||
+                  opticalFlowVisualizationUrl) &&
+                  !(gamePhase === 'game' && activeMarkType) && (
                   <div
                     role="tablist"
                     aria-label="Learner video source"
@@ -1701,6 +2206,32 @@ export default function CompareStudio() {
                       >
                         <Hand size={12} style={{ marginRight: 4 }} />
                         Aligned Expert Corridor
+                      </button>
+                    )}
+                    {evalCorridorOverlayUrl && (
+                      <button
+                        type="button"
+                        role="tab"
+                        aria-selected={learnerOverlay === 'eval_corridor'}
+                        className={`btn ${learnerOverlay === 'eval_corridor' ? 'btn-primary' : 'btn-ghost'}`}
+                        style={{ borderRadius: 0, fontSize: '0.75rem', padding: 'var(--space-xs) var(--space-sm)' }}
+                        onClick={() => setLearnerOverlay(learnerOverlay === 'eval_corridor' ? 'none' : 'eval_corridor')}
+                      >
+                        <Activity size={12} style={{ marginRight: 4 }} />
+                        Path Overlay
+                      </button>
+                    )}
+                    {console.log('vizUrl state:', vizUrl, 'gamePhase:', gamePhase, 'evalPhase:', evalPhase) as undefined}
+                    {vizUrl && (
+                      <button
+                        type="button"
+                        role="tab"
+                        aria-selected={learnerOverlay === 'visualization'}
+                        className={`btn ${learnerOverlay === 'visualization' ? 'btn-primary' : 'btn-ghost'}`}
+                        style={{ borderRadius: 0, fontSize: '0.75rem', padding: 'var(--space-xs) var(--space-sm)' }}
+                        onClick={() => setLearnerOverlay('visualization')}
+                      >
+                        Visualization
                       </button>
                     )}
                     {opticalFlowVisualizationUrl && (
@@ -1776,7 +2307,7 @@ export default function CompareStudio() {
                   key={learnerVideoSource ?? userVideoUrl}
                   ref={learnerVideoRef}
                   src={learnerVideoSource ?? undefined}
-                  controls={learnerOverlay === 'sam2' || learnerOverlay === 'optical_flow' || learnerOverlay === 'aligned_corridor'}
+                  controls={(learnerOverlay === 'sam2' || learnerOverlay === 'optical_flow' || learnerOverlay === 'aligned_corridor' || learnerOverlay === 'eval_corridor' || learnerOverlay === 'visualization') && gamePhase !== 'game'}
                   onClick={handleLearnerTipClick}
                   muted={learnerMuted}
                   playsInline
@@ -1800,8 +2331,25 @@ export default function CompareStudio() {
                       );
                     }
                   }}
-                  style={{ cursor: isSelectingTip ? 'crosshair' : 'default' }}
+                  style={{
+                    cursor: (gamePhase === 'game' && activeMarkType) || isSelectingTip ? 'crosshair' : 'default',
+                    pointerEvents: (gamePhase === 'game' && activeMarkType) ? 'none' : 'auto'
+                  }}
                 />
+
+                {gamePhase === 'game' && activeMarkType && (
+                  <div
+                    style={{
+                      position: 'absolute',
+                      inset: 0,
+                      zIndex: 20,
+                      background: 'transparent',
+                      cursor: 'crosshair',
+                      pointerEvents: 'all',
+                    }}
+                    onClick={handleLearnerTipClick}
+                  />
+                )}
 
                 {/* DTW preview loading overlay */}
                 {isDtwPreviewGenerating && (
@@ -1830,6 +2378,142 @@ export default function CompareStudio() {
                       <br />
                       <span style={{ fontWeight: 400, opacity: 0.8 }}>This may take up to 7 minutes.</span>
                     </span>
+                  </div>
+                )}
+
+                {/* ── Game marks overlay ───────────────────────────────── */}
+                {(gamePhase === 'game' || gamePhase === 'result') && (
+                  <div
+                    style={{
+                      position: 'absolute',
+                      inset: 0,
+                      pointerEvents: 'none',
+                      overflow: 'hidden',
+                    }}
+                  >
+                    {/* User-placed marks */}
+                    {userMarks.map((mark, markIdx) => {
+                      const resultEntry = scoreResult?.mark_results[markIdx];
+                      const isCorrect = resultEntry?.result === 'correct';
+                      const isFalseAlarm = resultEntry?.result === 'false_alarm';
+                      const pendingColor =
+                        mark.mark_type === 'vibration' ? '#F59E0B' : '#ef4444';
+                      const color =
+                        gamePhase === 'result'
+                          ? isCorrect
+                            ? '#22c55e'
+                            : '#ef4444'
+                          : pendingColor;
+                      const symbol =
+                        mark.mark_type === 'trajectory' ? '✕'
+                        : mark.mark_type === 'angle' ? '○'
+                        : '〜';
+                      const fSize =
+                        mark.mark_type === 'trajectory' ? 28
+                        : mark.mark_type === 'vibration' ? 30
+                        : 36;
+                      return (
+                        <span
+                          key={mark.id}
+                          title={gamePhase === 'result' ? (isCorrect ? 'Correct!' : 'False alarm') : 'Click to remove'}
+                          onClick={
+                            gamePhase === 'game'
+                              ? () => setUserMarks((prev) => prev.filter((m) => m.id !== mark.id))
+                              : undefined
+                          }
+                          style={{
+                            position: 'absolute',
+                            left: mark.display_x,
+                            top: mark.display_y,
+                            transform: 'translate(-50%, -50%)',
+                            fontSize: fSize,
+                            lineHeight: 1,
+                            color,
+                            textShadow: '0 0 3px #fff, 0 0 6px #fff',
+                            pointerEvents: gamePhase === 'game' ? 'auto' : 'none',
+                            cursor: gamePhase === 'game' ? 'pointer' : 'default',
+                            userSelect: 'none',
+                            width: 40,
+                            height: 40,
+                            display: 'inline-flex',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            textDecoration: isFalseAlarm && gamePhase === 'result' ? 'line-through' : 'none',
+                          }}
+                        >
+                          {symbol}
+                        </span>
+                      );
+                    })}
+
+                    {/* Missed errors shown in result phase */}
+                    {gamePhase === 'result' &&
+                      scoreResult?.missed_error_details.map((e) => {
+                        const video = learnerVideoRef.current;
+                        if (!video) return null;
+
+                        const vw = video.offsetWidth;
+                        const vh = video.offsetHeight;
+                        if (!vw || !vh) return null;
+
+                        // Letterbox calculation (same as handleLearnerTipClick)
+                        const videoAspect = video.videoWidth / video.videoHeight;
+                        const elementAspect = vw / vh;
+
+                        let contentWidth: number, contentHeight: number, contentLeft: number, contentTop: number;
+                        if (videoAspect > elementAspect) {
+                          contentWidth = vw;
+                          contentHeight = vw / videoAspect;
+                          contentLeft = 0;
+                          contentTop = (vh - contentHeight) / 2;
+                        } else {
+                          contentHeight = vh;
+                          contentWidth = vh * videoAspect;
+                          contentLeft = (vw - contentWidth) / 2;
+                          contentTop = 0;
+                        }
+
+                        // Scale from native video coords to display coords
+                        const nativeW = video.videoWidth || 1440;
+                        const nativeH = video.videoHeight || 1080;
+                        const dx = contentLeft + (e.peak_location.x / nativeW) * contentWidth;
+                        const dy = contentTop + (e.peak_location.y / nativeH) * contentHeight;
+                        const missedSymbol =
+                          e.error_type === 'trajectory' ? '✕'
+                          : e.error_type === 'vibration' ? '〜'
+                          : '○';
+                        const missedSize =
+                          e.error_type === 'trajectory' ? 28
+                          : e.error_type === 'vibration' ? 30
+                          : 36;
+                        return (
+                          <span
+                            key={`missed-${e.error_id}`}
+                            title="Missed"
+                            style={{
+                              position: 'absolute',
+                              left: dx,
+                              top: dy,
+                              transform: 'translate(-50%, -50%)',
+                              fontSize: missedSize,
+                              lineHeight: 1,
+                              color: 'rgba(156,163,175,0.85)',
+                              textShadow: '0 0 3px #000',
+                              pointerEvents: 'none',
+                              userSelect: 'none',
+                              display: 'inline-flex',
+                              flexDirection: 'column',
+                              alignItems: 'center',
+                              gap: 2,
+                            }}
+                          >
+                            {missedSymbol}
+                            <span style={{ fontSize: 9, fontWeight: 600, color: 'rgba(209,213,219,0.9)', lineHeight: 1 }}>
+                              missed
+                            </span>
+                          </span>
+                        );
+                      })}
                   </div>
                 )}
 
@@ -2089,148 +2773,18 @@ export default function CompareStudio() {
           animate={{ opacity: 1, x: 0 }}
           transition={{ delay: 0.2 }}
         >
-          <Tabs defaultValue="tools">
+          <Tabs defaultValue="evaluate">
             <TabsList>
-              <TabsTrigger value="tools">Tools</TabsTrigger>
               <TabsTrigger value="evaluate">Evaluate</TabsTrigger>
-              <TabsTrigger value="mediapipe">MediaPipe</TabsTrigger>
-              <TabsTrigger value="optical-flow">Optical Flow</TabsTrigger>
+              <TabsTrigger value="mediapipe">Models (Developer Tab)</TabsTrigger>
               <TabsTrigger value="timers">Timers</TabsTrigger>
             </TabsList>
 
-            {/* ── Tab: Tools ───────────────────────────────────────────── */}
-            <TabsContent value="tools">
-              <div
-                style={{
-                  display: 'flex',
-                  flexDirection: 'column',
-                  gap: 'var(--space-md)',
-                }}
-              >
-                {/* Tool grid */}
-                <div>
-                  <span
-                    className="label"
-                    style={{
-                      display: 'block',
-                      marginBottom: 'var(--space-sm)',
-                    }}
-                  >
-                    Tools
-                  </span>
-                  <div
-                    style={{
-                      display: 'grid',
-                      gridTemplateColumns: 'repeat(3, 1fr)',
-                      gap: 'var(--space-xs)',
-                    }}
-                  >
-                    {DRAWING_TOOLS.map((tool) => (
-                      <button
-                        key={tool.id}
-                        className={`btn ${activeTool === tool.id ? 'btn-primary' : 'btn-secondary'}`}
-                        style={{
-                          flexDirection: 'column',
-                          padding: 'var(--space-sm)',
-                          fontSize: '0.7rem',
-                          gap: '0.25rem',
-                        }}
-                        onClick={() => setActiveTool(tool.id)}
-                      >
-                        {tool.icon}
-                        {tool.label}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-
-                {/* Color picker */}
-                <div>
-                  <span
-                    className="label"
-                    style={{
-                      display: 'block',
-                      marginBottom: 'var(--space-sm)',
-                    }}
-                  >
-                    Color
-                  </span>
-                  <div style={{ display: 'flex', gap: 'var(--space-sm)' }}>
-                    {COLOR_SWATCHES.map((color) => (
-                      <button
-                        key={color}
-                        aria-label={`Color ${color}`}
-                        onClick={() => setToolColor(color)}
-                        style={{
-                          width: 28,
-                          height: 28,
-                          borderRadius: '50%',
-                          background: color,
-                          border:
-                            toolColor === color
-                              ? '2px solid var(--text-primary)'
-                              : '2px solid transparent',
-                          cursor: 'pointer',
-                          transition: 'transform var(--transition-fast)',
-                          transform:
-                            toolColor === color ? 'scale(1.15)' : 'scale(1)',
-                          outline: 'none',
-                        }}
-                      />
-                    ))}
-                  </div>
-                </div>
-
-                {/* Thickness */}
-                <div>
-                  <div
-                    className="flex-between"
-                    style={{ marginBottom: 'var(--space-sm)' }}
-                  >
-                    <span className="label">Thickness</span>
-                    <span
-                      className="text-small"
-                      style={{ color: 'var(--text-secondary)' }}
-                    >
-                      {toolThickness}px
-                    </span>
-                  </div>
-                  <Slider
-                    value={[toolThickness]}
-                    min={1}
-                    max={10}
-                    step={1}
-                    onValueChange={([v]) => setToolThickness(v)}
-                  />
-                </div>
-
-                {/* Show all frames */}
-                <div className="flex-between">
-                  <span className="text-small">Show on all frames</span>
-                  <Switch
-                    checked={showAllFrames}
-                    onCheckedChange={setShowAllFrames}
-                  />
-                </div>
-
-                <div className="divider" />
-
-                {/* Clear all */}
-                <button
-                  className="btn btn-secondary"
-                  style={{ width: '100%' }}
-                  onClick={handleClearAll}
-                >
-                  <Trash2 size={14} />
-                  Clear All
-                </button>
-              </div>
-            </TabsContent>
-
             {/* ── Tab: Evaluate ─────────────────────────────────────────── */}
             <TabsContent value="evaluate">
-              {/* Idle */}
-              {!isEvaluating && !apiEvaluationResult && (
+
+              {/* ── Idle: run button ─────────────────────────────────────── */}
+              {gamePhase === 'idle' && evalPhase === 'idle' && !apiEvaluationResult && (
                 <div
                   style={{
                     display: 'flex',
@@ -2240,14 +2794,8 @@ export default function CompareStudio() {
                     padding: 'var(--space-lg) 0',
                   }}
                 >
-                  <Sparkles
-                    size={48}
-                    style={{ color: 'var(--text-muted)' }}
-                  />
-                  <p
-                    className="text-body"
-                    style={{ textAlign: 'center' }}
-                  >
+                  <Sparkles size={48} style={{ color: 'var(--text-muted)' }} />
+                  <p className="text-body" style={{ textAlign: 'center' }}>
                     {userVideo
                       ? 'Ready to evaluate your practice!'
                       : 'Upload a practice video to get started.'}
@@ -2256,96 +2804,468 @@ export default function CompareStudio() {
                     className="btn btn-primary"
                     style={{ width: '100%' }}
                     disabled={!userVideo || !selectedClip}
-                    onClick={runEvaluation}
+                    onClick={() => void runEvaluation()}
                   >
                     Run Evaluation
                   </button>
                 </div>
               )}
 
-              {/* Evaluating */}
-              {isEvaluating && (
+              {/* ── Progress panel (uploading / streaming) ───────────────── */}
+              {(evalPhase === 'uploading' || evalPhase === 'streaming') && (
                 <div
                   style={{
                     display: 'flex',
                     flexDirection: 'column',
+                    gap: 'var(--space-md)',
+                    marginTop: 'var(--space-sm)',
+                  }}
+                >
+                  {/* Header */}
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)' }}>
+                    <Sparkles size={18} style={{ color: 'var(--accent-primary)' }} />
+                    <span className="text-small" style={{ fontWeight: 600 }}>
+                      Evaluating your practice
+                    </span>
+                  </div>
+
+                  {/* Vertical stepper */}
+                  <div
+                    style={{
+                      display: 'flex',
+                      flexDirection: 'column',
+                      gap: 6,
+                    }}
+                  >
+                    {EVAL_STEPS.map((label, i) => {
+                      const isDone    = i < evalStepIndex;
+                      const isRunning = i === evalStepIndex;
+                      const isWaiting = i > evalStepIndex;
+                      return (
+                        <div
+                          key={label}
+                          style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: 'var(--space-sm)',
+                            padding: '5px 0',
+                          }}
+                        >
+                          {/* Icon */}
+                          <span
+                            style={{
+                              width: 18,
+                              textAlign: 'center',
+                              fontSize: '0.8rem',
+                              flexShrink: 0,
+                              color: isDone
+                                ? 'var(--success, #22c55e)'
+                                : isRunning
+                                  ? 'var(--accent-primary)'
+                                  : 'var(--text-muted)',
+                            }}
+                          >
+                            {isDone ? '✓' : isRunning ? (
+                              <Loader2
+                                size={13}
+                                style={{ animation: 'spin 1s linear infinite', display: 'inline-block' }}
+                              />
+                            ) : '○'}
+                          </span>
+
+                          {/* Label */}
+                          <span
+                            className="text-small"
+                            style={{
+                              color: isDone
+                                ? 'var(--text-secondary)'
+                                : isRunning
+                                  ? 'var(--text-primary)'
+                                  : 'var(--text-muted)',
+                              fontWeight: isRunning ? 600 : 400,
+                              opacity: isWaiting ? 0.5 : 1,
+                            }}
+                          >
+                            {label}
+                          </span>
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  {/* Progress bar */}
+                  <Progress value={evalProgress} />
+
+                  {/* Rotating hint */}
+                  <p
+                    className="text-small"
+                    style={{
+                      color: 'var(--text-muted)',
+                      textAlign: 'center',
+                      margin: 0,
+                      minHeight: '1.2em',
+                    }}
+                  >
+                    {EVAL_HINTS[evalHintIndex]}
+                  </p>
+                </div>
+              )}
+
+              {/* ── Game: mark the errors ────────────────────────────────── */}
+              {gamePhase === 'game' && (
+                <div
+                  style={{
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: 'var(--space-md)',
+                    padding: 'var(--space-sm) 0',
+                  }}
+                >
+                  <div>
+                    <p className="text-body" style={{ fontWeight: 600, marginBottom: 2 }}>
+                      Mark the errors you spotted
+                    </p>
+                    <p className="text-small" style={{ color: 'var(--text-muted)', margin: 0 }}>
+                      Watch the video and click where you noticed mistakes
+                    </p>
+                  </div>
+
+                  {/* Toggle buttons */}
+                  <div style={{ display: 'flex', gap: 'var(--space-sm)', flexWrap: 'wrap' }}>
+                    {(['trajectory', 'angle', 'vibration'] as const).map((type) => {
+                      const isActive = activeMarkType === type;
+                      const isVib = type === 'vibration';
+                      const symbol = type === 'trajectory' ? '✕' : type === 'angle' ? '○' : '〜';
+                      const label  = type === 'trajectory' ? 'Path' : type === 'angle' ? 'Angle' : 'Vibration';
+                      return (
+                        <button
+                          key={type}
+                          className={isActive ? 'btn btn-primary' : 'btn btn-secondary'}
+                          style={{
+                            flex: 1,
+                            display: 'inline-flex',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            gap: 6,
+                            ...(isVib && isActive  ? { background: '#D97706', borderColor: '#B45309', color: '#fff' } : {}),
+                            ...(isVib && !isActive ? { borderColor: '#D97706', color: '#F59E0B' } : {}),
+                          }}
+                          onClick={() => setActiveMarkType((prev) => (prev === type ? null : type))}
+                        >
+                          <span style={{ fontSize: 16 }}>{symbol}</span>
+                          {label}
+                        </button>
+                      );
+                    })}
+                  </div>
+
+                  {/* Mark counts */}
+                  <div className="text-small" style={{ color: 'var(--text-muted)', display: 'flex', flexDirection: 'column', gap: 2 }}>
+                    <span>Marks placed: {userMarks.filter((m) => m.mark_type === 'trajectory').length} trajectory</span>
+                    <span style={{ paddingLeft: 70 }}>{userMarks.filter((m) => m.mark_type === 'angle').length} angle</span>
+                    <span style={{ paddingLeft: 70, color: '#F59E0B' }}>{userMarks.filter((m) => m.mark_type === 'vibration').length} vibration</span>
+                  </div>
+
+                  <hr style={{ border: 'none', borderTop: '1px solid var(--border-subtle)', margin: 0 }} />
+
+                  <button
+                    className="btn btn-primary"
+                    style={{ width: '100%' }}
+                    disabled={userMarks.length === 0}
+                    onClick={async () => {
+                      if (!evalEvaluationId || !evalRunId) return;
+                      try {
+                        const res = await fetch(`/api/evaluations/${evalEvaluationId}/score`, {
+                          method: 'POST',
+                          headers: { 'Content-Type': 'application/json' },
+                          body: JSON.stringify({ run_id: evalRunId, marks: userMarks }),
+                        });
+                        if (!res.ok) throw new Error(`Score API error: ${res.status}`);
+                        const data = await res.json() as ScoreResult;
+                        setScoreResult(data);
+                        setGamePhase('result');
+                      } catch (err) {
+                        toast.error('Failed to score your marks. Please try again.');
+                        console.error(err);
+                      }
+                    }}
+                  >
+                    Get Your Result
+                  </button>
+
+                  <button
+                    className="btn btn-secondary"
+                    style={{ width: '100%' }}
+                    onClick={() => {
+                      sessionStorage.removeItem('augmentor_compare_state');
+                      setGamePhase('idle');
+                      setEvalPhase('idle');
+                      setEvalStepIndex(0);
+                      setEvalProgress(0);
+                      setEvalError(null);
+                      setActiveMarkType(null);
+                      setUserMarks([]);
+                      setScoreResult(null);
+                      setGameErrors([]);
+                      setFeedbackText(null);
+                      setFeedbackStatus('idle');
+                    }}
+                  >
+                    <RotateCcw size={14} />
+                    Run Again
+                  </button>
+                </div>
+              )}
+
+              {/* ── Result: score display ─────────────────────────────────── */}
+              {gamePhase === 'result' && scoreResult && (
+                <div
+                  style={{
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: 'var(--space-md)',
+                    padding: 'var(--space-sm) 0',
+                  }}
+                >
+                  <p className="text-body" style={{ fontWeight: 600, margin: 0 }}>Your Score</p>
+
+                  {/* Big score */}
+                  <div style={{ textAlign: 'center', padding: 'var(--space-sm) 0' }}>
+                    <span
+                      style={{
+                        fontSize: '3rem',
+                        fontWeight: 700,
+                        color: 'var(--accent-primary)',
+                        lineHeight: 1,
+                      }}
+                    >
+                      {scoreResult.score_pct}%
+                    </span>
+                  </div>
+
+                  {/* Summary rows */}
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                    <div className="text-small" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                      <span style={{ color: '#22c55e', fontWeight: 700, width: 14, textAlign: 'center' }}>✓</span>
+                      <span>{scoreResult.correct_marks} error{scoreResult.correct_marks !== 1 ? 's' : ''} found</span>
+                    </div>
+                    <div className="text-small" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                      <span style={{ color: '#ef4444', fontWeight: 700, width: 14, textAlign: 'center' }}>✕</span>
+                      <span>{scoreResult.false_alarms} false alarm{scoreResult.false_alarms !== 1 ? 's' : ''}</span>
+                    </div>
+                    <div className="text-small" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                      <span style={{ color: 'var(--text-muted)', width: 14, textAlign: 'center' }}>○</span>
+                      <span>{scoreResult.missed_errors} error{scoreResult.missed_errors !== 1 ? 's' : ''} missed</span>
+                    </div>
+                  </div>
+
+                  <hr style={{ border: 'none', borderTop: '1px solid var(--border-subtle)', margin: 0 }} />
+
+                  {/* Breakdown by type */}
+                  {(['trajectory', 'angle', 'vibration'] as const).map((type) => {
+                    const totalReal = scoreResult.missed_error_details.filter((e) => e.error_type === type).length
+                      + scoreResult.mark_results.filter((m) => m.mark_type === type && m.result === 'correct').length;
+                    const found = scoreResult.mark_results.filter((m) => m.mark_type === type && m.result === 'correct').length;
+                    if (totalReal === 0 && found === 0) return null;
+                    const label = type === 'trajectory' ? 'Trajectory' : type === 'angle' ? 'Angle' : 'Vibration';
+                    const labelColor = type === 'vibration' ? '#F59E0B' : 'var(--text-secondary)';
+                    return (
+                      <div
+                        key={type}
+                        className="text-small"
+                        style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}
+                      >
+                        <span style={{ color: labelColor }}>{label}</span>
+                        <span style={{ color: 'var(--text-muted)' }}>
+                          {totalReal} real &nbsp;|&nbsp; {found} found
+                        </span>
+                      </div>
+                    );
+                  })}
+
+                  {/* Vibration error detail list */}
+                  {gameErrors.filter((e) => e.error_type === 'vibration').length > 0 && (
+                    <>
+                      <hr style={{ border: 'none', borderTop: '1px solid var(--border-subtle)', margin: 0 }} />
+                      <div>
+                        <p
+                          className="text-small"
+                          style={{ fontWeight: 600, color: '#F59E0B', marginBottom: 6, margin: '0 0 6px' }}
+                        >
+                          Vibration Events
+                        </p>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                          {gameErrors
+                            .filter((e) => e.error_type === 'vibration')
+                            .map((e) => (
+                              <div
+                                key={`vib-detail-${e.error_id}`}
+                                className="text-small"
+                                style={{
+                                  display: 'flex',
+                                  flexDirection: 'column',
+                                  gap: 2,
+                                  padding: '6px 8px',
+                                  background: 'rgba(245,158,11,0.08)',
+                                  border: '1px solid rgba(245,158,11,0.25)',
+                                  borderRadius: 6,
+                                }}
+                              >
+                                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                                  <span style={{ color: '#F59E0B', fontWeight: 600 }}>
+                                    〜 Vibration #{e.error_id}
+                                  </span>
+                                  {e.severity && (
+                                    <span
+                                      style={{
+                                        fontSize: 10,
+                                        fontWeight: 700,
+                                        textTransform: 'uppercase',
+                                        letterSpacing: '0.04em',
+                                        color:
+                                          e.severity === 'severe' ? '#ef4444'
+                                          : e.severity === 'moderate' ? '#F59E0B'
+                                          : '#a3a3a3',
+                                      }}
+                                    >
+                                      {e.severity}
+                                    </span>
+                                  )}
+                                </div>
+                                <div style={{ color: 'var(--text-muted)', display: 'flex', gap: 12 }}>
+                                  <span>
+                                    {e.timestamp_start_sec.toFixed(1)}s – {e.timestamp_end_sec.toFixed(1)}s
+                                  </span>
+                                  {e.dominant_freq_hz != null && (
+                                    <span>{e.dominant_freq_hz.toFixed(1)} Hz</span>
+                                  )}
+                                </div>
+                              </div>
+                            ))}
+                        </div>
+                      </div>
+                    </>
+                  )}
+
+                  <button
+                    className="btn btn-primary"
+                    style={{ width: '100%', marginTop: 'var(--space-xs)' }}
+                    onClick={() => {
+                      sessionStorage.removeItem('augmentor_compare_state');
+                      setGamePhase('idle');
+                      setEvalPhase('idle');
+                      setEvalStepIndex(0);
+                      setEvalProgress(0);
+                      setEvalError(null);
+                      setActiveMarkType(null);
+                      setUserMarks([]);
+                      setScoreResult(null);
+                      setGameErrors([]);
+                      setFeedbackText(null);
+                      setFeedbackStatus('idle');
+                    }}
+                  >
+                    <RotateCcw size={14} />
+                    Run Again
+                  </button>
+
+                  <button
+                    className={`btn ${vizState === 'ready' ? 'btn-primary' : 'btn-secondary'}`}
+                    style={{ width: '100%' }}
+                    disabled={vizState === 'loading'}
+                    onClick={async () => {
+                      if (vizState !== 'idle') return;
+                      if (!evalEvaluationId || !evalRunId || !selectedClip) return;
+                      setVizState('loading');
+                      try {
+                        const res = await fetch(
+                          `/api/evaluations/${evalEvaluationId}/generate-visualization`,
+                          {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ run_id: evalRunId, expert_id: selectedClip }),
+                          },
+                        );
+                        if (!res.ok) {
+                          const err = await res.json().catch(() => ({}));
+                          throw new Error((err as any).detail ?? `HTTP ${res.status}`);
+                        }
+                        const data = await res.json() as { status: string; visualization_url: string };
+                        const fullUrl = data.visualization_url.startsWith('http')
+                          ? data.visualization_url
+                          : `http://localhost:8001${data.visualization_url}`;
+                        setVizUrl(fullUrl);
+                        console.log('vizUrl set to:', fullUrl);
+                        setVizState('ready');
+                      } catch (err) {
+                        setVizState('idle');
+                        console.error('Visualization generation failed:', err);
+                      }
+                    }}
+                  >
+                    {vizState === 'loading' ? (
+                      <>
+                        <Loader2 size={14} style={{ animation: 'spin 1s linear infinite' }} />
+                        Generating...
+                      </>
+                    ) : (
+                      'Visualization'
+                    )}
+                  </button>
+                </div>
+              )}
+
+              {/* ── Error ────────────────────────────────────────────────── */}
+              {evalPhase === 'error' && (
+                <div
+                  style={{
+                    display: 'flex',
+                    flexDirection: 'column',
+                    alignItems: 'center',
                     gap: 'var(--space-md)',
                     padding: 'var(--space-lg) 0',
                   }}
                 >
                   <div
                     style={{
+                      width: 56,
+                      height: 56,
+                      borderRadius: '50%',
+                      border: '3px solid #ef4444',
                       display: 'flex',
-                      flexDirection: 'column',
-                      gap: 'var(--space-sm)',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      boxShadow: '0 0 16px #ef444430',
                     }}
                   >
-                    {PIPELINE_STAGES.map((stage, i) => (
-                      <div
-                        key={stage}
-                        style={{
-                          display: 'flex',
-                          alignItems: 'center',
-                          gap: 'var(--space-sm)',
-                        }}
-                      >
-                        <div
-                          style={{
-                            width: 8,
-                            height: 8,
-                            borderRadius: '50%',
-                            background:
-                              i < evaluationStep
-                                ? 'var(--success)'
-                                : i === evaluationStep
-                                  ? 'var(--accent-primary)'
-                                  : 'var(--bg-tertiary)',
-                            transition: 'background var(--transition-fast)',
-                          }}
-                        />
-                        <span
-                          className="text-small"
-                          style={{
-                            color:
-                              i <= evaluationStep
-                                ? 'var(--text-primary)'
-                                : 'var(--text-muted)',
-                            fontWeight: i === evaluationStep ? 600 : 400,
-                          }}
-                        >
-                          {stage}
-                        </span>
-                        {i < evaluationStep && (
-                          <span
-                            style={{
-                              color: 'var(--success)',
-                              fontSize: '0.75rem',
-                              marginLeft: 'auto',
-                            }}
-                          >
-                            ✓
-                          </span>
-                        )}
-                      </div>
-                    ))}
+                    <span style={{ fontSize: '1.5rem', lineHeight: 1 }}>!</span>
                   </div>
-
-                  <Progress value={evaluationProgress} />
-
                   <p
                     className="text-small"
-                    style={{
-                      color: 'var(--text-muted)',
-                      textAlign: 'center',
+                    style={{ textAlign: 'center', color: 'var(--text-secondary)', maxWidth: 280 }}
+                  >
+                    {evalError ?? 'Something went wrong. Please try again.'}
+                  </p>
+                  <button
+                    className="btn btn-secondary"
+                    style={{ width: '100%' }}
+                    onClick={() => {
+                      sessionStorage.removeItem('augmentor_compare_state');
+                      setEvalPhase('idle');
+                      setEvalStepIndex(0);
+                      setEvalProgress(0);
+                      setEvalError(null);
+                      setGamePhase('idle');
                     }}
                   >
-                    Processing... Step {evaluationStep + 1} of {PIPELINE_STAGES.length}
-                  </p>
+                    <RotateCcw size={14} />
+                    Try Again
+                  </button>
                 </div>
               )}
 
-              {/* Out of context rejection */}
-              {apiEvaluationResult?.status === 'out_of_context' && !isEvaluating && (
+              {/* ── Out-of-context rejection (existing flow) ─────────────── */}
+              {gamePhase === 'idle' && evalPhase === 'idle' && apiEvaluationResult?.status === 'out_of_context' && (
                 <div
                   style={{
                     display: 'flex',
@@ -2369,10 +3289,7 @@ export default function CompareStudio() {
                   >
                     <span style={{ fontSize: '2rem' }}>0</span>
                   </div>
-                  <p
-                    className="heading-4"
-                    style={{ textAlign: 'center', color: '#ef4444' }}
-                  >
+                  <p className="heading-4" style={{ textAlign: 'center', color: '#ef4444' }}>
                     Out of Context
                   </p>
                   <p
@@ -2389,6 +3306,7 @@ export default function CompareStudio() {
                     className="btn btn-secondary"
                     style={{ width: '100%' }}
                     onClick={() => {
+                      sessionStorage.removeItem('augmentor_compare_state');
                       resetEvaluation();
                       setApiEvaluationResult(null);
                     }}
@@ -2399,141 +3317,6 @@ export default function CompareStudio() {
                 </div>
               )}
 
-              {/* Complete */}
-              {apiEvaluationResult && apiEvaluationResult.status !== 'out_of_context' && !isEvaluating && (
-                <div
-                  style={{
-                    display: 'flex',
-                    flexDirection: 'column',
-                    gap: 'var(--space-md)',
-                    padding: 'var(--space-md) 0',
-                  }}
-                >
-                  {/* Score circle */}
-                  <div className="flex-center">
-                    <div
-                      style={{
-                        width: 100,
-                        height: 100,
-                        borderRadius: '50%',
-                        border: `4px solid ${scoreColor(apiEvaluationResult.score)}`,
-                        display: 'flex',
-                        flexDirection: 'column',
-                        alignItems: 'center',
-                        justifyContent: 'center',
-                        boxShadow: `0 0 20px ${scoreColor(apiEvaluationResult.score)}40`,
-                      }}
-                    >
-                      <span
-                        style={{
-                          fontSize: '2rem',
-                          fontWeight: 700,
-                          color: scoreColor(apiEvaluationResult.score),
-                        }}
-                      >
-                        {apiEvaluationResult.score}
-                      </span>
-                      <span className="label">{scoreLabel(apiEvaluationResult.score)}</span>
-                    </div>
-                  </div>
-
-                  {/* Metric cards */}
-                  <div
-                    style={{
-                      display: 'grid',
-                      gridTemplateColumns: '1fr 1fr',
-                      gap: 'var(--space-sm)',
-                    }}
-                  >
-                    {(
-                      [
-                        {
-                          label: 'Angle Dev.',
-                          value: apiEvaluationResult.metrics?.angle_deviation,
-                          unit: '',
-                        },
-                        {
-                          label: 'Trajectory',
-                          value: apiEvaluationResult.metrics?.trajectory_deviation,
-                          unit: '',
-                        },
-                        {
-                          label: 'Velocity',
-                          value: apiEvaluationResult.metrics?.velocity_difference,
-                          unit: '',
-                        },
-                        {
-                          label: 'Tool Align.',
-                          value: apiEvaluationResult.metrics?.tool_alignment_deviation,
-                          unit: '',
-                        },
-                      ] as const
-                    ).map((m) => (
-                      <div
-                        key={m.label}
-                        className="stat-card"
-                        style={{ padding: 'var(--space-sm)' }}
-                      >
-                        <div
-                          className="stat-value"
-                          style={{ fontSize: '1.25rem' }}
-                        >
-                          {typeof m.value === 'number' ? m.value : 0}
-                          {m.unit}
-                        </div>
-                        <div
-                          className="stat-label"
-                          style={{ fontSize: '0.7rem' }}
-                        >
-                          {m.label}
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-
-                  {/* AI explanation */}
-                  <div
-                    style={{
-                      background: 'var(--bg-tertiary)',
-                      borderRadius: 'var(--radius-md)',
-                      padding: 'var(--space-md)',
-                    }}
-                  >
-                    <p
-                      className="text-small"
-                      style={{ color: 'var(--text-secondary)' }}
-                    >
-                      {apiEvaluationResult.explanation?.explanation ?? ''}
-                    </p>
-                    {Array.isArray(apiEvaluationResult.key_error_moments) &&
-                      apiEvaluationResult.key_error_moments.length > 0 && (
-                        <div style={{ marginTop: 'var(--space-sm)' }}>
-                          {apiEvaluationResult.key_error_moments.map((error: any, index: number) => (
-                            <p
-                              key={`${error.error_type ?? 'error'}-${index}`}
-                              className="text-small"
-                              style={{ color: 'var(--text-secondary)' }}
-                            >
-                              - {error.semantic_label || error.label}
-                            </p>
-                          ))}
-                        </div>
-                      )}
-                  </div>
-
-                  <button
-                    className="btn btn-secondary"
-                    style={{ width: '100%' }}
-                    onClick={() => {
-                      resetEvaluation();
-                      setApiEvaluationResult(null);
-                    }}
-                  >
-                    <RotateCcw size={14} />
-                    Run Again
-                  </button>
-                </div>
-              )}
             </TabsContent>
 
             {/* ── Tab: MediaPipe ───────────────────────────────────────── */}
@@ -3283,16 +4066,204 @@ export default function CompareStudio() {
 
                   <TabsContent value="optical_flow">
                     <div
-                      className="text-small"
                       style={{
-                        color: 'var(--text-muted)',
-                        marginTop: 'var(--space-sm)',
-                        background: 'var(--bg-tertiary)',
-                        borderRadius: 'var(--radius-md)',
-                        padding: 'var(--space-sm) var(--space-md)',
+                        display: 'flex',
+                        flexDirection: 'column',
+                        gap: 'var(--space-md)',
+                        padding: 'var(--space-sm) 0',
                       }}
                     >
-                      Optical Flow inspection is reserved for later and will appear here in the same panel.
+                      <div
+                        style={{
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: 'var(--space-sm)',
+                        }}
+                      >
+                        <Activity size={18} style={{ color: 'var(--accent-primary)' }} />
+                        <span className="text-small" style={{ fontWeight: 600 }}>
+                          Motion Instability (Optical Flow)
+                        </span>
+                      </div>
+                      <p
+                        className="text-small"
+                        style={{ color: 'var(--text-muted)', margin: 0 }}
+                      >
+                        Run learner-only Optical Flow to estimate vibration and motion
+                        stability. These values are side-analysis only and do not affect
+                        the evaluation score.
+                      </p>
+
+                      <button
+                        className="btn btn-primary"
+                        style={{
+                          width: '100%',
+                          display: 'inline-flex',
+                          alignItems: 'center',
+                          justifyContent: 'center',
+                          gap: 'var(--space-xs)',
+                        }}
+                        disabled={!userVideo || isOpticalFlowProcessing}
+                        onClick={runOpticalFlow}
+                      >
+                        {isOpticalFlowProcessing ? (
+                          <>
+                            <Loader2
+                              size={14}
+                              style={{ animation: 'spin 1s linear infinite' }}
+                            />
+                            Processing...
+                          </>
+                        ) : (
+                          <>
+                            <Activity size={14} />
+                            {opticalFlowRun ? 'Run Optical Flow Again' : 'Run Optical Flow'}
+                          </>
+                        )}
+                      </button>
+
+                      {!userVideo && (
+                        <p
+                          className="text-small"
+                          style={{
+                            color: 'var(--text-muted)',
+                            textAlign: 'center',
+                            margin: 0,
+                          }}
+                        >
+                          Upload a practice video to enable Optical Flow
+                        </p>
+                      )}
+
+                      {opticalFlowError && (
+                        <div
+                          className="text-small"
+                          style={{
+                            background: 'var(--bg-tertiary)',
+                            border: '1px solid var(--danger, #ef4444)',
+                            color: 'var(--danger, #ef4444)',
+                            borderRadius: 'var(--radius-md)',
+                            padding: 'var(--space-sm) var(--space-md)',
+                          }}
+                        >
+                          {opticalFlowError}
+                        </div>
+                      )}
+
+                      {opticalFlowRun && (
+                        <>
+                          <div
+                            style={{
+                              display: 'grid',
+                              gridTemplateColumns: '1fr 1fr',
+                              gap: 'var(--space-sm)',
+                            }}
+                          >
+                            {[
+                              {
+                                label: 'Vibration',
+                                value: opticalFlowRun.summary.vibration_score,
+                              },
+                              {
+                                label: 'High freq.',
+                                value: opticalFlowRun.summary.vibration_high_freq_mean,
+                              },
+                              {
+                                label: 'Stability',
+                                value: opticalFlowRun.summary.motion_stability_score,
+                              },
+                              {
+                                label: 'Avg magnitude',
+                                value: opticalFlowRun.summary.avg_magnitude,
+                              },
+                              {
+                                label: 'ROI usage',
+                                value: opticalFlowRun.summary.roi_usage_ratio,
+                              },
+                              {
+                                label: 'Jitter',
+                                value: opticalFlowRun.summary.magnitude_jitter,
+                              },
+                            ].map((metric) => (
+                              <div
+                                key={metric.label}
+                                className="stat-card"
+                                style={{ padding: 'var(--space-sm)' }}
+                              >
+                                <div
+                                  className="stat-value"
+                                  style={{ fontSize: '1.25rem' }}
+                                >
+                                  {formatMetricValue(metric.value)}
+                                </div>
+                                <div
+                                  className="stat-label"
+                                  style={{ fontSize: '0.7rem' }}
+                                >
+                                  {metric.label}
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+
+                          <button
+                            type="button"
+                            className={`btn ${learnerOverlay === 'optical_flow' ? 'btn-primary' : 'btn-secondary'}`}
+                            style={{ width: '100%' }}
+                            disabled={!opticalFlowVisualizationUrl}
+                            onClick={() => {
+                              setLearnerOverlay((current) =>
+                                current === 'optical_flow' ? 'none' : 'optical_flow',
+                              );
+                            }}
+                          >
+                            {learnerOverlay === 'optical_flow'
+                              ? 'Show Original Learner Video'
+                              : 'Show Optical Flow Visualization'}
+                          </button>
+
+                          {opticalFlowVisualizationUrl && (
+                            <div
+                              className="video-container"
+                              style={{
+                                aspectRatio: '16/9',
+                                border: '1px solid var(--border-default)',
+                              }}
+                            >
+                              <video
+                                key={`optical-flow-preview-${opticalFlowLearnerSource ?? opticalFlowVisualizationUrl}`}
+                                src={opticalFlowLearnerSource ?? opticalFlowVisualizationUrl}
+                                controls
+                                muted
+                                playsInline
+                                preload="metadata"
+                              />
+                            </div>
+                          )}
+
+                          <div
+                            style={{
+                              display: 'flex',
+                              flexDirection: 'column',
+                              gap: 'var(--space-xs)',
+                              fontSize: '0.75rem',
+                              color: 'var(--text-secondary)',
+                            }}
+                          >
+                            <span>
+                              <strong>run_id:</strong>{' '}
+                              <code
+                                style={{
+                                  fontFamily: 'var(--font-mono)',
+                                  fontSize: '0.7rem',
+                                }}
+                              >
+                                {opticalFlowRun.run_id}
+                              </code>
+                            </span>
+                          </div>
+                        </>
+                      )}
                     </div>
                   </TabsContent>
 
@@ -3437,210 +4408,6 @@ export default function CompareStudio() {
               </div>
             </TabsContent>
 
-            {/* ── Tab: Optical Flow ─────────────────────────────────────── */}
-            <TabsContent value="optical-flow">
-              <div
-                style={{
-                  display: 'flex',
-                  flexDirection: 'column',
-                  gap: 'var(--space-md)',
-                  padding: 'var(--space-sm) 0',
-                }}
-              >
-                <div
-                  style={{
-                    display: 'flex',
-                    alignItems: 'center',
-                    gap: 'var(--space-sm)',
-                  }}
-                >
-                  <Activity size={18} style={{ color: 'var(--accent-primary)' }} />
-                  <span className="text-small" style={{ fontWeight: 600 }}>
-                    Motion Instability (Optical Flow)
-                  </span>
-                </div>
-                <p
-                  className="text-small"
-                  style={{ color: 'var(--text-muted)', margin: 0 }}
-                >
-                  Run learner-only Optical Flow to estimate vibration and motion
-                  stability. These values are side-analysis only and do not affect
-                  the evaluation score.
-                </p>
-
-                <button
-                  className="btn btn-primary"
-                  style={{
-                    width: '100%',
-                    display: 'inline-flex',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    gap: 'var(--space-xs)',
-                  }}
-                  disabled={!userVideo || isOpticalFlowProcessing}
-                  onClick={runOpticalFlow}
-                >
-                  {isOpticalFlowProcessing ? (
-                    <>
-                      <Loader2
-                        size={14}
-                        style={{ animation: 'spin 1s linear infinite' }}
-                      />
-                      Processing...
-                    </>
-                  ) : (
-                    <>
-                      <Activity size={14} />
-                      {opticalFlowRun ? 'Run Optical Flow Again' : 'Run Optical Flow'}
-                    </>
-                  )}
-                </button>
-
-                {!userVideo && (
-                  <p
-                    className="text-small"
-                    style={{
-                      color: 'var(--text-muted)',
-                      textAlign: 'center',
-                      margin: 0,
-                    }}
-                  >
-                    Upload a practice video to enable Optical Flow
-                  </p>
-                )}
-
-                {opticalFlowError && (
-                  <div
-                    className="text-small"
-                    style={{
-                      background: 'var(--bg-tertiary)',
-                      border: '1px solid var(--danger, #ef4444)',
-                      color: 'var(--danger, #ef4444)',
-                      borderRadius: 'var(--radius-md)',
-                      padding: 'var(--space-sm) var(--space-md)',
-                    }}
-                  >
-                    {opticalFlowError}
-                  </div>
-                )}
-
-                {opticalFlowRun && (
-                  <>
-                    <div
-                      style={{
-                        display: 'grid',
-                        gridTemplateColumns: '1fr 1fr',
-                        gap: 'var(--space-sm)',
-                      }}
-                    >
-                      {[
-                        {
-                          label: 'Vibration',
-                          value: opticalFlowRun.summary.vibration_score,
-                        },
-                        {
-                          label: 'High freq.',
-                          value: opticalFlowRun.summary.vibration_high_freq_mean,
-                        },
-                        {
-                          label: 'Stability',
-                          value: opticalFlowRun.summary.motion_stability_score,
-                        },
-                        {
-                          label: 'Avg magnitude',
-                          value: opticalFlowRun.summary.avg_magnitude,
-                        },
-                        {
-                          label: 'ROI usage',
-                          value: opticalFlowRun.summary.roi_usage_ratio,
-                        },
-                        {
-                          label: 'Jitter',
-                          value: opticalFlowRun.summary.magnitude_jitter,
-                        },
-                      ].map((metric) => (
-                        <div
-                          key={metric.label}
-                          className="stat-card"
-                          style={{ padding: 'var(--space-sm)' }}
-                        >
-                          <div
-                            className="stat-value"
-                            style={{ fontSize: '1.25rem' }}
-                          >
-                            {formatMetricValue(metric.value)}
-                          </div>
-                          <div
-                            className="stat-label"
-                            style={{ fontSize: '0.7rem' }}
-                          >
-                            {metric.label}
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-
-                    <button
-                      type="button"
-                      className={`btn ${learnerOverlay === 'optical_flow' ? 'btn-primary' : 'btn-secondary'}`}
-                      style={{ width: '100%' }}
-                      disabled={!opticalFlowVisualizationUrl}
-                      onClick={() => {
-                        setLearnerOverlay((current) =>
-                          current === 'optical_flow' ? 'none' : 'optical_flow',
-                        );
-                      }}
-                    >
-                      {learnerOverlay === 'optical_flow'
-                        ? 'Show Original Learner Video'
-                        : 'Show Optical Flow Visualization'}
-                    </button>
-
-                    {opticalFlowVisualizationUrl && (
-                      <div
-                        className="video-container"
-                        style={{
-                          aspectRatio: '16/9',
-                          border: '1px solid var(--border-default)',
-                        }}
-                      >
-                        <video
-                          key={`optical-flow-preview-${opticalFlowLearnerSource ?? opticalFlowVisualizationUrl}`}
-                          src={opticalFlowLearnerSource ?? opticalFlowVisualizationUrl}
-                          controls
-                          muted
-                          playsInline
-                          preload="metadata"
-                        />
-                      </div>
-                    )}
-
-                    <div
-                      style={{
-                        display: 'flex',
-                        flexDirection: 'column',
-                        gap: 'var(--space-xs)',
-                        fontSize: '0.75rem',
-                        color: 'var(--text-secondary)',
-                      }}
-                    >
-                      <span>
-                        <strong>run_id:</strong>{' '}
-                        <code
-                          style={{
-                            fontFamily: 'var(--font-mono)',
-                            fontSize: '0.7rem',
-                          }}
-                        >
-                          {opticalFlowRun.run_id}
-                        </code>
-                      </span>
-                    </div>
-                  </>
-                )}
-              </div>
-            </TabsContent>
-
             {/* ── Tab: Timers ──────────────────────────────────────────── */}
             <TabsContent value="timers">
               <div
@@ -3761,6 +4528,68 @@ export default function CompareStudio() {
           </Tabs>
         </motion.div>
       </div>
+
+      {/* ─── VLM Coach Feedback ───────────────────────────────────────── */}
+      <AnimatePresence>
+        {gamePhase === 'result' && (feedbackStatus === 'loading' || feedbackStatus === 'done') && (
+          <motion.div
+            key="coach-feedback"
+            initial={{ opacity: 0, y: 16 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: 8 }}
+            style={{ marginTop: 'var(--space-lg)' }}
+          >
+            {feedbackStatus === 'loading' && (
+              <div
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  gap: 'var(--space-sm)',
+                  padding: 'var(--space-lg)',
+                  color: 'var(--text-muted)',
+                  fontSize: '0.875rem',
+                }}
+              >
+                <Loader2 size={16} style={{ animation: 'spin 1s linear infinite', flexShrink: 0 }} />
+                Your Crafting Coach is reviewing your practice...
+              </div>
+            )}
+            {feedbackStatus === 'done' && feedbackText && (
+              <div
+                style={{
+                  background: 'var(--bg-secondary)',
+                  border: '1px solid var(--border-subtle)',
+                  borderRadius: 'var(--radius-lg)',
+                  padding: 'var(--space-xl)',
+                }}
+              >
+                <p
+                  style={{
+                    fontWeight: 700,
+                    fontSize: '1.05rem',
+                    color: 'var(--accent-primary)',
+                    margin: '0 0 var(--space-md) 0',
+                  }}
+                >
+                  🎓 Your Crafting Coach
+                </p>
+                <p
+                  style={{
+                    lineHeight: 1.75,
+                    margin: 0,
+                    whiteSpace: 'pre-wrap',
+                    color: 'var(--text-primary)',
+                    fontSize: '0.9375rem',
+                  }}
+                >
+                  {renderFeedback(feedbackText)}
+                </p>
+              </div>
+            )}
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       {/* ─── Guided Tour Overlay ───────────────────────────────────────── */}
       <AnimatePresence>

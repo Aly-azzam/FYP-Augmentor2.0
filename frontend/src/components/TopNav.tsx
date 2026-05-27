@@ -1,12 +1,11 @@
 import { useState } from 'react';
-import { Link, useLocation } from 'react-router-dom';
+import { Link, useLocation, useNavigate } from 'react-router-dom';
+import { useAuth } from '@/contexts/AuthContext';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
   BookOpen,
-  BarChart3,
   RefreshCw,
   Clock,
-  Trophy,
   Sun,
   Moon,
   Bot,
@@ -28,16 +27,16 @@ import { useThemeStore, useUIStore } from '../store';
 
 const navLinks = [
   { label: 'Courses', path: '/courses', icon: BookOpen },
-  { label: 'My Learning', path: '/progress', icon: BarChart3 },
   { label: 'Compare Studio', path: '/compare', icon: RefreshCw },
   { label: 'History', path: '/history', icon: Clock },
-  { label: 'Achievements', path: '/achievements', icon: Trophy },
 ] as const;
 
 export default function TopNav() {
   const location = useLocation();
+  const navigate = useNavigate();
   const { isDark, toggleTheme } = useThemeStore();
   const { showRobot, setShowRobot } = useUIStore();
+  const { user, logout } = useAuth();
   const [mobileOpen, setMobileOpen] = useState(false);
 
   const isActive = (path: string) => location.pathname === path;
@@ -97,7 +96,7 @@ export default function TopNav() {
             <DropdownMenuTrigger asChild>
               <button className="flex items-center gap-2 btn btn-ghost p-1.5 rounded-full">
                 <div className="w-8 h-8 rounded-full bg-gradient-to-br from-[var(--accent-primary)] to-[var(--blue-400)] flex items-center justify-center text-white text-sm font-semibold">
-                  AJ
+                  {user?.display_name?.split(' ').map((w) => w[0]).join('').slice(0, 2).toUpperCase() || '?'}
                 </div>
               </button>
             </DropdownMenuTrigger>
@@ -105,9 +104,9 @@ export default function TopNav() {
               <DropdownMenuLabel>
                 <div className="flex flex-col">
                   <span className="text-sm font-semibold text-[var(--text-primary)]">
-                    Alex Johnson
+                    {user?.display_name || 'Guest'}
                   </span>
-                  <span className="text-xs text-[var(--text-muted)]">alex@augmentor.dev</span>
+                  <span className="text-xs text-[var(--text-muted)]">{user?.email || ''}</span>
                 </div>
               </DropdownMenuLabel>
               <DropdownMenuSeparator />
@@ -128,7 +127,7 @@ export default function TopNav() {
                 {isDark ? 'Light mode' : 'Dark mode'}
               </DropdownMenuItem>
               <DropdownMenuSeparator />
-              <DropdownMenuItem className="text-[var(--error)]">
+              <DropdownMenuItem className="text-[var(--error)]" onClick={() => { logout(); navigate('/login'); }}>
                 <LogOut size={14} />
                 Log out
               </DropdownMenuItem>

@@ -5,7 +5,8 @@ from typing import List, Literal
 import cv2
 import numpy as np
 
-from .schemas import FrameFlowFeatures, VideoFlowSummary
+from .schemas import FrameFlowFeatures, VideoFlowSummary, VibrationAnalysis
+from .vibration_classifier import classify_vibration
 
 
 def compute_magnitude_and_angle(flow: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -122,6 +123,14 @@ def extract_frame_flow_features(
     mean_magnitude = float(np.mean(magnitude)) if magnitude.size > 0 else 0.0
     max_magnitude = float(np.max(magnitude)) if magnitude.size > 0 else 0.0
     mean_angle = compute_mean_angle_deg(angle_deg, magnitude=magnitude)
+    if magnitude.size > 0 and float(np.sum(magnitude)) > 1e-6:
+        angles_rad = np.radians(angle_deg)
+        sin_vals = np.sin(angles_rad) * magnitude
+        cos_vals = np.cos(angles_rad) * magnitude
+        direction_variance = float(np.std(sin_vals) + np.std(cos_vals))
+    else:
+        direction_variance = 0.0
+    magnitude_spatial_std = float(np.std(magnitude)) if magnitude.size > 0 else 0.0
     motion_area_ratio = compute_motion_area_ratio(
         magnitude,
         motion_threshold=motion_threshold,
@@ -168,6 +177,8 @@ def extract_frame_flow_features(
         fallback_used=fallback_used,
         fallback_reason=fallback_reason,
         roi_area_ratio=round(float(roi_area_ratio), 6),
+        direction_variance=round(direction_variance, 6),
+        magnitude_spatial_std=round(magnitude_spatial_std, 6),
     )
 
 
@@ -273,7 +284,7 @@ def _compute_vibration_score(vibration_high_freq_mean: float) -> float:
     """
     Normalize high-frequency motion instability into [0, 1].
     """
-    return min(1.0, vibration_high_freq_mean / 0.2)
+    return min(1.0, vibration_high_freq_mean / 1.0)
 
 
 def _compute_robust_peak_magnitude(max_magnitudes: List[float]) -> float:
@@ -286,6 +297,102 @@ def _compute_robust_peak_magnitude(max_magnitudes: List[float]) -> float:
 
     arr = np.asarray(max_magnitudes, dtype=np.float32)
     return float(np.percentile(arr, 95))
+
+
+def _compute_fft_vibration(
+    raw_magnitudes: List[float],
+    fps: float = 30.0,
+    window_sec: float = 1.0,
+) -> tuple[float, float, float, list]:
+    if len(raw_magnitudes) < 8:
+        return 0.0, 0.0, 0.0, []
+    window_size = max(8, int(window_sec * fps))
+    step = max(1, window_size // 2)
+    arr = np.asarray(raw_magnitudes, dtype=np.float32)
+    best_freq = 0.0
+    best_amp = 0.0
+    best_confidence = 0.0
+    window_results: list = []
+    for start in range(0, len(arr) - window_size + 1, step):
+        window = arr[start:start + window_size]
+        signal = np.diff(window)
+        if len(signal) < 4:
+            continue
+        fft_vals = np.abs(np.fft.rfft(signal))
+        freqs = np.fft.rfftfreq(len(signal), d=1.0 / fps)
+        vibration_mask = (freqs >= 2.0) & (freqs <= 20.0)
+        if not np.any(vibration_mask):
+            continue
+        vib_freqs = freqs[vibration_mask]
+        vib_amps = fft_vals[vibration_mask]
+        peak_idx = int(np.argmax(vib_amps))
+        dominant_freq = float(vib_freqs[peak_idx])
+        dominant_amp = float(vib_amps[peak_idx])
+        total_amp = float(np.sum(fft_vals)) + 1e-8
+        confidence = float(dominant_amp / total_amp)
+        if confidence > best_confidence:
+            best_freq = dominant_freq
+            best_amp = dominant_amp
+            best_confidence = confidence
+        window_results.append({
+            "start_frame": start,
+            "end_frame": start + window_size,
+            "timestamp_sec": round(start / fps, 2),
+            "dominant_freq_hz": round(dominant_freq, 4),
+            "confidence": round(confidence, 4),
+        })
+    return best_freq, best_amp, best_confidence, window_results
+
+
+def _compute_vibration_consistency(
+    vibration_windows: list[dict],
+    confidence_threshold: float = 0.15,
+    freq_tolerance_hz: float = 2.0,
+) -> tuple[float, float, int]:
+    if not vibration_windows:
+        return 0.0, 0.0, 0
+    best_streak = 0
+    best_streak_freq = 0.0
+    best_streak_peak_conf = 0.0
+    current_streak = 0
+    current_freq = 0.0
+    current_streak_peak_conf = 0.0
+    for w in vibration_windows:
+        if w["confidence"] >= confidence_threshold:
+            if current_streak == 0 or abs(w["dominant_freq_hz"] - current_freq) > freq_tolerance_hz:
+                # Start a new streak — first check if the old one beats the best
+                if current_streak > best_streak or (
+                    current_streak == best_streak and current_streak_peak_conf > best_streak_peak_conf
+                ):
+                    best_streak = current_streak
+                    best_streak_freq = current_freq
+                    best_streak_peak_conf = current_streak_peak_conf
+                current_streak = 1
+                current_freq = w["dominant_freq_hz"]
+                current_streak_peak_conf = w["confidence"]
+            else:
+                current_streak += 1
+                current_streak_peak_conf = max(current_streak_peak_conf, w["confidence"])
+        else:
+            # Fails threshold — end current streak
+            if current_streak > best_streak or (
+                current_streak == best_streak and current_streak_peak_conf > best_streak_peak_conf
+            ):
+                best_streak = current_streak
+                best_streak_freq = current_freq
+                best_streak_peak_conf = current_streak_peak_conf
+            current_streak = 0
+            current_freq = 0.0
+            current_streak_peak_conf = 0.0
+    # Final check after loop ends
+    if current_streak > best_streak or (
+        current_streak == best_streak and current_streak_peak_conf > best_streak_peak_conf
+    ):
+        best_streak = current_streak
+        best_streak_freq = current_freq
+    total_windows = len(vibration_windows)
+    consistency_score = float(best_streak / total_windows) if total_windows > 0 else 0.0
+    return consistency_score, best_streak_freq, best_streak
 
 
 def build_video_flow_summary(
@@ -303,6 +410,7 @@ def build_video_flow_summary(
     ] = "none",
     roi_smoothing_enabled: bool = False,
     roi_smoothing_alpha: float | None = None,
+    fps: float = 30.0,
 ) -> VideoFlowSummary:
     """
     Aggregate per-frame flow features into a video-level summary.
@@ -330,6 +438,14 @@ def build_video_flow_summary(
             peak_flow_magnitude=0.0,
             roi_smoothing_enabled=roi_smoothing_enabled,
             roi_smoothing_alpha=roi_smoothing_alpha,
+            dominant_vibration_freq_hz=0.0,
+            vibration_freq_amplitude=0.0,
+            vibration_freq_confidence=0.0,
+            vibration_windows=[],
+            vibration_consistency_score=0.0,
+            consistent_freq_hz=0.0,
+            max_consecutive_windows=0,
+            vibration_analysis=VibrationAnalysis(),
         )
 
     raw_mean_magnitudes = [f.mean_magnitude for f in frame_features]
@@ -363,6 +479,11 @@ def build_video_flow_summary(
         smoothed_signal=mean_magnitudes,
     )
     vibration_score = _compute_vibration_score(vibration_high_freq_mean)
+    dominant_vibration_freq_hz, vibration_freq_amplitude, vibration_freq_confidence, vibration_windows = _compute_fft_vibration(
+        raw_magnitudes=raw_mean_magnitudes,
+        fps=fps,
+    )
+    vibration_consistency_score, consistent_freq_hz, max_consecutive_windows = _compute_vibration_consistency(vibration_windows)
     roi_frames_used = sum(1 for f in frame_features if f.roi_used)
     roi_enabled = roi_enabled or roi_frames_used > 0
     roi_fallback_frames = len(frame_features) - roi_frames_used if roi_enabled else 0
@@ -404,7 +525,7 @@ def build_video_flow_summary(
     roi_area_ratios = [f.roi_area_ratio for f in frame_features if f.roi_used]
     average_roi_area_ratio = _safe_mean(roi_area_ratios)
 
-    return VideoFlowSummary(
+    summary = VideoFlowSummary(
         avg_magnitude=round(avg_magnitude, 6),
         peak_magnitude=round(peak_magnitude, 6),
         avg_motion_area_ratio=round(avg_motion_area_ratio, 6),
@@ -433,4 +554,13 @@ def build_video_flow_summary(
         average_roi_area_ratio=round(average_roi_area_ratio, 6),
         roi_smoothing_enabled=roi_smoothing_enabled,
         roi_smoothing_alpha=roi_smoothing_alpha,
+        dominant_vibration_freq_hz=round(dominant_vibration_freq_hz, 4),
+        vibration_freq_amplitude=round(vibration_freq_amplitude, 4),
+        vibration_freq_confidence=round(vibration_freq_confidence, 4),
+        vibration_windows=vibration_windows,
+        vibration_consistency_score=round(vibration_consistency_score, 6),
+        consistent_freq_hz=round(consistent_freq_hz, 4),
+        max_consecutive_windows=max_consecutive_windows,
     )
+    summary.vibration_analysis = classify_vibration(summary)
+    return summary

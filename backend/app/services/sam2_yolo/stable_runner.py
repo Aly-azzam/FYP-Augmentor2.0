@@ -1080,3 +1080,257 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+# ── New entry point — accepts a pre-built InitialPrompt, skips YOLO ──────────
+# The original run_stable_yolo_sam2_tracking() is untouched above.
+
+def run_stable_yolo_sam2_tracking_with_prompt(
+    *,
+    video_path: str | Path,
+    output_dir: str | Path,
+    initial_prompt: InitialPrompt,
+    stride: int = DEFAULT_FRAME_STRIDE,
+    max_processed_frames: int | None = None,
+    use_gpu: bool = True,
+    trajectory_point_mode: str = DEFAULT_TRAJECTORY_POINT_MODE,
+    save_debug: bool = False,
+    debug_gpu: bool = False,
+    sam2_checkpoint: str | None = None,
+    sam2_config: str | None = None,
+    sam2_model_id: str | None = None,
+) -> dict[str, Any]:
+    """Identical to run_stable_yolo_sam2_tracking but skips the YOLO step.
+
+    Uses the provided *initial_prompt* directly instead of running YOLO detection.
+    Called by the evaluation orchestrator which runs YOLO once via run_shared_yolo
+    and feeds the result to both SAM2 and the angle pipeline.
+    """
+    if trajectory_point_mode not in TRAJECTORY_POINT_MODES:
+        raise ValueError(f"trajectory_point_mode must be one of {TRAJECTORY_POINT_MODES}")
+
+    run_dir = Path(output_dir).expanduser().resolve()
+    run_dir.mkdir(parents=True, exist_ok=True)
+    run_id = run_dir.name
+    video = Path(video_path).expanduser().resolve()
+    if not video.is_file():
+        raise FileNotFoundError(f"video_path does not exist: {video}")
+
+    raw_path = run_dir / RAW_FILENAME
+    metrics_path = run_dir / METRICS_FILENAME
+    summary_path = run_dir / SUMMARY_FILENAME
+    overlay_path = run_dir / OVERLAY_FILENAME
+    cleaned_trajectory_path = run_dir / CLEANED_TRAJECTORY_FILENAME
+    trajectory_smoothed_path = run_dir / TRAJECTORY_SMOOTHED_FILENAME
+    smooth_polyline_overlay_path = run_dir / SMOOTH_POLYLINE_OVERLAY_FILENAME
+    smoothed_cutting_path_overlay_path = run_dir / SMOOTHED_CUTTING_PATH_OVERLAY_FILENAME
+    frame_cap = _resolved_frame_cap(max_processed_frames)
+
+    device_choice = choose_stable_device(use_gpu=use_gpu)
+
+    # YOLO step is skipped — prompt provided by caller.
+    yolo_payload: dict[str, Any] = {
+        "yolo_backend": "shared_yolo_runner",
+        "yolo_weights_path": str(BACKEND_ROOT / "models" / "yolo" / "best.pt"),
+    }
+
+    try:
+        tracking_result = _run_stable_sam2_tracking(
+            video_path=video,
+            initial_prompt=initial_prompt,
+            frame_stride=stride,
+            run_dir=run_dir,
+            device_choice=device_choice,
+            max_processed_frames=frame_cap,
+            sam2_checkpoint=sam2_checkpoint,
+            sam2_config=sam2_config,
+            sam2_model_id=sam2_model_id,
+            debug_gpu=debug_gpu,
+        )
+    except RuntimeError as exc:
+        if device_choice.device.type == "cuda" and _is_cuda_oom(exc):
+            torch.cuda.empty_cache()
+            cpu_choice = StableDeviceChoice(
+                device=torch.device("cpu"),
+                warning="CUDA out of memory during SAM2, retried on CPU for SAM2",
+            )
+            try:
+                tracking_result = _run_stable_sam2_tracking(
+                    video_path=video,
+                    initial_prompt=initial_prompt,
+                    frame_stride=stride,
+                    run_dir=run_dir,
+                    device_choice=cpu_choice,
+                    max_processed_frames=frame_cap,
+                    sam2_checkpoint=sam2_checkpoint,
+                    sam2_config=sam2_config,
+                    sam2_model_id=sam2_model_id,
+                    debug_gpu=debug_gpu,
+                )
+            except Exception as fallback_exc:  # noqa: BLE001
+                summary = _sam2_failed_summary(
+                    exc=fallback_exc,
+                    run_id=run_id,
+                    video_path=video,
+                    run_dir=run_dir,
+                    raw_path=raw_path,
+                    metrics_path=metrics_path,
+                    summary_path=summary_path,
+                    overlay_path=overlay_path,
+                    frame_stride=stride,
+                    max_processed_frames=frame_cap,
+                    stage="sam2_propagation",
+                    device_attempted="cuda",
+                    fallback_attempted=True,
+                    device_warning=cpu_choice.warning,
+                )
+                _write_json(summary_path, summary)
+                return summary
+        else:
+            summary = _sam2_failed_summary(
+                exc=exc,
+                run_id=run_id,
+                video_path=video,
+                run_dir=run_dir,
+                raw_path=raw_path,
+                metrics_path=metrics_path,
+                summary_path=summary_path,
+                overlay_path=overlay_path,
+                frame_stride=stride,
+                max_processed_frames=frame_cap,
+                stage="sam2_propagation",
+                device_attempted=device_choice.device.type,
+                fallback_attempted=False,
+                device_warning=device_choice.warning,
+            )
+            _write_json(summary_path, summary)
+            return summary
+    except Exception as exc:  # noqa: BLE001
+        summary = _sam2_failed_summary(
+            exc=exc,
+            run_id=run_id,
+            video_path=video,
+            run_dir=run_dir,
+            raw_path=raw_path,
+            metrics_path=metrics_path,
+            summary_path=summary_path,
+            overlay_path=overlay_path,
+            frame_stride=stride,
+            max_processed_frames=frame_cap,
+            stage="sam2_initialization",
+            device_attempted=device_choice.device.type,
+            fallback_attempted=False,
+            device_warning=device_choice.warning,
+        )
+        _write_json(summary_path, summary)
+        return summary
+
+    raw_payload = _build_raw_payload(
+        run_id=run_id,
+        video_path=video,
+        device=tracking_result.device,
+        frame_stride=stride,
+        max_processed_frames=frame_cap,
+        original_frame_count=tracking_result.extracted_video.source_frame_count,
+        initial_prompt=initial_prompt,
+        frames=tracking_result.frames,
+    )
+    if yolo_payload.get("yolo_backend"):
+        raw_payload["yolo_backend"] = yolo_payload["yolo_backend"]
+    if yolo_payload.get("yolo_weights_path"):
+        raw_payload["yolo_weights_path"] = yolo_payload["yolo_weights_path"]
+
+    metrics_payload = _build_metrics_payload(raw_payload)
+    summary_payload = _build_success_summary(
+        raw_payload=raw_payload,
+        metrics_payload=metrics_payload,
+        run_dir=run_dir,
+        raw_path=raw_path,
+        metrics_path=metrics_path,
+        summary_path=summary_path,
+        overlay_path=overlay_path,
+        device_warning=tracking_result.device_warning,
+    )
+
+    _write_json(raw_path, raw_payload)
+    _write_json(metrics_path, metrics_payload)
+
+    try:
+        write_sam2_yolo_overlay_video(
+            frame_dir=tracking_result.extracted_video.frame_dir,
+            frames=tracking_result.frames,
+            masks_by_processed_frame=tracking_result.masks_by_processed_frame,
+            output_path=overlay_path,
+            fps=tracking_result.extracted_video.output_fps,
+            trajectory_metrics=metrics_payload["trajectory_metrics"],
+            trajectory_point_mode=trajectory_point_mode,
+        )
+    except Exception as exc:  # noqa: BLE001
+        summary = _build_failed_summary(
+            run_id=run_id,
+            video_path=video,
+            run_dir=run_dir,
+            raw_path=raw_path,
+            metrics_path=metrics_path,
+            summary_path=summary_path,
+            overlay_path=overlay_path,
+            frame_stride=stride,
+            max_processed_frames=frame_cap,
+            stage="visualization",
+            failure_reason=str(exc),
+            device_attempted=raw_payload["device"],
+            fallback_attempted=False,
+            device_warning=tracking_result.device_warning,
+        )
+        _write_json(summary_path, summary)
+        return summary
+
+    try:
+        cleaned_trajectory_payload = build_cleaned_trajectory_artifact(
+            raw_json_path=raw_path,
+            metrics_json_path=metrics_path,
+            output_path=cleaned_trajectory_path,
+            trajectory_point_mode=trajectory_point_mode,
+        )
+        write_trajectory_line_overlay_video(
+            frame_dir=tracking_result.extracted_video.frame_dir,
+            raw_frames=tracking_result.frames,
+            cleaned_trajectory=cleaned_trajectory_payload,
+            output_path=smooth_polyline_overlay_path,
+            fps=tracking_result.extracted_video.output_fps,
+        )
+        smoothed_trajectory_payload = smooth_trajectory(
+            cleaned_json_path=str(cleaned_trajectory_path),
+            output_path=str(trajectory_smoothed_path),
+        )
+        write_smoothed_cutting_path_overlay_video(
+            frame_dir=tracking_result.extracted_video.frame_dir,
+            raw_frames=tracking_result.frames,
+            smoothed_trajectory=smoothed_trajectory_payload,
+            output_path=smoothed_cutting_path_overlay_path,
+            fps=tracking_result.extracted_video.output_fps,
+        )
+        summary_payload.update(
+            {
+                "cleaned_trajectory_json_path": str(cleaned_trajectory_path),
+                "smooth_polyline_overlay_video_path": str(smooth_polyline_overlay_path),
+                "smooth_polyline_overlay_video_url": _storage_url_for(smooth_polyline_overlay_path),
+                "cleaned_trajectory_usable_for_corridor": bool(
+                    cleaned_trajectory_payload.get("usable_for_corridor", False)
+                ),
+                "trajectory_smoothed_json_path": str(trajectory_smoothed_path),
+                "smoothed_cutting_path_overlay_video_path": str(smoothed_cutting_path_overlay_path),
+                "smoothed_cutting_path_overlay_video_url": _storage_url_for(
+                    smoothed_cutting_path_overlay_path
+                ),
+                "smoothed_trajectory_usable_for_corridor": bool(
+                    smoothed_trajectory_payload.get("usable_for_corridor", False)
+                ),
+            }
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("[SAM2] cleaned trajectory post-processing failed")
+        summary_payload["cleaned_trajectory_error"] = str(exc)
+
+    _write_json(summary_path, summary_payload)
+    return summary_payload

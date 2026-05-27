@@ -1,310 +1,185 @@
-import { useState } from 'react';
-import { motion } from 'framer-motion';
-import {
-  Mail,
-  CalendarDays,
-  TrendingUp,
-  Target,
-  Flame,
-  Trophy,
-  Star,
-  Edit3,
-  Check,
-  Github,
-  Twitter,
-  Linkedin,
-} from 'lucide-react';
-import { Button } from '@/components/ui/button';
-import { userProfile } from '@/services/mock/user';
-import { achievements } from '@/services/mock/achievements';
+import { useState, useEffect } from 'react';
+import { useAuth } from '@/contexts/AuthContext';
+import { Edit2, Mail, Calendar, Github, Twitter, Linkedin, Save, X } from 'lucide-react';
 
-const recentAchievements = achievements
-  .filter((a) => a.unlockedAt)
-  .sort((a, b) => new Date(b.unlockedAt!).getTime() - new Date(a.unlockedAt!).getTime())
-  .slice(0, 4);
+const API = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
-function getInitials(name: string) {
-  return name
-    .split(' ')
-    .map((w) => w[0])
-    .join('')
-    .toUpperCase();
+interface EvalStats {
+  count: number;
+  avgScore: number | null;
 }
 
 export default function ProfilePage() {
-  const [bio, setBio] = useState(
-    'Passionate learner exploring ceramics and woodcraft. Always looking to improve my technique through practice and AI-powered feedback.',
-  );
-  const [isEditingBio, setIsEditingBio] = useState(false);
+  const { user, token } = useAuth();
+  const [stats, setStats] = useState<EvalStats>({ count: 0, avgScore: null });
+  const [editingBio, setEditingBio] = useState(false);
+  const [editingLinks, setEditingLinks] = useState(false);
+  const [bio, setBio] = useState(user?.bio || '');
+  const [github, setGithub] = useState(user?.github_url || '');
+  const [twitter, setTwitter] = useState(user?.twitter_url || '');
+  const [linkedin, setLinkedin] = useState(user?.linkedin_url || '');
+  const [saving, setSaving] = useState(false);
 
-  const xpPercent = Math.round((userProfile.xp / userProfile.nextLevelXp) * 100);
-  const initials = getInitials(userProfile.name);
+  useEffect(() => {
+    if (!user || !token) return;
+    setBio(user.bio || '');
+    setGithub(user.github_url || '');
+    setTwitter(user.twitter_url || '');
+    setLinkedin(user.linkedin_url || '');
+  }, [user]);
+
+  useEffect(() => {
+    if (!user || !token) return;
+    fetch(`${API}/api/history?user_id=${user.id}&limit=200`, {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+      .then(r => r.ok ? r.json() : [])
+      .then((entries: { score: number | null }[]) => {
+        const scored = entries.filter(e => e.score !== null);
+        const avg = scored.length > 0
+          ? Math.round(scored.reduce((sum, e) => sum + (e.score ?? 0), 0) / scored.length)
+          : null;
+        setStats({ count: entries.length, avgScore: avg });
+      })
+      .catch(() => {});
+  }, [user, token]);
+
+  const saveProfile = async (fields: object) => {
+    if (!token) return;
+    setSaving(true);
+    try {
+      await fetch(`${API}/api/auth/profile`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify(fields),
+      });
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (!user) return null;
+
+  const initials = user.display_name?.split(' ').map((w: string) => w[0]).join('').slice(0, 2).toUpperCase() || '?';
+  const joinedDate = user.created_at
+    ? new Date(user.created_at).toLocaleDateString('en-US', { month: 'long', year: 'numeric' })
+    : null;
 
   return (
-    <div className="container section">
-      {/* ── Cover + Avatar ────────────────────────────────────────────── */}
-      <motion.div
-        style={{ position: 'relative', marginBottom: 'var(--space-3xl)' }}
-        initial={{ opacity: 0 }}
-        animate={{ opacity: 1 }}
-      >
-        {/* Cover gradient */}
-        <div
-          style={{
-            height: 200,
-            borderRadius: 'var(--radius-xl)',
-            background:
-              'linear-gradient(135deg, #1E3A8A 0%, #2563EB 50%, #3B82F6 100%)',
-            position: 'relative',
-            overflow: 'hidden',
-          }}
-        >
-          <div
-            style={{
-              position: 'absolute',
-              inset: 0,
-              background:
-                'radial-gradient(ellipse at 30% 50%, rgba(59,130,246,0.3), transparent 70%)',
-            }}
-          />
-        </div>
+    <div className="container section" style={{ maxWidth: 800 }}>
+      {/* Header banner */}
+      <div style={{ background: 'linear-gradient(135deg, #1e3a5f 0%, #3b6fd4 100%)', borderRadius: 'var(--radius-lg)', height: 140, marginBottom: 0 }} />
 
-        {/* Avatar */}
-        <div
-          style={{
-            position: 'absolute',
-            bottom: -48,
-            left: 'var(--space-xl)',
-            display: 'flex',
-            alignItems: 'flex-end',
-            gap: 'var(--space-lg)',
-          }}
-        >
-          <div
-            style={{
-              width: 96,
-              height: 96,
-              borderRadius: '50%',
-              background: 'var(--accent-primary)',
-              border: '4px solid var(--bg-primary)',
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              fontSize: '1.75rem',
-              fontWeight: 700,
-              color: '#fff',
-              boxShadow: 'var(--shadow-glow)',
-            }}
-          >
-            {initials}
-          </div>
+      {/* Avatar + name */}
+      <div style={{ padding: '0 var(--space-xl)', marginTop: -40, marginBottom: 'var(--space-xl)' }}>
+        <div style={{ width: 80, height: 80, borderRadius: '50%', background: 'var(--accent-primary)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '1.75rem', fontWeight: 700, color: '#fff', border: '4px solid var(--bg-primary)', marginBottom: 'var(--space-md)' }}>
+          {initials}
         </div>
-      </motion.div>
-
-      {/* ── User Info ─────────────────────────────────────────────────── */}
-      <motion.div
-        style={{ paddingLeft: 'var(--space-xl)' }}
-        initial={{ opacity: 0, y: 10 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={{ delay: 0.1 }}
-      >
-        <h2 className="heading-2">{userProfile.name}</h2>
-        <div
-          style={{
-            display: 'flex',
-            alignItems: 'center',
-            gap: 'var(--space-lg)',
-            marginTop: 'var(--space-sm)',
-            flexWrap: 'wrap',
-          }}
-        >
-          <span
-            className="text-small"
-            style={{ color: 'var(--text-secondary)', display: 'flex', alignItems: 'center', gap: 4 }}
-          >
-            <Mail size={14} />
-            {userProfile.email}
+        <h1 className="heading-2" style={{ marginBottom: 4 }}>{user.display_name}</h1>
+        <div style={{ display: 'flex', gap: 'var(--space-lg)', flexWrap: 'wrap' }}>
+          <span className="text-small" style={{ color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 4 }}>
+            <Mail size={13} /> {user.email}
           </span>
-          <span
-            className="text-small"
-            style={{ color: 'var(--text-secondary)', display: 'flex', alignItems: 'center', gap: 4 }}
-          >
-            <CalendarDays size={14} />
-            Joined {new Date(userProfile.joinedAt).toLocaleDateString('en-US', { month: 'long', year: 'numeric' })}
-          </span>
+          {joinedDate && (
+            <span className="text-small" style={{ color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 4 }}>
+              <Calendar size={13} /> Joined {joinedDate}
+            </span>
+          )}
         </div>
-      </motion.div>
-
-      {/* ── XP Bar ────────────────────────────────────────────────────── */}
-      <motion.div
-        className="card"
-        style={{ padding: 'var(--space-lg)', marginTop: 'var(--space-xl)' }}
-        initial={{ opacity: 0, y: 10 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={{ delay: 0.15 }}
-      >
-        <div className="flex-between" style={{ marginBottom: 'var(--space-sm)' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)' }}>
-            <Trophy size={18} style={{ color: 'var(--accent-primary)' }} />
-            <span style={{ fontWeight: 600 }}>Experience Points</span>
-          </div>
-          <span className="badge badge-blue">Level {userProfile.level}</span>
-        </div>
-        <div className="progress-bar" style={{ height: 12 }}>
-          <div
-            className="progress-bar-fill"
-            style={{ width: `${xpPercent}%` }}
-          />
-        </div>
-        <div
-          className="flex-between"
-          style={{ marginTop: 'var(--space-xs)' }}
-        >
-          <span className="text-small" style={{ color: 'var(--text-muted)' }}>
-            {userProfile.xp} XP
-          </span>
-          <span className="text-small" style={{ color: 'var(--text-muted)' }}>
-            {userProfile.nextLevelXp} XP
-          </span>
-        </div>
-      </motion.div>
-
-      {/* ── Stats Row ─────────────────────────────────────────────────── */}
-      <div className="stats-grid" style={{ marginTop: 'var(--space-xl)' }}>
-        {[
-          { icon: TrendingUp, label: 'Evaluations', value: userProfile.totalEvaluations },
-          { icon: Target, label: 'Avg. Score', value: userProfile.averageScore },
-          { icon: Flame, label: 'Streak', value: `${userProfile.streakDays} days` },
-        ].map((stat, i) => {
-          const Icon = stat.icon;
-          return (
-            <motion.div
-              key={stat.label}
-              className="card stat-card"
-              style={{ textAlign: 'center' }}
-              initial={{ opacity: 0, y: 10 }}
-              animate={{ opacity: 1, y: 0 }}
-              transition={{ delay: 0.2 + i * 0.05 }}
-            >
-              <Icon size={24} style={{ color: 'var(--accent-primary)', marginBottom: 'var(--space-sm)' }} />
-              <div className="stat-value">{stat.value}</div>
-              <div className="stat-label">{stat.label}</div>
-            </motion.div>
-          );
-        })}
       </div>
 
-      {/* ── Recent Achievements ───────────────────────────────────────── */}
-      <motion.div
-        style={{ marginTop: 'var(--space-xl)' }}
-        initial={{ opacity: 0, y: 10 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={{ delay: 0.3 }}
-      >
-        <h3 className="heading-4" style={{ marginBottom: 'var(--space-lg)' }}>
-          Recent Achievements
-        </h3>
-        <div className="stats-grid">
-          {recentAchievements.map((a) => (
-            <div
-              key={a.id}
-              className="card"
-              style={{
-                padding: 'var(--space-md)',
-                display: 'flex',
-                alignItems: 'center',
-                gap: 'var(--space-md)',
-              }}
-            >
-              <div
-                style={{
-                  width: 40,
-                  height: 40,
-                  borderRadius: 'var(--radius-md)',
-                  background: 'var(--accent-soft)',
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                  flexShrink: 0,
-                }}
-              >
-                <Star size={18} style={{ color: 'var(--accent-primary)' }} />
-              </div>
-              <div style={{ minWidth: 0 }}>
-                <div style={{ fontWeight: 600, fontSize: '0.875rem' }}>{a.title}</div>
-                <div className="text-small" style={{ color: 'var(--text-muted)' }}>
-                  {new Date(a.unlockedAt!).toLocaleDateString('en-US', {
-                    month: 'short',
-                    day: 'numeric',
-                  })}
-                </div>
-              </div>
-            </div>
-          ))}
+      {/* Stats */}
+      <div className="stats-grid" style={{ marginBottom: 'var(--space-xl)' }}>
+        <div className="stat-card">
+          <div className="stat-label">Evaluations</div>
+          <div className="stat-value">{stats.count}</div>
         </div>
-      </motion.div>
+        <div className="stat-card">
+          <div className="stat-label">Avg. Score</div>
+          <div className="stat-value">{stats.avgScore !== null ? `${stats.avgScore}%` : '—'}</div>
+        </div>
+      </div>
 
-      {/* ── Bio ───────────────────────────────────────────────────────── */}
-      <motion.div
-        className="card"
-        style={{ padding: 'var(--space-lg)', marginTop: 'var(--space-xl)' }}
-        initial={{ opacity: 0, y: 10 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={{ delay: 0.35 }}
-      >
-        <div className="flex-between" style={{ marginBottom: 'var(--space-md)' }}>
-          <h3 className="heading-4">Bio</h3>
-          <button
-            className="btn btn-ghost"
-            style={{ padding: '0.375rem' }}
-            onClick={() => {
-              if (isEditingBio) setIsEditingBio(false);
-              else setIsEditingBio(true);
-            }}
-          >
-            {isEditingBio ? <Check size={16} /> : <Edit3 size={16} />}
-          </button>
+      {/* Bio */}
+      <div className="card" style={{ padding: 'var(--space-lg)', marginBottom: 'var(--space-lg)' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 'var(--space-md)' }}>
+          <span className="heading-4">Bio</span>
+          {!editingBio ? (
+            <button className="btn btn-ghost" style={{ padding: '4px 8px' }} onClick={() => setEditingBio(true)}>
+              <Edit2 size={14} />
+            </button>
+          ) : (
+            <div style={{ display: 'flex', gap: 8 }}>
+              <button className="btn btn-ghost" style={{ padding: '4px 8px' }} onClick={() => { setEditingBio(false); setBio(user.bio || ''); }}>
+                <X size={14} />
+              </button>
+              <button className="btn btn-primary" style={{ padding: '4px 12px', fontSize: '0.8rem' }} disabled={saving}
+                onClick={async () => { await saveProfile({ bio }); setEditingBio(false); }}>
+                <Save size={14} /> {saving ? 'Saving…' : 'Save'}
+              </button>
+            </div>
+          )}
         </div>
-        {isEditingBio ? (
+        {!editingBio ? (
+          <p className="text-body" style={{ color: bio ? 'var(--text-secondary)' : 'var(--text-muted)', fontStyle: bio ? 'normal' : 'italic' }}>
+            {bio || 'No bio yet. Click the edit button to add one.'}
+          </p>
+        ) : (
           <textarea
             className="input"
             value={bio}
-            onChange={(e) => setBio(e.target.value)}
+            onChange={e => setBio(e.target.value)}
             rows={4}
-            style={{ resize: 'vertical', fontFamily: 'inherit' }}
+            placeholder="Write something about yourself…"
+            style={{ width: '100%', resize: 'vertical' }}
           />
-        ) : (
-          <p className="text-body">{bio}</p>
         )}
-      </motion.div>
+      </div>
 
-      {/* ── Social Links ──────────────────────────────────────────────── */}
-      <motion.div
-        className="card"
-        style={{ padding: 'var(--space-lg)', marginTop: 'var(--space-xl)' }}
-        initial={{ opacity: 0, y: 10 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={{ delay: 0.4 }}
-      >
-        <h3 className="heading-4" style={{ marginBottom: 'var(--space-md)' }}>
-          Social Links
-        </h3>
-        <div style={{ display: 'flex', gap: 'var(--space-md)' }}>
-          {[
-            { icon: Github, label: 'GitHub' },
-            { icon: Twitter, label: 'Twitter' },
-            { icon: Linkedin, label: 'LinkedIn' },
-          ].map(({ icon: Icon, label }) => (
-            <Button key={label} variant="secondary" size="sm">
-              <Icon size={14} />
-              {label}
-            </Button>
-          ))}
+      {/* Social Links */}
+      <div className="card" style={{ padding: 'var(--space-lg)' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 'var(--space-md)' }}>
+          <span className="heading-4">Social Links</span>
+          {!editingLinks ? (
+            <button className="btn btn-ghost" style={{ padding: '4px 8px' }} onClick={() => setEditingLinks(true)}>
+              <Edit2 size={14} />
+            </button>
+          ) : (
+            <div style={{ display: 'flex', gap: 8 }}>
+              <button className="btn btn-ghost" style={{ padding: '4px 8px' }} onClick={() => { setEditingLinks(false); }}>
+                <X size={14} />
+              </button>
+              <button className="btn btn-primary" style={{ padding: '4px 12px', fontSize: '0.8rem' }} disabled={saving}
+                onClick={async () => { await saveProfile({ github_url: github, twitter_url: twitter, linkedin_url: linkedin }); setEditingLinks(false); }}>
+                <Save size={14} /> {saving ? 'Saving…' : 'Save'}
+              </button>
+            </div>
+          )}
         </div>
-        <p className="text-small" style={{ color: 'var(--text-muted)', marginTop: 'var(--space-md)' }}>
-          Connect your social accounts to share your progress
-        </p>
-      </motion.div>
+        {!editingLinks ? (
+          <div style={{ display: 'flex', gap: 'var(--space-md)', flexWrap: 'wrap' }}>
+            {github && <a href={github} target="_blank" rel="noreferrer" className="btn btn-ghost" style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: '0.875rem' }}><Github size={15} /> GitHub</a>}
+            {twitter && <a href={twitter} target="_blank" rel="noreferrer" className="btn btn-ghost" style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: '0.875rem' }}><Twitter size={15} /> Twitter</a>}
+            {linkedin && <a href={linkedin} target="_blank" rel="noreferrer" className="btn btn-ghost" style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: '0.875rem' }}><Linkedin size={15} /> LinkedIn</a>}
+            {!github && !twitter && !linkedin && <p className="text-small" style={{ color: 'var(--text-muted)', fontStyle: 'italic' }}>No social links yet. Click edit to add some.</p>}
+          </div>
+        ) : (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-md)' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-md)' }}>
+              <Github size={16} style={{ color: 'var(--text-muted)', flexShrink: 0 }} />
+              <input className="input" value={github} onChange={e => setGithub(e.target.value)} placeholder="https://github.com/username" style={{ flex: 1 }} />
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-md)' }}>
+              <Twitter size={16} style={{ color: 'var(--text-muted)', flexShrink: 0 }} />
+              <input className="input" value={twitter} onChange={e => setTwitter(e.target.value)} placeholder="https://twitter.com/username" style={{ flex: 1 }} />
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-md)' }}>
+              <Linkedin size={16} style={{ color: 'var(--text-muted)', flexShrink: 0 }} />
+              <input className="input" value={linkedin} onChange={e => setLinkedin(e.target.value)} placeholder="https://linkedin.com/in/username" style={{ flex: 1 }} />
+            </div>
+          </div>
+        )}
+      </div>
     </div>
   );
 }

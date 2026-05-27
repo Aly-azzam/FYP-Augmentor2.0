@@ -357,3 +357,9 @@ body {
   .heading-3 { font-size: 1.25rem; }
   .page-title { font-size: 1.75rem; }
 }
+
+/* Hide browser-native video control overlays */
+video::-webkit-media-controls-overlay-play-button { display: none !important; }
+video::-webkit-media-controls-picture-in-picture-button { display: none !important; }
+video::-webkit-media-controls-wireless-playback-button { display: none !important; }
+video::-webkit-media-controls { display: none !important; }

@@ -19,6 +19,8 @@ from urllib.parse import quote
 import cv2
 import numpy as np
 
+from app.services.sam2_yolo.visualization import _convert_to_web_mp4
+
 logger = logging.getLogger(__name__)
 
 BACKEND_ROOT = Path(__file__).resolve().parents[3]
@@ -64,6 +66,8 @@ def align_corridor_blade_tip_with_extension(
     output_dir: str,
     expert_code: str,
     learner_video_path: str | None = None,
+    generate_overlay_video: bool = True,
+    fps: float | None = None,
 ) -> dict[str, Any]:
     """Align pre-built expert corridor via blade-tip translation + safe axis extension.
 
@@ -93,17 +97,46 @@ def align_corridor_blade_tip_with_extension(
     smoothed = json.loads(Path(learner_smoothed_path).read_text(encoding="utf-8"))
 
     # ── Step 1: anchors & translation ─────────────────────────────────────
-    expert_anchor = (
-        float(corridor["centerline"][0]["x"]),
-        float(corridor["centerline"][0]["y"]),
-    )
+
+    # Resolve fps: use caller-supplied value, else read from video, else 30.0
+    _fps = fps
+    if _fps is None or _fps <= 0:
+        _fps = 30.0
+        if learner_video_path:
+            try:
+                _cap_fps = cv2.VideoCapture(learner_video_path)
+                if _cap_fps.isOpened():
+                    _v = _cap_fps.get(cv2.CAP_PROP_FPS)
+                    if _v and _v > 0:
+                        _fps = float(_v)
+                _cap_fps.release()
+            except Exception:  # noqa: BLE001
+                pass
+    print(f"[corridor_alignment] fps for anchor: {_fps:.2f}", flush=True)
+
+    frames_2s = max(1, round(_fps * 2.0))
+
+    expert_pts_2s = corridor["centerline"][:frames_2s]
+
     smoothed_pts = smoothed.get("points", [])
     if not smoothed_pts:
         raise ValueError("trajectory_smoothed.json has no points")
-    first_pt = smoothed_pts[0]
-    learner_anchor = (float(first_pt["smoothed_x"]), float(first_pt["smoothed_y"]))
-    t_dx = learner_anchor[0] - expert_anchor[0]
-    t_dy = learner_anchor[1] - expert_anchor[1]
+
+    learner_pts_2s = smoothed_pts[:frames_2s]
+
+    # X: use 2-second average (reduces horizontal jitter)
+    expert_anchor_x = float(np.mean([p["x"] for p in expert_pts_2s]))
+    learner_anchor_x = float(np.mean([p["smoothed_x"] for p in learner_pts_2s]))
+
+    # Y: use first point only (corridor must start exactly at learner's first point)
+    expert_anchor_y = float(corridor["centerline"][0]["y"])
+    learner_anchor_y = float(smoothed_pts[0]["smoothed_y"])
+
+    expert_anchor = (expert_anchor_x, expert_anchor_y)
+    learner_anchor = (learner_anchor_x, learner_anchor_y)
+
+    t_dx = learner_anchor_x - expert_anchor_x
+    t_dy = learner_anchor_y - expert_anchor_y
 
     print(f"[corridor_alignment] Expert anchor: ({expert_anchor[0]:.2f}, {expert_anchor[1]:.2f})", flush=True)
     print(f"[corridor_alignment] Learner anchor: ({learner_anchor[0]:.2f}, {learner_anchor[1]:.2f})", flush=True)
@@ -168,6 +201,41 @@ def align_corridor_blade_tip_with_extension(
                 f"BUG: rejected segment {rs['segment_index']} was extended. "
                 "This should never happen."
             )
+
+    # ── Y-axis rescaling ──────────────────────────────────────────────────────
+    # Stretch/compress the corridor on the Y axis only so its Y range matches
+    # the learner's Y range.  X coordinates and corridor width are untouched.
+    learner_ys = [py for _, py in learner_points]
+    if learner_ys:
+        learner_y_min = min(learner_ys)
+        learner_y_max = max(learner_ys)
+        learner_y_range = learner_y_max - learner_y_min
+
+        corridor_ys = [py for _, py in adapted_cl]
+        corridor_y_min = min(corridor_ys)
+        corridor_y_max = max(corridor_ys)
+        corridor_y_range = corridor_y_max - corridor_y_min
+
+        y_scale = learner_y_range / corridor_y_range if corridor_y_range > 1e-6 else 1.0
+        print(
+            f"[corridor_alignment] Y-rescale: corridor_y_range={corridor_y_range:.1f}px  "
+            f"learner_y_range={learner_y_range:.1f}px  y_scale={y_scale:.4f}",
+            flush=True,
+        )
+
+        # Anchor Y rescaling at corridor first point (= learner first point Y)
+        # So start is always locked and only the end stretches/compresses
+        y_anchor = adapted_cl[0][1]
+
+        def _rescale_y(pts: list[tuple[float, float]]) -> list[tuple[float, float]]:
+            return [
+                (px, y_anchor + (py - y_anchor) * y_scale)
+                for px, py in pts
+            ]
+
+        adapted_cl    = _rescale_y(adapted_cl)
+        adapted_left  = _rescale_y(adapted_left)
+        adapted_right = _rescale_y(adapted_right)
 
     adapted_polygon = adapted_left + list(reversed(adapted_right)) + [adapted_left[0]]
     adapted_n = len(adapted_cl)
@@ -284,28 +352,31 @@ def align_corridor_blade_tip_with_extension(
 
     # ── Overlay video ──────────────────────────────────────────────────────
     overlay_path = out_dir / ALIGNED_CORRIDOR_OVERLAY_FILENAME
-    _render_blade_tip_overlay(
-        learner_video_path=learner_video_path,
-        aligned_centerline=adapted_cl,
-        aligned_polygon=adapted_polygon,
-        aligned_left_edge=adapted_left,
-        aligned_right_edge=adapted_right,
-        learner_points=learner_points,
-        frame_checks=frame_checks,
-        learner_anchor=learner_anchor,
-        output_path=overlay_path,
-    )
+    if generate_overlay_video:
+        _render_blade_tip_overlay(
+            learner_video_path=learner_video_path,
+            aligned_centerline=adapted_cl,
+            aligned_polygon=adapted_polygon,
+            aligned_left_edge=adapted_left,
+            aligned_right_edge=adapted_right,
+            learner_points=learner_points,
+            frame_checks=frame_checks,
+            learner_anchor=learner_anchor,
+            output_path=overlay_path,
+        )
+        print(f"[corridor_alignment] Overlay video: {overlay_path}", flush=True)
+    else:
+        print("[corridor_alignment] Overlay video skipped (generate_overlay_video=False)", flush=True)
 
     print(f"[corridor_alignment] Aligned corridor JSON: {aligned_json_path}", flush=True)
     print(f"[corridor_alignment] Preview image: {preview_path}", flush=True)
-    print(f"[corridor_alignment] Overlay video: {overlay_path}", flush=True)
 
     return {
         "aligned_corridor_json_path": str(aligned_json_path),
         "aligned_corridor_preview_path": str(preview_path),
         "aligned_corridor_preview_url": _storage_url_for(preview_path),
-        "aligned_corridor_overlay_video_path": str(overlay_path),
-        "aligned_corridor_overlay_video_url": _storage_url_for(overlay_path),
+        "aligned_corridor_overlay_video_path": str(overlay_path) if generate_overlay_video else None,
+        "aligned_corridor_overlay_video_url": _storage_url_for(overlay_path) if generate_overlay_video else None,
     }
 
 
@@ -959,8 +1030,10 @@ def _render_blade_tip_overlay(
         h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
 
+    _tmp_path = output_path.with_suffix(".tmp.mp4")
+    _web_tmp_path = output_path.with_suffix(".web.tmp.mp4")
     writer = cv2.VideoWriter(
-        str(output_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h)
+        str(_tmp_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h)
     )
 
     def _draw(frame: np.ndarray) -> None:
@@ -1004,6 +1077,13 @@ def _render_blade_tip_overlay(
                 writer.write(frame)
     finally:
         writer.release()
+    if output_path.exists():
+        output_path.unlink()
+    if _convert_to_web_mp4(_tmp_path, _web_tmp_path):
+        _tmp_path.unlink(missing_ok=True)
+        _web_tmp_path.replace(output_path)
+    else:
+        _tmp_path.replace(output_path)
 
 
 # ── Archive: expert-axis-preserving alignment (kept for reference) ────────────
@@ -1613,8 +1693,10 @@ def _render_expert_axis_overlay(
         h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
 
+    _tmp_path = output_path.with_suffix(".tmp.mp4")
+    _web_tmp_path = output_path.with_suffix(".web.tmp.mp4")
     writer = cv2.VideoWriter(
-        str(output_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h)
+        str(_tmp_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h)
     )
 
     def _draw(frame: np.ndarray) -> None:
@@ -1640,6 +1722,13 @@ def _render_expert_axis_overlay(
                 writer.write(frame)
     finally:
         writer.release()
+    if output_path.exists():
+        output_path.unlink()
+    if _convert_to_web_mp4(_tmp_path, _web_tmp_path):
+        _tmp_path.unlink(missing_ok=True)
+        _web_tmp_path.replace(output_path)
+    else:
+        _tmp_path.replace(output_path)
 
 
 # ── Archive: translation-only (kept for reference, not the default) ──────────
@@ -2124,8 +2213,10 @@ def _render_translation_overlay(
         h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
 
+    _tmp_path = output_path.with_suffix(".tmp.mp4")
+    _web_tmp_path = output_path.with_suffix(".web.tmp.mp4")
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(str(output_path), fourcc, fps, (w, h))
+    writer = cv2.VideoWriter(str(_tmp_path), fourcc, fps, (w, h))
 
     def _draw(frame: np.ndarray) -> None:
         _draw_translation_corridor(
@@ -2150,6 +2241,13 @@ def _render_translation_overlay(
                 writer.write(frame)
     finally:
         writer.release()
+    if output_path.exists():
+        output_path.unlink()
+    if _convert_to_web_mp4(_tmp_path, _web_tmp_path):
+        _tmp_path.unlink(missing_ok=True)
+        _web_tmp_path.replace(output_path)
+    else:
+        _tmp_path.replace(output_path)
 
 
 # ── Archive: frame-0 bbox anchor + scale (kept, not used by default) ─────────
@@ -2933,8 +3031,10 @@ def _render_frame0_overlay_video(
         h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
 
+    _tmp_path = output_path.with_suffix(".tmp.mp4")
+    _web_tmp_path = output_path.with_suffix(".web.tmp.mp4")
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(str(output_path), fourcc, fps, (w, h))
+    writer = cv2.VideoWriter(str(_tmp_path), fourcc, fps, (w, h))
 
     try:
         if cap is not None:
@@ -2971,6 +3071,13 @@ def _render_frame0_overlay_video(
                 writer.write(frame)
     finally:
         writer.release()
+    if output_path.exists():
+        output_path.unlink()
+    if _convert_to_web_mp4(_tmp_path, _web_tmp_path):
+        _tmp_path.unlink(missing_ok=True)
+        _web_tmp_path.replace(output_path)
+    else:
+        _tmp_path.replace(output_path)
 
 
 def _render_overlay_video(
@@ -2998,8 +3105,10 @@ def _render_overlay_video(
         h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
 
+    _tmp_path = output_path.with_suffix(".tmp.mp4")
+    _web_tmp_path = output_path.with_suffix(".web.tmp.mp4")
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(str(output_path), fourcc, fps, (w, h))
+    writer = cv2.VideoWriter(str(_tmp_path), fourcc, fps, (w, h))
 
     try:
         if cap is not None:
@@ -3035,6 +3144,13 @@ def _render_overlay_video(
                 writer.write(frame)
     finally:
         writer.release()
+    if output_path.exists():
+        output_path.unlink()
+    if _convert_to_web_mp4(_tmp_path, _web_tmp_path):
+        _tmp_path.unlink(missing_ok=True)
+        _web_tmp_path.replace(output_path)
+    else:
+        _tmp_path.replace(output_path)
 
 
 # ──────────────────────────────────────────────────────────────────────────────

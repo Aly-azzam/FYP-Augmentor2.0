@@ -27,6 +27,7 @@ class EvaluationStartResponse(BaseModel):
     score: Optional[int] = None
     gate_status: Optional[str] = None
     gate_reasons: Optional[list[str]] = None
+    run_id: Optional[str] = None
 
 
 class EvaluationStatusResponse(BaseModel):

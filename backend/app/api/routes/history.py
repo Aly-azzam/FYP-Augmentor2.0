@@ -37,11 +37,12 @@ async def list_history(
         .join(Course, Course.id == Chapter.course_id)
         .outerjoin(Evaluation, Evaluation.attempt_id == Attempt.id)
         .order_by(Attempt.created_at.desc())
-        .limit(limit)
-        .offset(offset)
     )
+
     if user_id is not None:
         query = query.filter(Attempt.user_id == str(user_id))
+
+    query = query.limit(limit).offset(offset)
 
     rows = query.all()
     results: list[HistoryEntry] = []
@@ -50,7 +51,6 @@ async def list_history(
         score_value = None
         if row.overall_score is not None:
             score_value = int(round(float(row.overall_score)))
-
         results.append(
             HistoryEntry(
                 attempt_id=UUID(str(row.attempt_id)),
@@ -63,5 +63,4 @@ async def list_history(
                 created_at=row.attempt_created_at,
             )
         )
-
     return results

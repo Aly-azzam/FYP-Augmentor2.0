@@ -165,6 +165,7 @@ async def process_learner_optical_flow(
                 if active_roi_source in {"yolo_scissors", "yolo_scissors_expanded"}
                 else None
             ),
+            fps=video_metadata.fps,
         )
 
         raw_json_path = raw_dir / "learner_optical_flow_raw.json"

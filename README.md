@@ -177,6 +177,24 @@ Expert videos are pre-processed once at registration time. Per-evaluation runtim
 ![AugMentor 2.0 Home](images/Yolo.png)
 
 ---
+
+## Validation Results
+
+![AugMentor 2.0 Home](images/DTW.png)
+
+![AugMentor 2.0 Home](images/Vibration.png)
+
+| Component | Result |
+|---|---|
+| YOLOv8s mAP@0.5 | 0.995 |
+| YOLOv8s F1 | 1.00 |
+| SAM2 tracking coverage | 100% |
+| Vibration detection accuracy | 100% (4/4 test videos) |
+| End-to-end stress test errors detected | 4/4 |
+
+![AugMentor 2.0 Home](images/Yolo.png)
+
+---
 ## Documentation
 
 The full technical report is available in [`docs/`](docs/).

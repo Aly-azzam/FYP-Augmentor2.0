@@ -1,25 +1,21 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import traceback
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session, joinedload
 
 from app.core.config import settings
-from app.core.constants import AttemptStatus
-from app.core.database import get_db
+from app.core.database import get_db, SessionLocal
 from app.models.evaluation import Evaluation as EvaluationModel
 from app.models.evaluation_feedback import EvaluationFeedback
-from app.models.video import Video
 from app.models.attempt import Attempt
-from app.models.user import User
-from app.schemas.upload_schema import (
-    EvaluationStartResponse,
-    EvaluationStatusResponse,
-)
 from app.schemas.evaluation_schema import (
     AttemptProgressOut,
     EvaluationHistoryOut,
@@ -27,335 +23,603 @@ from app.schemas.evaluation_schema import (
     EvaluationResultOut,
     PersistedEvaluationOut,
 )
-from app.services.context_gate_service import run_context_gate, OUT_OF_CONTEXT_MESSAGE
-from app.services.evaluation_engine_service import run_evaluation_pipeline
-from app.services.media_service import find_first_expert_video_file, normalize_storage_key
-from app.services.motion_representation_service import process_video_to_motion_representation
-from app.services.optical_flow import (
-    FarnebackConfig,
-    evaluate_optical_flow_summary,
-    run_optical_flow_comparison,
+from app.schemas.upload_schema import EvaluationStatusResponse
+from app.services.evaluation.orchestrator import (
+    run_evaluation_pipeline as _run_new_pipeline,
 )
-from app.services.optical_flow.io_utils import save_optical_flow_results
-from app.services.optical_flow.schemas import (
-    OpticalFlowEvaluationConfigUsed,
-    OpticalFlowEvaluationResult,
-    OpticalFlowScore,
-    OpticalFlowSimilarities,
-)
-from app.services.optical_flow.visualizer import create_comparison_visualizations
 from app.services.progress_service import compute_progress
 
 router = APIRouter(prefix="/api/evaluations", tags=["Evaluations"])
 
-MIN_VALID_LANDMARK_FRAMES = 3
+# ── SSE progress store ─────────────────────────────────────────────────────────
+# Keyed by evaluation_id (str). Values are replaced in-place as steps complete.
+_evaluation_progress: dict[str, dict] = {}
+
+PROGRESS_STEPS: dict[str, dict] = {
+    "upload":            {"step": "upload",            "label": "Uploading your video",             "progress": 5},
+    "yolo":              {"step": "yolo",              "label": "Detecting scissors in your video", "progress": 15},
+    "trajectory_init":   {"step": "trajectory_init",   "label": "Initializing trajectory tracking", "progress": 25},
+    "trajectory_track":  {"step": "trajectory_track",  "label": "Tracking scissor path",            "progress": 40},
+    "trajectory_errors": {"step": "trajectory_errors", "label": "Detecting trajectory errors",      "progress": 55},
+    "angle_init":        {"step": "angle_init",        "label": "Analyzing cutting angles",         "progress": 68},
+    "angle_track":       {"step": "angle_track",       "label": "Comparing angles to expert",       "progress": 82},
+    "angle_errors":      {"step": "angle_errors",      "label": "Detecting angle errors",           "progress": 88},
+    "vibration":         {"step": "vibration",         "label": "Analyzing hand vibration",          "progress": 95},
+    "done":              {"step": "done",               "label": "Analysis complete",                "progress": 100},
+}
 
 
-def _build_schema_evaluation_result(evaluation_result: dict) -> OpticalFlowEvaluationResult:
-    return OpticalFlowEvaluationResult(
-        similarities=OpticalFlowSimilarities(**evaluation_result["similarities"]),
-        score=OpticalFlowScore(**evaluation_result["score"]),
-        config_used=OpticalFlowEvaluationConfigUsed(**evaluation_result["config_used"]),
-    )
+def _emit_progress(evaluation_id: str, step: str) -> None:
+    if step in PROGRESS_STEPS:
+        _evaluation_progress[evaluation_id] = dict(PROGRESS_STEPS[step])
 
 
-def _run_optical_flow_side_analysis(
-    *,
-    expert_video_path: Path,
-    learner_video_path: Path,
-    attempt_id: UUID,
-) -> dict[str, Any]:
-    output_dir = settings.STORAGE_ROOT / "outputs" / "optical_flow" / str(attempt_id)
-    visualization_dir = output_dir / "visualizations"
-    config = FarnebackConfig(
-        use_hand_roi=True,
-        roi_padding_px=40,
-    )
+def _run_orchestrator_bg(
+    evaluation_id: str,
+    learner_video_path: str,
+    expert_id: str,
+    user_id: str | None = None,
+) -> None:
+    def emit(step: str) -> None:
+        if step != "done":
+            _emit_progress(evaluation_id, step)
 
-    raw_result, summary_result = run_optical_flow_comparison(
-        expert_video_path=expert_video_path,
-        learner_video_path=learner_video_path,
-        config=config,
-    )
-    evaluation_result = evaluate_optical_flow_summary(summary_result)
-    summary_result.optical_flow_evaluation = _build_schema_evaluation_result(
-        evaluation_result
-    )
+    try:
+        result = _run_new_pipeline(
+            learner_video_path=learner_video_path,
+            expert_id=expert_id,
+            emit_progress=emit,
+        )
+        _evaluation_progress[evaluation_id] = {
+            **PROGRESS_STEPS["done"],
+            "run_id": result.get("run_id"),
+        }
+        print(f"[EVAL] Background orchestrator complete — run_id: {result.get('run_id')}")
 
-    raw_json_path, summary_json_path = save_optical_flow_results(
-        raw_result=raw_result,
-        summary_result=summary_result,
-        output_dir=output_dir,
-    )
-    expert_hsv_video_path, learner_hsv_video_path = create_comparison_visualizations(
-        expert_video_path=expert_video_path,
-        learner_video_path=learner_video_path,
-        output_dir=visualization_dir,
-        run_id=raw_result.run.run_id,
-        config=config,
-    )
+        # Write Attempt + Evaluation rows to DB
+        if user_id:
+            from app.core.database import SessionLocal
+            import uuid as _uuid
+            _db = SessionLocal()
+            try:
+                from app.models.chapter import Chapter
+                chapter = _db.query(Chapter).filter(Chapter.id == expert_id).first()
+                chapter_id_to_use = expert_id if chapter is not None else None
 
-    comparison_metrics = summary_result.comparison_metrics
-    return {
-        "run_id": raw_result.run.run_id,
-        "raw_json_path": str(raw_json_path),
-        "summary_json_path": str(summary_json_path),
-        "expert_hsv_video_path": str(expert_hsv_video_path),
-        "learner_hsv_video_path": str(learner_hsv_video_path),
-        "optical_flow_score": evaluation_result["score"]["optical_flow_score"],
-        "vibration_difference": comparison_metrics.vibration_difference,
-        "vibration_ratio": comparison_metrics.vibration_ratio,
-        "expert_vibration_score": summary_result.expert_summary.vibration_score,
-        "learner_vibration_score": summary_result.learner_summary.vibration_score,
-        "expert_roi_usage_ratio": summary_result.expert_summary.roi_usage_ratio,
-        "learner_roi_usage_ratio": summary_result.learner_summary.roi_usage_ratio,
-    }
+                attempt = Attempt(
+                    id=str(_uuid.uuid4()),
+                    user_id=user_id,
+                    chapter_id=chapter_id_to_use,
+                    learner_video_id=None,
+                    status="completed",
+                )
+                _db.add(attempt)
+                _db.flush()
+                evaluation = EvaluationModel(
+                    id=str(_uuid.uuid4()),
+                    attempt_id=attempt.id,
+                    overall_score=None,
+                    status="completed",
+                )
+                _db.add(evaluation)
+                _db.commit()
+                print(f"[DB] SUCCESS — attempt {attempt.id} written for user {user_id}, chapter={chapter_id_to_use}")
+            except Exception as _e:
+                _db.rollback()
+                import traceback as _tb
+                print(f"[DB] FAILED — {type(_e).__name__}: {_e}")
+                _tb.print_exc()
+            finally:
+                _db.close()
+
+    except Exception as exc:
+        _evaluation_progress[evaluation_id] = {
+            "step": "error",
+            "label": f"Evaluation failed: {exc}",
+            "progress": -1,
+        }
+        print(f"[EVAL] Background orchestrator FAILED: {exc}")
+        traceback.print_exc()
 
 
-@router.post("/start", response_model=EvaluationStartResponse)
+# ── POST /start ────────────────────────────────────────────────────────────────
+
+@router.post("/start")
 async def start_evaluation(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    clip_id: str = Form(...),
+    user_id: str = Form(None),
+):
+    # 1. Save uploaded file to disk
+    suffix = Path(file.filename or "upload.mp4").suffix or ".mp4"
+    save_path = settings.STORAGE_ROOT / "uploads" / "compare_tmp" / f"{uuid4().hex}{suffix}"
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(save_path, "wb") as f:
+        f.write(await file.read())
+
+    # 2. Generate evaluation ID
+    evaluation_id = str(uuid4())
+
+    # 3. Seed initial progress so SSE has something to return immediately
+    _emit_progress(evaluation_id, "upload")
+
+    # 4. Run pipeline in background
+    background_tasks.add_task(
+        _run_orchestrator_bg,
+        evaluation_id,
+        str(save_path),
+        clip_id,
+        user_id,
+    )
+
+    print(f"[EVAL] Orchestrator started — evaluation_id: {evaluation_id}, expert_id: {clip_id}, user_id: {user_id}")
+
+    # 5. Return immediately
+    video_filename = save_path.name
+    video_url = f"/storage/uploads/compare_tmp/{video_filename}"
+    return {"evaluation_id": evaluation_id, "status": "processing", "video_url": video_url}
+
+
+# ── On-demand corridor overlay generation ─────────────────────────────────────
+
+@router.post("/{evaluation_id}/generate-corridor-overlay")
+async def generate_corridor_overlay(
+    evaluation_id: str,
+    body: dict = Body(...),
+):
+    """Generate the corridor overlay video on demand for a completed evaluation run.
+
+    Body: { "run_id": "<uuid>" }
+    Returns: { "status": "done", "overlay_video_url": "/storage/..." }
+    """
+    run_id: str | None = body.get("run_id")
+    if not run_id:
+        raise HTTPException(status_code=400, detail="run_id is required in the request body.")
+
+    eval_base_dir = settings.STORAGE_ROOT / "evaluation"
+    run_dir = eval_base_dir / run_id
+    trajectory_dir = run_dir / "trajectory"
+
+    print(f"[PATH OVERLAY] run_id received: {run_id}")
+    print(f"[PATH OVERLAY] looking for dir: {eval_base_dir / run_id}")
+    print(f"[PATH OVERLAY] dir exists: {(eval_base_dir / run_id).exists()}")
+
+    if not (trajectory_dir / "aligned_corridor.json").is_file():
+        raise HTTPException(
+            status_code=404,
+            detail="Corridor data not found for this run. Run evaluation first.",
+        )
+
+    try:
+        from app.services.sam2_yolo.pipeline import generate_corridor_overlay_for_run  # noqa: PLC0415
+
+        result = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: generate_corridor_overlay_for_run(
+                run_id=run_id,
+                eval_base_dir=str(eval_base_dir),
+            ),
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Overlay generation failed: {exc}",
+        ) from exc
+
+    overlay_url: str | None = result.get("overlay_video_url")
+    if not overlay_url:
+        raise HTTPException(status_code=500, detail="Overlay video URL not returned by pipeline.")
+
+    return {"status": "done", "overlay_video_url": overlay_url}
+
+
+# ── On-demand visualization generation ────────────────────────────────────────
+
+@router.post("/{evaluation_id}/generate-visualization")
+async def generate_visualization(
+    evaluation_id: str,
     request: Request,
     db: Session = Depends(get_db),
 ):
-    """Run the real evaluation pipeline: video -> MediaPipe -> motion -> DTW -> score."""
+    """Return or render the visualization.mp4 for a completed evaluation run.
 
-    raw_attempt_id = None
-    selected_course_id = None
-    selected_clip_id = None
-    selected_chapter_id = None
-    learner_video_path: Path | None = None
-    uploaded_filename: str | None = None
-    uploaded_content_type: str | None = None
+    Body: { "run_id": "<uuid>", "expert_id": "<uuid>" }
+    Returns: { "status": "ready", "visualization_url": "/storage/evaluation/{run_id}/visualization/visualization.mp4" }
+    """
+    body = await request.json()
+    run_id = body.get("run_id")
+    expert_id = body.get("expert_id")
+    if not run_id or not expert_id:
+        raise HTTPException(status_code=422, detail="run_id and expert_id are required")
 
-    content_type = (request.headers.get("content-type") or "").lower()
-    if "multipart/form-data" in content_type:
-        form = await request.form()
-        raw_attempt_id = form.get("attempt_id") or raw_attempt_id
-        selected_course_id = form.get("course_id")
-        selected_clip_id = form.get("clip_id")
-        selected_chapter_id = form.get("chapter_id")
-        uploaded_file = form.get("file")
-        if uploaded_file is not None and hasattr(uploaded_file, "filename"):
-            uploaded_filename = str(getattr(uploaded_file, "filename", "") or "")
-            uploaded_content_type = str(getattr(uploaded_file, "content_type", "") or "") or None
-            learner_video_path = await _save_uploaded_file(uploaded_file)
-    else:
-        try:
-            payload = await request.json()
-        except Exception:
-            payload = {}
-        if isinstance(payload, dict):
-            raw_attempt_id = payload.get("attempt_id") or raw_attempt_id
-            selected_course_id = payload.get("course_id")
-            selected_clip_id = payload.get("clip_id")
-            selected_chapter_id = payload.get("chapter_id")
+    _BACKEND_ROOT = Path(__file__).resolve().parents[3]
+    viz_path = _BACKEND_ROOT / "storage" / "evaluation" / run_id / "visualization" / "visualization.mp4"
 
-    attempt_id: UUID | None = None
-    if raw_attempt_id is not None and str(raw_attempt_id).strip() != "":
-        attempt_id = _require_uuid(raw_attempt_id, field_name="attempt_id")
+    if viz_path.is_file():
+        return {
+            "status": "ready",
+            "visualization_url": f"/storage/evaluation/{run_id}/visualization/visualization.mp4",
+        }
 
-    if attempt_id is None:
-        chapter_id = _resolve_optional_chapter_id(
-            chapter_id_value=selected_chapter_id,
-            clip_id_value=selected_clip_id,
+    # Find learner video — use the most recently uploaded mp4 in compare_tmp
+    compare_tmp = _BACKEND_ROOT / "storage" / "uploads" / "compare_tmp"
+    mp4s = sorted(compare_tmp.glob("*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True) if compare_tmp.exists() else []
+    if not mp4s:
+        raise HTTPException(status_code=404, detail="Learner video not found in compare_tmp")
+    learner_video_path = str(mp4s[0])
+
+    out_dir = str(_BACKEND_ROOT / "storage" / "evaluation" / run_id / "visualization")
+
+    try:
+        from app.services.evaluation.visualization import render_visualization  # noqa: PLC0415
+        await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: render_visualization(
+                learner_video_path=learner_video_path,
+                expert_id=expert_id,
+                run_id=run_id,
+                output_dir=out_dir,
+            ),
         )
-        if chapter_id is None:
-            raise HTTPException(
-                status_code=400,
-                detail="attempt_id is required unless chapter_id (or a UUID clip_id) is provided with a learner file.",
-            )
-        if learner_video_path is None:
-            raise HTTPException(
-                status_code=400,
-                detail="Learner video file is required when attempt_id is not provided.",
-            )
-        attempt_id = _create_temporary_attempt(
-            db=db,
-            chapter_id=chapter_id,
-            learner_video_path=learner_video_path,
-            original_filename=uploaded_filename,
-            mime_type=uploaded_content_type,
-        )
-    else:
-        chapter_id = _resolve_chapter_id(db=db, attempt_id=attempt_id, chapter_id_value=selected_chapter_id)
+    except Exception as exc:
+        import traceback as _tb
+        _tb.print_exc()
+        raise HTTPException(status_code=500, detail=f"Visualization failed: {exc}") from exc
 
-    if chapter_id is None:
-        raise HTTPException(status_code=400, detail="Unable to resolve chapter_id for the provided attempt_id.")
+    if not viz_path.is_file():
+        raise HTTPException(status_code=500, detail="Visualization rendering completed but file not found")
 
-    if learner_video_path is None:
-        learner_video_path = _resolve_learner_video_path(db=db, attempt_id=attempt_id)
+    return {
+        "status": "ready",
+        "visualization_url": f"/storage/evaluation/{run_id}/visualization/visualization.mp4",
+    }
 
-    expert_video_path = _resolve_expert_video_path(
-        db=db,
-        chapter_id=chapter_id,
-        course_id=str(selected_course_id) if selected_course_id else None,
-        clip_id=str(selected_clip_id) if selected_clip_id else None,
+
+# ── On-demand VLM feedback generation ────────────────────────────────────────
+
+@router.post("/{evaluation_id}/generate-feedback")
+async def generate_feedback(
+    evaluation_id: str,
+    body: dict = Body(...),
+):
+    """Generate VLM coaching feedback for a completed evaluation run.
+
+    Body: { "run_id": "<uuid>", "expert_id": "<uuid>" }
+    Returns: { "status": "done", "feedback": "<text>", "feedback_url": "/storage/..." }
+
+    If feedback.json already exists for this run it is returned without calling the API.
+    """
+    run_id: str | None = body.get("run_id")
+    expert_id: str | None = body.get("expert_id")
+    if not run_id:
+        raise HTTPException(status_code=400, detail="run_id is required in the request body.")
+    if not expert_id:
+        raise HTTPException(status_code=400, detail="expert_id is required in the request body.")
+
+    feedback_path = (
+        Path(settings.STORAGE_ROOT) / "evaluation" / run_id / "vlm" / "feedback.json"
     )
 
-    print(
-        "[EVAL] INPUTS:",
-        {
-            "mode": "REAL_MEDIAPIPE",
-            "course_id": selected_course_id,
-            "clip_id": selected_clip_id,
-            "chapter_id": str(chapter_id) if chapter_id else None,
-            "expert_video_path": str(expert_video_path) if expert_video_path else None,
-            "learner_video_path": str(learner_video_path) if learner_video_path else None,
+    if feedback_path.exists():
+        with open(feedback_path, encoding="utf-8") as fh:
+            cached = json.load(fh)
+        return {
+            "status": "done",
+            "feedback": cached.get("feedback", ""),
+            "feedback_url": f"/storage/evaluation/{run_id}/vlm/feedback.json",
+        }
+
+    output_dir = str(Path(settings.STORAGE_ROOT) / "evaluation" / run_id / "visualization")
+
+    try:
+        from app.services.evaluation.vlm_feedback import generate_feedback as _generate_feedback  # noqa: PLC0415
+
+        saved_path = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: _generate_feedback(
+                run_id=run_id,
+                expert_id=expert_id,
+                output_dir=output_dir,
+            ),
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Feedback generation failed: {exc}",
+        ) from exc
+
+    with open(saved_path, encoding="utf-8") as fh:
+        result = json.load(fh)
+
+    return {
+        "status": "done",
+        "feedback": result.get("feedback", ""),
+        "feedback_url": f"/storage/evaluation/{run_id}/vlm/feedback.json",
+    }
+
+
+# ── SSE stream ─────────────────────────────────────────────────────────────────
+
+@router.get("/{evaluation_id}/status-stream")
+async def stream_evaluation_status(evaluation_id: str):
+    """Server-Sent Events stream for evaluation progress."""
+    async def event_generator():
+        last_progress: int = -999
+        elapsed = 0.0
+        max_wait = 600.0  # 10 minutes
+
+        while elapsed < max_wait:
+            current = _evaluation_progress.get(evaluation_id)
+            if current is not None:
+                p = int(current.get("progress", 0))
+                if p != last_progress:
+                    last_progress = p
+                    yield f"data: {json.dumps(current)}\n\n"
+                if p >= 100 or p < 0:
+                    break
+            await asyncio.sleep(0.5)
+            elapsed += 0.5
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
         },
     )
 
-    if expert_video_path is None or not expert_video_path.exists():
-        raise HTTPException(
-            status_code=400,
-            detail=f"Expert video not found. Resolved path: {expert_video_path}",
-        )
-    if learner_video_path is None or not learner_video_path.exists():
-        raise HTTPException(
-            status_code=400,
-            detail="Learner video not uploaded or file missing.",
-        )
 
-    optical_flow_side_analysis = None
+# ── Unified errors ────────────────────────────────────────────────────────────
+
+@router.get("/{evaluation_id}/errors")
+async def get_unified_errors(evaluation_id: str, run_id: str):
+    """Return the merged trajectory + angle error list for a completed run."""
+    errors_path = (
+        Path(settings.STORAGE_ROOT) / "evaluation" / run_id / "score" / "unified_errors.json"
+    )
+    if not errors_path.exists():
+        raise HTTPException(status_code=404, detail="Unified errors not found for this run.")
+    with open(errors_path) as fh:
+        return json.load(fh)
+
+
+# ── POST /{evaluation_id}/score ────────────────────────────────────────────────
+
+_FALLBACK_W = 1920
+_FALLBACK_H = 1080
+
+
+def _scale_mark(mark: dict, native_w: int, native_h: int) -> tuple[float, float]:
+    if mark.get('x') is None or mark.get('y') is None:
+        return 0.0, 0.0
+    vw = mark.get("video_width") or native_w
+    vh = mark.get("video_height") or native_h
+    return mark["x"] * (native_w / vw), mark["y"] * (native_h / vh)
+
+
+def _load_native_dims(run_id: str) -> tuple[int, int]:
+    """Read actual video frame dimensions from vibration_summary.json.
+
+    Falls back to 1920×1080 if the file is absent or lacks the fields.
+    """
     try:
-        optical_flow_side_analysis = _run_optical_flow_side_analysis(
-            expert_video_path=expert_video_path,
-            learner_video_path=learner_video_path,
-            attempt_id=attempt_id,
+        vib_path = (
+            Path(settings.STORAGE_ROOT) / "evaluation" / run_id / "vibration" / "vibration_summary.json"
         )
-        print("[OPTICAL_FLOW] SIDE ANALYSIS:", optical_flow_side_analysis)
+        if vib_path.exists():
+            with open(vib_path) as fh:
+                vib = json.load(fh)
+            fw = int(vib.get("frame_width") or 0)
+            fh_ = int(vib.get("frame_height") or 0)
+            if fw > 0 and fh_ > 0:
+                return fw, fh_
+    except Exception:  # noqa: BLE001
+        pass
+    return _FALLBACK_W, _FALLBACK_H
+
+
+def _mark_hits_error(
+    sx: float,
+    sy: float,
+    mark_type: str,
+    mark_ts: float | None,
+    error: dict,
+) -> bool:
+    if error["error_type"] != mark_type:
+        return False
+    bb = error.get("bounding_box")
+    print(f"[SCORE DEBUG] checking error_type={error['error_type']} bbox={bb}", flush=True)
+    if bb is None:
+        return False
+    if not (bb["x_min"] <= sx <= bb["x_max"] and bb["y_min"] <= sy <= bb["y_max"]):
+        return False
+    # Vibration errors additionally require the mark timestamp to fall within the event window
+    if error["error_type"] == "vibration" and mark_ts is not None:
+        ts_start = error.get("timestamp_start_sec")
+        ts_end   = error.get("timestamp_end_sec")
+        if ts_start is not None and ts_end is not None:
+            if not (ts_start <= mark_ts <= ts_end):
+                return False
+    return True
+
+
+def _run_feedback_bg(run_id: str, expert_id: str, output_dir: str) -> None:
+    try:
+        from app.services.evaluation.vlm_feedback import generate_feedback as _gen  # noqa: PLC0415
+        _gen(run_id=run_id, expert_id=expert_id, output_dir=output_dir)
+        print(f"[VLM] feedback generation complete for run {run_id}", flush=True)
     except Exception as exc:
-        print(f"[OPTICAL_FLOW] Side analysis failed but evaluation will continue: {exc}")
+        import traceback
+        print(f"[VLM] FAILED for run {run_id}:", flush=True)
         traceback.print_exc()
 
+
+@router.get("/{evaluation_id}/generate-feedback")
+async def get_feedback_status(evaluation_id: str, run_id: str, expert_id: str = ""):
+    """Poll whether VLM coaching feedback is ready for a completed run.
+
+    Returns { "status": "pending" } while generation is in progress,
+    or { "status": "done", "feedback": "...", "feedback_url": "..." } once ready.
+    """
+    feedback_path = (
+        Path(settings.STORAGE_ROOT) / "evaluation" / run_id / "vlm" / "feedback.json"
+    )
+    if not feedback_path.exists():
+        return {"status": "pending"}
+    with open(feedback_path, encoding="utf-8") as fh:
+        cached = json.load(fh)
+    return {
+        "status": "done",
+        "feedback": cached.get("feedback", ""),
+        "feedback_url": f"/storage/evaluation/{run_id}/vlm/feedback.json",
+    }
+
+
+@router.post("/{evaluation_id}/score")
+async def score_evaluation(evaluation_id: str, background_tasks: BackgroundTasks, body: dict = Body(...)):
+    """Score the learner's X-mark game attempt against the stored unified errors.
+
+    Body: { "run_id": "...", "marks": [ { mark_type, x, y, timestamp_sec,
+            video_width, video_height }, ... ] }
+    """
+    run_id: str | None = body.get("run_id")
+    marks: list[dict] = body.get("marks", [])
+    if not run_id:
+        raise HTTPException(status_code=400, detail="run_id is required")
+
+    errors_path = (
+        Path(settings.STORAGE_ROOT) / "evaluation" / run_id / "score" / "unified_errors.json"
+    )
+    if not errors_path.exists():
+        raise HTTPException(status_code=404, detail="unified_errors.json not found for this run")
+
+    with open(errors_path) as fh:
+        unified = json.load(fh)
+    errors: list[dict] = unified.get("all_errors", [])
+
+    native_w, native_h = _load_native_dims(run_id)
+    print(f"[SCORE DEBUG] native dims: {native_w}×{native_h}", flush=True)
+
+    matched_error_ids: set[int] = set()
+    mark_results: list[dict] = []
+
+    for mark in marks:
+        sx, sy = _scale_mark(mark, native_w, native_h)
+        print(f"[SCORE DEBUG] mark type={mark['mark_type']} raw=({mark['x']:.1f},{mark['y']:.1f}) scaled=({sx:.1f},{sy:.1f}) vw={mark.get('video_width')} vh={mark.get('video_height')}", flush=True)
+        mark_ts: float | None = mark.get("timestamp_sec")
+        hit_error: dict | None = None
+        for error in errors:
+            if error["error_id"] in matched_error_ids:
+                continue
+            if _mark_hits_error(sx, sy, mark["mark_type"], mark_ts, error):
+                hit_error = error
+                break
+
+        if hit_error:
+            matched_error_ids.add(hit_error["error_id"])
+            mark_results.append({
+                "mark_type": mark["mark_type"],
+                "x": mark["x"],
+                "y": mark["y"],
+                "timestamp_sec": mark.get("timestamp_sec"),
+                "result": "correct",
+                "matched_error_id": hit_error["error_id"],
+            })
+        else:
+            mark_results.append({
+                "mark_type": mark["mark_type"],
+                "x": mark["x"],
+                "y": mark["y"],
+                "timestamp_sec": mark.get("timestamp_sec"),
+                "result": "false_alarm",
+                "matched_error_id": None,
+            })
+
+    missed_errors = [e for e in errors if e["error_id"] not in matched_error_ids]
+    total_real = len(errors)
+    correct = sum(1 for m in mark_results if m["result"] == "correct")
+    false_alarms = sum(1 for m in mark_results if m["result"] == "false_alarm")
+    missed = len(missed_errors)
+    score_pct = round(100 * correct / total_real) if total_real > 0 else 0
+
+    vibration_errors_total = sum(1 for e in errors if e.get("error_type") == "vibration")
+
+    result = {
+        "run_id": run_id,
+        "total_real_errors": total_real,
+        "trajectory_errors_total": sum(1 for e in errors if e.get("error_type") == "trajectory"),
+        "angle_errors_total":      sum(1 for e in errors if e.get("error_type") == "angle"),
+        "vibration_errors_total":  vibration_errors_total,
+        "correct_marks": correct,
+        "false_alarms": false_alarms,
+        "missed_errors": missed,
+        "score_pct": score_pct,
+        "mark_results": mark_results,
+        "missed_error_details": [
+            {
+                "error_id": e["error_id"],
+                "error_type": e["error_type"],
+                "timestamp_start_sec": e["timestamp_start_sec"],
+                "timestamp_end_sec": e["timestamp_end_sec"],
+                "peak_location": e.get("peak_location"),
+            }
+            for e in missed_errors
+        ],
+    }
+
+    score_path = (
+        Path(settings.STORAGE_ROOT) / "evaluation" / run_id / "score" / "score_result.json"
+    )
+    with open(score_path, "w") as fh:
+        json.dump(result, fh, indent=2)
+
+    # Kick off VLM feedback generation in the background (non-blocking).
+    expert_id: str | None = unified.get("expert_id")
+    if expert_id:
+        feedback_file = (
+            Path(settings.STORAGE_ROOT) / "evaluation" / run_id / "vlm" / "feedback.json"
+        )
+        if not feedback_file.exists():
+            output_dir = str(
+                Path(settings.STORAGE_ROOT) / "evaluation" / run_id / "visualization"
+            )
+            background_tasks.add_task(_run_feedback_bg, run_id, expert_id, output_dir)
+
+    # Update DB evaluation record with the gamified score
+    _score_db = SessionLocal()
     try:
-        expert_motion_output = process_video_to_motion_representation(str(expert_video_path))
-        expert_valid = _count_valid_landmark_frames(expert_motion_output)
-        print(f"[EVAL] Expert landmarks: total_frames={expert_motion_output.total_frames}, valid_landmark_frames={expert_valid}")
-
-        if expert_valid < MIN_VALID_LANDMARK_FRAMES:
-            raise HTTPException(
-                status_code=422,
-                detail=f"Expert video has insufficient hand landmarks ({expert_valid} valid frames, need >= {MIN_VALID_LANDMARK_FRAMES}).",
-            )
-    except HTTPException:
-        raise
-    except Exception as exc:
-        print(f"[EVAL] Expert landmark extraction FAILED: {exc}")
-        traceback.print_exc()
-        raise HTTPException(
-            status_code=422,
-            detail=f"Failed to extract landmarks from expert video: {exc}",
+        from app.models.evaluation import Evaluation as _EvalModel
+        _eval_row = (
+            _score_db.query(_EvalModel)
+            .filter(_EvalModel.overall_score == None)
+            .filter(_EvalModel.status == "completed")
+            .order_by(_EvalModel.created_at.desc())
+            .first()
         )
+        if _eval_row is not None:
+            _eval_row.overall_score = score_pct
+            _score_db.commit()
+            print(f"[DB] Score {score_pct} saved to evaluation {_eval_row.id}")
+    except Exception as _se:
+        _score_db.rollback()
+        print(f"[DB] Score save failed: {_se}")
+    finally:
+        _score_db.close()
 
-    try:
-        learner_motion_output = process_video_to_motion_representation(str(learner_video_path))
-        learner_valid = _count_valid_landmark_frames(learner_motion_output)
-        print(f"[EVAL] Learner landmarks: total_frames={learner_motion_output.total_frames}, valid_landmark_frames={learner_valid}")
+    return result
 
-        if learner_valid < MIN_VALID_LANDMARK_FRAMES:
-            raise HTTPException(
-                status_code=422,
-                detail=f"Learner video has insufficient hand landmarks ({learner_valid} valid frames, need >= {MIN_VALID_LANDMARK_FRAMES}). Make sure hands are visible in the video.",
-            )
-    except HTTPException:
-        raise
-    except Exception as exc:
-        print(f"[EVAL] Learner landmark extraction FAILED: {exc}")
-        traceback.print_exc()
-        raise HTTPException(
-            status_code=422,
-            detail=f"Failed to extract landmarks from learner video: {exc}",
-        )
 
-    expert_motion_dict = expert_motion_output.model_dump()
-    learner_motion_dict = learner_motion_output.model_dump()
-
-    print(
-        "[EVAL] Motion sequence lengths:",
-        {
-            "expert_sequence_length": expert_motion_dict.get("sequence_length"),
-            "learner_sequence_length": learner_motion_dict.get("sequence_length"),
-        },
-    )
-
-    # ── Context gate: reject clearly out-of-context videos early ──────
-    gate_result = run_context_gate(
-        expert_motion=expert_motion_dict,
-        learner_motion=learner_motion_dict,
-    )
-    if not gate_result.passed:
-        persisted_evaluation_id = _persist_out_of_context_result(
-            db=db,
-            attempt_id=attempt_id,
-            gate_reasons=gate_result.reasons,
-        )
-        print(f"[EVAL] REJECTED by context gate: {gate_result.reasons}")
-        return EvaluationStartResponse(
-            evaluation_id=UUID(persisted_evaluation_id),
-            attempt_id=attempt_id,
-            status="out_of_context",
-            message=OUT_OF_CONTEXT_MESSAGE,
-            score=0,
-            gate_status="rejected",
-            gate_reasons=gate_result.reasons,
-        )
-
-    evaluation_result = await run_evaluation_pipeline(
-        expert_motion_source=expert_motion_dict,
-        learner_motion_source=learner_motion_dict,
-        attempt_id=str(attempt_id),
-        db=db,
-    )
-    evaluation_id = UUID(str(evaluation_result.evaluation_id))
-    if optical_flow_side_analysis is not None:
-        try:
-            evaluation_row = (
-                db.query(EvaluationModel)
-                .filter(EvaluationModel.id == str(evaluation_id))
-                .first()
-            )
-            if evaluation_row is not None:
-                metrics = dict(evaluation_row.metrics or {})
-                metrics["optical_flow"] = optical_flow_side_analysis
-                evaluation_row.metrics = metrics
-                db.commit()
-            else:
-                print(
-                    "[OPTICAL_FLOW] Could not attach side analysis: "
-                    f"evaluation row not found for {evaluation_id}"
-                )
-        except Exception as exc:
-            db.rollback()
-            print(
-                "[OPTICAL_FLOW] Failed to persist side analysis but evaluation "
-                f"will continue: {exc}"
-            )
-            traceback.print_exc()
-
-    print(
-        "[EVAL] RESULT:",
-        {
-            "evaluation_id": str(evaluation_id),
-            "score": evaluation_result.score,
-            "angle_deviation": evaluation_result.metrics.angle_deviation,
-            "trajectory_deviation": evaluation_result.metrics.trajectory_deviation,
-            "velocity_difference": evaluation_result.metrics.velocity_difference,
-            "smoothness_score": evaluation_result.metrics.smoothness_score,
-            "timing_score": evaluation_result.metrics.timing_score,
-        },
-    )
-
-    return EvaluationStartResponse(
-        evaluation_id=evaluation_id,
-        attempt_id=attempt_id,
-        status="completed",
-        message="Evaluation completed.",
-    )
-
+# ── Remaining read-only DB endpoints (untouched) ──────────────────────────────
 
 @router.get("/{evaluation_id}/status", response_model=EvaluationStatusResponse)
 async def get_evaluation_status(evaluation_id: UUID, db: Session = Depends(get_db)):
-    """Poll evaluation processing status."""
     row = (
         db.query(EvaluationModel)
         .filter(EvaluationModel.id == str(evaluation_id))
@@ -375,7 +639,6 @@ async def get_evaluation_status(evaluation_id: UUID, db: Session = Depends(get_d
 
 @router.get("/{evaluation_id}/result", response_model=EvaluationResultOut)
 async def get_evaluation_result(evaluation_id: UUID, db: Session = Depends(get_db)):
-    """Get final evaluation result. Only available when status is terminal."""
     row = (
         db.query(EvaluationModel)
         .options(
@@ -457,12 +720,8 @@ async def get_evaluation_by_id(evaluation_id: str, db: Session = Depends(get_db)
 
 
 def _to_persisted_out(row: EvaluationModel) -> PersistedEvaluationOut:
-    feedback = (
-        row.feedback
-        if hasattr(row, "feedback")
-        else None
-    )
-    explanation_payload = {}
+    feedback = row.feedback if hasattr(row, "feedback") else None
+    explanation_payload: dict[str, Any] = {}
     if feedback is not None:
         explanation_payload = {
             "mode": feedback.mode,
@@ -485,237 +744,3 @@ def _to_persisted_out(row: EvaluationModel) -> PersistedEvaluationOut:
         explanation=explanation_payload,
         created_at=row.created_at,
     )
-
-
-def _require_uuid(value: Any, field_name: str) -> UUID:
-    if value is None or str(value).strip() == "":
-        raise HTTPException(status_code=400, detail=f"{field_name} is required.")
-    try:
-        return UUID(str(value))
-    except Exception:
-        raise HTTPException(status_code=400, detail=f"Invalid {field_name}. Expected UUID format.")
-
-
-def _resolve_chapter_id(db: Session, attempt_id: UUID, chapter_id_value: Any) -> UUID | None:
-    try:
-        if chapter_id_value:
-            return UUID(str(chapter_id_value))
-    except Exception:
-        pass
-
-    attempt = db.query(Attempt).filter(Attempt.id == str(attempt_id)).first()
-    if attempt is None:
-        return None
-    try:
-        return UUID(str(attempt.chapter_id))
-    except Exception:
-        return None
-
-
-def _resolve_optional_chapter_id(*, chapter_id_value: Any, clip_id_value: Any) -> UUID | None:
-    """Resolve chapter UUID directly from request fields without requiring attempt_id."""
-    for value in (chapter_id_value, clip_id_value):
-        if value is None or str(value).strip() == "":
-            continue
-        try:
-            return UUID(str(value))
-        except Exception:
-            continue
-    return None
-
-
-def _create_temporary_attempt(
-    *,
-    db: Session,
-    chapter_id: UUID,
-    learner_video_path: Path,
-    original_filename: str | None,
-    mime_type: str | None,
-) -> UUID:
-    """Create a lightweight attempt+learner video record for ad-hoc Compare Studio uploads."""
-    user = db.query(User).order_by(User.created_at.asc()).first()
-    if user is None:
-        raise HTTPException(
-            status_code=400,
-            detail="No user record found to own this attempt. Seed at least one user first.",
-        )
-
-    try:
-        learner_video = Video(
-            owner_user_id=user.id,
-            chapter_id=str(chapter_id),
-            video_role="learner",
-            file_path=normalize_storage_key(learner_video_path),
-            file_name=original_filename or learner_video_path.name,
-            mime_type=mime_type,
-            file_size_bytes=learner_video_path.stat().st_size if learner_video_path.exists() else None,
-        )
-        db.add(learner_video)
-        db.flush()
-
-        attempt = Attempt(
-            user_id=user.id,
-            chapter_id=str(chapter_id),
-            learner_video_id=learner_video.id,
-            status=AttemptStatus.UPLOADED.value,
-            original_filename=original_filename or learner_video_path.name,
-        )
-        db.add(attempt)
-        db.commit()
-        db.refresh(attempt)
-        return UUID(str(attempt.id))
-    except HTTPException:
-        db.rollback()
-        raise
-    except Exception as exc:
-        db.rollback()
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to create temporary learner attempt: {exc}",
-        ) from exc
-
-
-def _resolve_expert_video_path(
-    *,
-    db: Session,
-    chapter_id: UUID | None,
-    course_id: str | None,
-    clip_id: str | None,
-) -> Path | None:
-    if chapter_id is not None:
-        row = db.query(Video).filter(Video.chapter_id == str(chapter_id), Video.video_role == "expert").first()
-        if row is not None and row.file_path:
-            try:
-                return settings.STORAGE_ROOT / normalize_storage_key(row.file_path)
-            except Exception:
-                pass
-
-    if course_id == "pottery-wheel" and clip_id == "pottery-wheel-clip-1":
-        mapped = settings.STORAGE_ROOT / "expert" / "pottery.mp4"
-        if mapped.exists():
-            return mapped
-
-    if course_id == "pottery-wheel" and clip_id == "pottery-wheel-clip-2":
-        mapped = settings.STORAGE_ROOT / "expert" / "expert1.mp4"
-        if mapped.exists():
-            return mapped
-
-    return find_first_expert_video_file()
-
-
-def _resolve_learner_video_path(*, db: Session, attempt_id: UUID) -> Path | None:
-    attempt = (
-        db.query(Attempt)
-        .options(joinedload(Attempt.learner_video))
-        .filter(Attempt.id == str(attempt_id))
-        .first()
-    )
-    if attempt is None:
-        raise HTTPException(status_code=404, detail="Attempt not found for provided attempt_id.")
-    if attempt.learner_video is None or not attempt.learner_video.file_path:
-        raise HTTPException(status_code=400, detail="Learner video is not linked to the provided attempt.")
-
-    try:
-        resolved_path = settings.STORAGE_ROOT / normalize_storage_key(attempt.learner_video.file_path)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Learner video file path is invalid.")
-
-    if not resolved_path.exists():
-        raise HTTPException(status_code=400, detail="Learner video file does not exist on disk.")
-    return resolved_path
-
-
-def _persist_out_of_context_result(*, db: Session, attempt_id: UUID, gate_reasons: list[str]) -> str:
-    attempt = db.query(Attempt).filter(Attempt.id == str(attempt_id)).first()
-    if attempt is None:
-        raise HTTPException(status_code=404, detail="Attempt not found for provided attempt_id.")
-
-    expert_video = (
-        db.query(Video)
-        .filter(Video.chapter_id == attempt.chapter_id, Video.video_role == "expert")
-        .order_by(Video.created_at.asc())
-        .first()
-    )
-    if expert_video is None:
-        raise HTTPException(
-            status_code=400,
-            detail="Expert video record not found for this chapter; cannot persist out_of_context result.",
-        )
-
-    row = db.query(EvaluationModel).filter(EvaluationModel.attempt_id == attempt.id).first()
-    if row is None:
-        row = EvaluationModel(
-            attempt_id=attempt.id,
-            expert_video_id=expert_video.id,
-            learner_video_id=attempt.learner_video_id,
-        )
-        db.add(row)
-
-    row.overall_score = 0
-    row.status = "out_of_context"
-    row.gate_passed = False
-    row.gate_reasons = gate_reasons
-    row.metrics = {}
-    row.per_metric_breakdown = {}
-    row.key_error_moments = []
-    row.semantic_phases = {}
-    row.summary_text = OUT_OF_CONTEXT_MESSAGE
-    attempt.status = "out_of_context"
-
-    feedback_text = OUT_OF_CONTEXT_MESSAGE
-    if gate_reasons:
-        feedback_text = f"{OUT_OF_CONTEXT_MESSAGE} Reasons: " + "; ".join(gate_reasons)
-
-    feedback_row = (
-        db.query(EvaluationFeedback)
-        .filter(EvaluationFeedback.evaluation_id == row.id)
-        .first()
-    )
-    if feedback_row is None:
-        feedback_row = EvaluationFeedback(
-            evaluation_id=row.id,
-            mode="rule_based",
-            explanation_text=feedback_text,
-        )
-        db.add(feedback_row)
-
-    feedback_row.mode = "rule_based"
-    feedback_row.model_name = "context_gate"
-    feedback_row.explanation_text = feedback_text
-    feedback_row.strengths = None
-    feedback_row.weaknesses = gate_reasons or None
-    feedback_row.advice = [
-        "Please upload a learner practice video that matches the same chapter task as the expert."
-    ]
-    feedback_row.cited_timestamps = None
-
-    db.commit()
-    db.refresh(row)
-    return str(row.id)
-
-
-async def _save_uploaded_file(uploaded_file) -> Path:
-    suffix = Path(str(uploaded_file.filename or "upload.mp4")).suffix or ".mp4"
-    relative = Path("uploads") / "compare_tmp" / f"{uuid4().hex}{suffix}"
-    destination = settings.STORAGE_ROOT / relative
-    destination.parent.mkdir(parents=True, exist_ok=True)
-
-    with destination.open("wb") as output:
-        while True:
-            chunk = await uploaded_file.read(1024 * 1024)
-            if not chunk:
-                break
-            output.write(chunk)
-    await uploaded_file.close()
-
-    return destination
-
-
-def _count_valid_landmark_frames(motion_output) -> int:
-    count = 0
-    for frame in motion_output.frames:
-        left = frame.left_hand_features
-        right = frame.right_hand_features
-        if left.present or right.present:
-            count += 1
-    return count

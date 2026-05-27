@@ -95,3 +95,9 @@ backend/runs/
 backend/resource_logs/
 backend/storage/course_thumbnails/
 backend/storage/evaluation/
+
+backend/storage/evaluation/
+backend/storage/uploads/compare_tmp/
+.claude/** 
+backend/resource_logs/
+backend/storage/course_thumbnails/

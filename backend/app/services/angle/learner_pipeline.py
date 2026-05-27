@@ -341,3 +341,277 @@ def build_learner_angles_payload(
 def _write_json(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+# ── New entry point — accepts pre-computed YOLO detections, skips YOLO ────────
+# The original run_learner_angle_pipeline() is untouched above.
+
+def run_learner_angle_from_yolo(
+    *,
+    video_path: str,
+    yolo_detections: list,
+    expert_name: str,
+    output_dir: str,
+) -> dict:
+    """Run the learner angle + DTW pipeline using pre-computed YOLO detections.
+
+    Identical to run_learner_angle_pipeline but skips YOLO inference — reads
+    the video only for frame pixel data needed by estimate_blade_angle_from_crop.
+    Called by the evaluation orchestrator which runs YOLO once via run_shared_yolo.
+
+    Parameters
+    ----------
+    video_path:
+        Path to the learner video (needed for blade angle crop extraction).
+    yolo_detections:
+        List of per-frame detection dicts from run_shared_yolo — each dict
+        has keys: frame_index, detected, bbox, confidence, bbox_center.
+    expert_name:
+        Name of the expert folder under storage/outputs/angles/expert/.
+    output_dir:
+        Directory where all angle outputs are saved.
+    """
+    import uuid as _uuid
+
+    video = Path(video_path).expanduser().resolve()
+    out_dir = Path(output_dir).expanduser().resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    run_id = str(_uuid.uuid4())
+    angles_root = settings.ANGLES_OUTPUT_ROOT
+
+    # Build a frame-index → detection lookup.
+    detection_by_frame: dict[int, dict] = {
+        int(d["frame_index"]): d
+        for d in yolo_detections
+        if isinstance(d, dict) and "frame_index" in d
+    }
+
+    # ── Step 1: Angle extraction from pre-computed detections ─────────────────
+    print(f"Processing learner video (pre-computed YOLO): {video.name}")
+    learner_frames_payload = _extract_angles_from_detections(
+        video_path=video,
+        video_type="learner",
+        detection_by_frame=detection_by_frame,
+    )
+    angles_path = out_dir / ANGLES_FILENAME
+    _write_json(angles_path, learner_frames_payload)
+    print(f"Saved {ANGLES_FILENAME}")
+
+    # ── Step 2: Load expert angles ─────────────────────────────────────────────
+    expert_angles_path = angles_root / "expert" / expert_name / ANGLES_FILENAME
+    if not expert_angles_path.is_file():
+        raise FileNotFoundError(
+            f"Expert angles not found. Run offline script first. "
+            f"Expected: {expert_angles_path}"
+        )
+    expert_frames_payload = json.loads(expert_angles_path.read_text(encoding="utf-8"))
+
+    # ── Step 3: DTW ───────────────────────────────────────────────────────────
+    expert_valid_frames = extract_valid_line_frames(expert_frames_payload)
+    learner_valid_frames = extract_valid_line_frames(learner_frames_payload)
+
+    expert_angles_seq = [frame["line_angle"] for frame in expert_valid_frames]
+    learner_angles_seq = [frame["line_angle"] for frame in learner_valid_frames]
+
+    print("Running DTW...")
+    dtw_result = run_dtw(
+        expert_angles_seq,
+        learner_angles_seq,
+        window_ratio=dtw_window_ratio(expert_angles_seq, learner_angles_seq),
+    )
+    dtw_result = add_frame_indices_to_dtw_matches(
+        dtw_result,
+        expert_frames=expert_valid_frames,
+        learner_frames=learner_valid_frames,
+    )
+    dtw_alignment_payload = build_dtw_alignment_payload(
+        dtw_result,
+        expert_valid_frame_count=len(expert_valid_frames),
+        learner_valid_frame_count=len(learner_valid_frames),
+    )
+    dtw_path = out_dir / DTW_ALIGNMENT_FILENAME
+    _write_json(dtw_path, dtw_alignment_payload)
+    print(f"Saved {DTW_ALIGNMENT_FILENAME}")
+
+    # ── Step 4: Learner comparison + run summary ──────────────────────────────
+    learner_comparison_payload = build_learner_comparison_payload(
+        learner_frames_payload=learner_frames_payload,
+        dtw_alignment_payload=dtw_alignment_payload,
+    )
+    comparison_path = out_dir / LEARNER_COMPARISON_FILENAME
+    _write_json(comparison_path, learner_comparison_payload)
+    print(f"Saved {LEARNER_COMPARISON_FILENAME}")
+
+    run_summary = build_run_summary_payload(
+        clip_id=run_id,
+        expert_name=expert_name,
+        expert_frames_payload=expert_frames_payload,
+        learner_frames_payload=learner_frames_payload,
+        dtw_alignment_payload=dtw_alignment_payload,
+        learner_comparison_payload=learner_comparison_payload,
+    )
+    summary_path = out_dir / RUN_SUMMARY_FILENAME
+    _write_json(summary_path, run_summary)
+    print(f"Saved {RUN_SUMMARY_FILENAME}")
+
+    # ── Step 5: Generate learner_comparison_output.mp4 ────────────────────────
+    comparison_video_path: Path | None = out_dir / LEARNER_COMPARISON_VIDEO_FILENAME
+    print("Generating learner_comparison_output.mp4...")
+    try:
+        generate_learner_comparison_video(
+            learner_video_path=video,
+            learner_comparison_payload=learner_comparison_payload,
+            output_path=comparison_video_path,
+        )
+        print(f"Saved {LEARNER_COMPARISON_VIDEO_FILENAME}")
+    except Exception as exc:
+        print(f"WARNING: Could not generate comparison video: {exc}")
+        comparison_video_path = None
+
+    return {
+        "run_id": run_id,
+        "expert_name": expert_name,
+        "angles_path": str(angles_path),
+        "dtw_alignment_path": str(dtw_path),
+        "learner_comparison_path": str(comparison_path),
+        "run_summary_path": str(summary_path),
+        "learner_comparison_video_path": (
+            str(comparison_video_path) if comparison_video_path else None
+        ),
+        "normalized_dtw_distance": run_summary["normalized_dtw_distance"],
+        "mean_angle_difference": run_summary["mean_angle_difference"],
+        "median_angle_difference": run_summary["median_angle_difference"],
+        "max_angle_difference": run_summary["max_angle_difference"],
+    }
+
+
+def _extract_angles_from_detections(
+    *,
+    video_path: Path,
+    video_type: str,
+    detection_by_frame: dict[int, dict],
+) -> dict:
+    """Extract blade angles from pre-computed YOLO detections.
+
+    Reads every video frame for the blade-angle crop estimation but uses the
+    pre-computed bbox from detection_by_frame instead of running YOLO again.
+    The smoothing / fallback logic is identical to _extract_angles_from_video.
+    """
+    from app.services.angle.detector import extend_angle_line  # noqa: PLC0415
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video: {video_path}")
+
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    if width <= 0 or height <= 0:
+        cap.release()
+        raise RuntimeError(f"Invalid video dimensions for {video_path}")
+
+    frames: list[dict] = []
+    frame_index = 0
+    last_bbox: list[float] | None = None
+    last_confidence = 0.0
+    previous_angle: float | None = None
+
+    try:
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+
+            bbox = None
+            confidence = 0.0
+            line_center = None
+            line_angle = None
+            line_start = None
+            line_end = None
+            line_source = "none"
+            fallback_used = False
+            valid_line = False
+            status = "no_detection"
+
+            det = detection_by_frame.get(frame_index)
+            if det is not None and det.get("detected") and det.get("bbox") is not None:
+                bbox = [float(v) for v in det["bbox"]]
+                confidence = float(det.get("confidence") or 0.0)
+                last_bbox = bbox
+                last_confidence = confidence
+                status = "detected"
+            elif last_bbox is not None:
+                bbox = last_bbox
+                confidence = last_confidence
+                status = "reused"
+
+            if bbox is not None:
+                x1, y1, x2, y2 = map(int, bbox)
+                center_x = (x1 + x2) / 2.0
+                center_y = (y1 + y2) / 2.0
+                line_center = [round(center_x, 3), round(center_y, 3)]
+
+                bbox_angle = angle_from_points((x1, y1), (x2, y2))
+                blade_angle = estimate_blade_angle_from_crop(frame, (x1, y1, x2, y2))
+
+                if previous_angle is None:
+                    if blade_angle is not None:
+                        angle_to_draw = blade_angle
+                        line_source = "fitline"
+                    else:
+                        angle_to_draw = bbox_angle
+                        line_source = "bbox_diagonal"
+                        fallback_used = True
+                elif blade_angle is None or confidence < LOW_CONFIDENCE_ANGLE_THRESHOLD:
+                    angle_to_draw = previous_angle
+                    line_source = "previous_frame"
+                    fallback_used = True
+                else:
+                    jump = abs(angle_delta_degrees(previous_angle, blade_angle))
+                    if jump > ANGLE_JUMP_LIMIT_DEGREES:
+                        angle_to_draw = previous_angle
+                        line_source = "previous_frame"
+                        fallback_used = True
+                    else:
+                        angle_to_draw = smooth_angle(previous_angle, blade_angle)
+                        line_source = "fitline"
+
+                start, end = extend_angle_line(angle_to_draw, center_x, center_y, width, height)
+                line_start = [int(start[0]), int(start[1])]
+                line_end = [int(end[0]), int(end[1])]
+                previous_angle = angle_to_draw
+                line_angle = round(float(angle_to_draw), 6)
+                valid_line = True
+
+            frames.append(
+                {
+                    "frame_index": frame_index,
+                    "bbox": bbox,
+                    "confidence": round(confidence, 6),
+                    "line_center": line_center,
+                    "line_angle": line_angle,
+                    "line_start": line_start,
+                    "line_end": line_end,
+                    "line_source": line_source,
+                    "fallback_used": fallback_used,
+                    "valid_line": valid_line,
+                    "status": status,
+                }
+            )
+            frame_index += 1
+
+    finally:
+        cap.release()
+
+    if frame_index == 0:
+        raise RuntimeError(f"No frames were processed from {video_path}")
+
+    return build_video_frames_payload(
+        video_type=video_type,
+        video_path=str(video_path),
+        total_frames=frame_index,
+        fps=float(fps),
+        frames=frames,
+    )
