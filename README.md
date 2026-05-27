@@ -177,6 +177,9 @@ Expert videos are pre-processed once at registration time. Per-evaluation runtim
 ![AugMentor 2.0 Home](images/Yolo.png)
 
 ---
+## Documentation
+
+The full technical report is available in [`docs/`](docs/).
 
 ## Contributors
 
