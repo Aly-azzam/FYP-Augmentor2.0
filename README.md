@@ -1,122 +1,198 @@
 # AugMentor 2.0
+**Vision–Language–Action Framework for Egocentric Craft Skill Evaluation**
 
-### Vision–Language–Action Framework for Craft Skill Learning
+AugMentor 2.0 is an AI-powered web platform that evaluates a learner's craft practice video against an expert reference and delivers structured, personalised feedback — without requiring the expert to be present.
 
-AugMentor 2.0 is an AI-powered system designed to help learners improve **manual craft skills** by analyzing and comparing their movements with those of an expert.
+The system processes egocentric videos through a computer vision and signal processing pipeline that tracks the cutting tool frame by frame, measures deviations in trajectory, blade angle, and vibration, and generates natural-language explanations grounded in computed metrics.
 
-The system processes **egocentric craft videos** and uses computer vision and AI models to extract motion information, analyze gesture quality, and generate meaningful feedback.
-
-This project is developed as a **Final Year Project (FYP)** in Computer & Communication Engineering in collaboration with **Mines Paris – PSL University**.
-
----
-
-## Project Concept
-
-Learning complex manual skills such as carving, sculpting, or other crafting techniques often relies on observing experts and practicing repeatedly. However, many important details of expert movements are **subtle and difficult to notice** in normal videos.
-
-AugMentor 2.0 aims to transform instructional videos into **interactive learning tools** by automatically extracting motion features and highlighting the key elements of expert performance.
-
-By comparing a learner’s attempt with an expert’s demonstration, the system can identify differences in motion and provide explanations that help improve technique.
+Developed as a Final Year Project in Computer & Communications Engineering at École Supérieure d'Ingénieurs de Beyrouth — Université Saint-Joseph de Beyrouth, in collaboration with Mines Paris – PSL University.
 
 ---
 
-## Core Idea
+## How It Works
 
-The system analyzes two videos:
+![AugMentor 2.0 evaluation pipeline](images/5-stage-pipeline-diagram.png)
 
-- **Expert video** – demonstration of the correct technique  
-- **Learner video** – attempt performed by the student  
+The system compares two videos:
 
-Using AI and computer vision, the system:
+- **Expert video** — a reference recording of the correct technique
+- **Learner video** — the student's practice attempt
 
-1. Detects hand and object movements  
-2. Extracts motion features such as trajectories and gesture patterns  
-3. Compares the learner's motion with the expert's motion  
-4. Generates explanations and visual feedback to guide improvement  
+The evaluation pipeline runs automatically on upload:
 
-This approach turns simple craft videos into **augmented learning material**.
+1. **Tool detection** across all frames (custom YOLOv8s)
+2. **Blade tip tracking** and trajectory extraction (SAM2 Hiera-Tiny)
+3. **Blade angle estimation** per frame (HSV masking + fitLine + DTW alignment)
+4. **Vibration detection** via optical flow frequency analysis (RAFT + windowed FFT)
+5. **Hand-to-tool distance** estimation (MediaPipe)
+6. **Error detection and localisation** — trajectory drift, angle deviation, and vibration events timestamped and spatially bounded
+7. **Annotated video output** with corridor overlays and error markers
+8. **AI-generated feedback** — plain-language coaching grounded in measured deviations (metric-constrained VLM)
 
----
+![AugMentor 2.0 evaluation pipeline](images/pipelineDiagrm.png)
 
-## Technologies
-
-The project explores the integration of several AI technologies:
-
-- **Computer Vision** for hand and object detection
-- **Motion Analysis** to measure gesture quality
-- **Vision-Language Models (VLMs)** to generate explanations
-- **Video Augmentation** for pedagogical visualization
-
-These components work together to convert raw videos into **structured motion data and instructional feedback**.
+The learner then interacts with their results through a **gamified interface** that challenges them to identify their own errors before the system reveals the full evaluation and score.
 
 ---
 
-## Project Status
+## Application Stack
 
-🚧 **Work in progress**
+![AugMentor 2.0 evaluation pipeline](images/AppStack.png)
 
-This repository currently contains the early development of the AugMentor 2.0 system.  
-The architecture and components are under active development.
+| Layer | Technology |
+|---|---|
+| Frontend | React SPA (Vite) |
+| Backend | FastAPI + Uvicorn |
+| Database | PostgreSQL |
+| Tool Detection | YOLOv8s (custom fine-tuned, `best.pt`) |
+| Blade Tracking | SAM2 Hiera-Tiny |
+| Angle Estimation | OpenCV HSV + fitLine + DTW |
+| Vibration Detection | RAFT optical flow + windowed FFT |
+| Hand Detection | MediaPipe Hands |
+| Video Processing | OpenCV + FFmpeg |
+| VLM Feedback | Groq Llama-4 Scout (dev) / GPT-4o (production) |
 
----
-
-## Development Note (Expert Upload)
-
-If the **Expert Upload / Expert Video Manager** page shows:
-
-`Could not load chapters. Make sure the backend is running.`
-
-the frontend cannot reach the backend API.
-
-- Frontend dev server proxies `/api` and `/storage` to `http://localhost:8001` by default.
-- Start the backend on port `8001` before using Expert Upload:
-
-`uvicorn app.main:app --reload --port 8001`
-
-- If you use a different backend port, set `AUGMENTOR_API_TARGET` in the frontend environment to match it.
+GPU (CUDA) is required. SAM2 tracking alone exceeds 600 seconds per video without a GPU.
 
 ---
 
-## Database Recovery & Test Safety
+## Interface
 
-If DB rows are lost but files still exist under `backend/storage`, run:
+![AugMentor 2.0 Home](images/HomeInterface.png)
 
-- Audit only (read-only):
-  - `python -m app.scripts.recover_storage_registry`
-- Re-register recoverable expert rows:
-  - `python -m app.scripts.recover_storage_registry --apply --create-missing-chapters`
 
-Notes:
-- Recovery only re-registers expert records when a source video file still exists on disk.
-- Learner runtime run folders (`storage/mediapipe/runs`, `storage/sam2/runs`) are audit-only in this helper.
+![AugMentor 2.0 Home](images/CompareStudio.png)
+ 
+![AugMentor 2.0 Home](images/GamifiedError.png)
 
-### Pytest DB isolation (important)
+![AugMentor 2.0 Home](images/VLM.png)
 
-Pytest now requires `TEST_DATABASE_URL` and refuses to run if it matches the app `DATABASE_URL`.
+---
 
-Example:
-- `set TEST_DATABASE_URL=postgresql+psycopg://augmentor_user:augmentor_password@localhost:5432/augmentor_test_db`
-- `pytest`
+## Getting Started
 
-This prevents destructive test setup (`drop_all/create_all`) from touching the real app database.
+### Prerequisites
+
+- Python 3.10+
+- NVIDIA GPU with CUDA 11.4+
+- PostgreSQL
+- Node.js 18+
+
+### Backend
+
+```bash
+cd backend
+pip install -r requirements.txt
+uvicorn app.main:app --reload --port 8001
+```
+
+The frontend dev server proxies `/api` and `/storage` to `http://localhost:8001` by default. If you use a different port, set `AUGMENTOR_API_TARGET` in the frontend environment.
+
+### Frontend
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+### Model Weights
+
+Place the following weight files in the configured model directory:
+
+- `best.pt` — custom YOLOv8s scissors detector (fine-tuned on 584 egocentric images)
+- `sam2_hiera_tiny.pt` — SAM2 Hiera-Tiny tracker
+- RAFT weights are downloaded automatically via torchvision on first run
+
+---
+
+## Database
+
+### Setup
+
+```bash
+createdb augmentor_db
+python -m app.scripts.init_db
+```
+
+### Recovery
+
+If DB rows are lost but files still exist under `backend/storage`:
+
+```bash
+# Audit only (read-only)
+python -m app.scripts.recover_storage_registry
+
+# Re-register recoverable expert rows
+python -m app.scripts.recover_storage_registry --apply --create-missing-chapters
+```
+
+Recovery only re-registers expert records when the source video file still exists on disk. Learner run folders are audit-only.
+
+### Testing
+
+Pytest requires `TEST_DATABASE_URL` and refuses to run if it matches the app `DATABASE_URL`.
+
+```bash
+set TEST_DATABASE_URL=postgresql+psycopg://<user>:<password>@localhost:5432/augmentor_test_db
+pytest
+```
+
+---
+
+## Performance
+
+Measured on an 18-second learner video at 30 fps (NVIDIA RTX 3060 Laptop, 6 GB VRAM):
+
+
+
+| Stage | Runtime |
+|---|---|
+| YOLO pre-pass | 18.1s |
+| SAM2 tracking + trajectory | 47.4s |
+| HSV angle estimation + DTW | 19.4s |
+| RAFT vibration detection | ~7.0s |
+| MediaPipe hand distance | ~5.0s |
+| Error detection + merge | <0.1s |
+| **Total** | **~97s** |
+
+Expert videos are pre-processed once at registration time. Per-evaluation runtime covers the learner video only.
+
+---
+
+## Validation Results
+
+![AugMentor 2.0 Home](images/DTW.png)
+
+![AugMentor 2.0 Home](images/Vibration.png)
+
+| Component | Result |
+|---|---|
+| YOLOv8s mAP@0.5 | 0.995 |
+| YOLOv8s F1 | 1.00 |
+| SAM2 tracking coverage | 100% |
+| Vibration detection accuracy | 100% (4/4 test videos) |
+| End-to-end stress test errors detected | 4/4 |
+
+![AugMentor 2.0 Home](images/Yolo.png)
 
 ---
 
 ## Contributors
-
-Final Year Project – Computer & Communication Engineering
 
 **Students**
 - Ali Azzam
 - Ahmad Dia
 - Rafic Dergham
 
-
 **Supervisors**
-- Dr. Alina Glushkova – Mines Paris PSL  
+Dr. Alina Glushkova — Mines Paris – PSL University
+Dr. Juliana El Rayess — USJ — École Supérieure d'Ingénieurs de Beyrouth 
 
 ---
 
-## Research Context
+## Academic Context
 
-AugMentor 2.0 extends an earlier prototype by introducing new AI models and analytics capable of extracting motion indicators from craft videos and producing annotated learning material.
+Final Year Project — Computer & Communications Engineering  
+École Supérieure d'Ingénieurs de Beyrouth, Université Saint-Joseph de Beyrouth  
+May 2026

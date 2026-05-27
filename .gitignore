@@ -91,3 +91,7 @@ backend/runs/
 !backend/models/
 !backend/models/yolo/
 !backend/models/yolo/best.pt
+.claude/
+backend/resource_logs/
+backend/storage/course_thumbnails/
+backend/storage/evaluation/
