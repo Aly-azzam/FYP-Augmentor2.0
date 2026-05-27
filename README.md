@@ -197,8 +197,7 @@ Expert videos are pre-processed once at registration time. Per-evaluation runtim
 ---
 ## Documentation
 
-The full technical report is available in [`docs/`](docs/).
-
+The full technical report is available [here](docs/FYP41_CCE_final_report_Ali_Ahmad_Rafic.pdf).
 
 ## Contributors
 
