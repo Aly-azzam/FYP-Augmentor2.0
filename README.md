@@ -186,8 +186,8 @@ Expert videos are pre-processed once at registration time. Per-evaluation runtim
 - Rafic Dergham
 
 **Supervisors**
-Dr. Alina Glushkova — Mines Paris – PSL University
-Dr. Juliana El Rayess — USJ — École Supérieure d'Ingénieurs de Beyrouth 
+- Dr. Alina Glushkova — Mines Paris – PSL University
+- Dr. Juliana El Rayess — USJ — École Supérieure d'Ingénieurs de Beyrouth 
 
 ---
 
